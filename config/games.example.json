@@ -1,0 +1,14 @@
+{
+  "games": [
+    {
+      "steamAppId": "620",
+      "title": "Portal 2",
+      "id": "steam-620"
+    },
+    {
+      "steamAppId": "105600",
+      "title": "Terraria",
+      "id": "steam-105600"
+    }
+  ]
+}

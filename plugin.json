@@ -1,0 +1,9 @@
+{
+  "id": "steamidra",
+  "name": "SteaMidra",
+  "version": "0.2.0",
+  "apiVersion": 3,
+  "library": "steamidra_plugin",
+  "iconName": "stadia_controller",
+  "description": "Self-contained Steam depot installs (bundled DDMod + .NET; LumaCore / SLSsteam)"
+}

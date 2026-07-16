@@ -1,0 +1,16 @@
+build/
+build-win/
+*.arach
+.venv/
+__pycache__/
+*.pyc
+
+# Vendored large/binary trees (fetch via tools/fetch_third_party.*)
+third_party/linux/dotnet/
+third_party/windows/dotnet/
+third_party/linux/SLSsteam/*.so
+third_party/windows/LumaCore/*.dll
+third_party/linux/DDMod/*.dll
+third_party/windows/DDMod/*.dll
+third_party/DDMod/*.dll
+third_party/DDMod/*.exe
