@@ -1,0 +1,81 @@
+# Daily installable-manifest catalog for SteaMidra.
+# Schedule in GitLab: CI/CD → Schedules → cron `0 4 * * *` (UTC), target branch main.
+# Optional CI/CD variables: HUBCAP_API_KEY, CATALOG_PUSH_TOKEN (project access token with write_repository)
+
+stages:
+  - catalog
+
+variables:
+  GIT_DEPTH: "1"
+
+.update-catalog:
+  stage: catalog
+  image: python:3.12-slim
+  timeout: 3h
+  cache:
+    key: depotkeys
+    paths:
+      - catalog/.cache/
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git ca-certificates
+  script:
+    - python tools/build_manifest_catalog.py --incremental --steam-dates --workers 32 --verbose
+    - |
+      if git diff --quiet -- catalog/games-manifest-catalog.json config/games-manifest-catalog.json; then
+        echo "Catalog unchanged"
+        exit 0
+      fi
+      git config user.email "ci@gitlab.com"
+      git config user.name "SteaMidra Catalog Bot"
+      git add catalog/games-manifest-catalog.json config/games-manifest-catalog.json
+      COUNT=$(python -c "import json; print(json.load(open('catalog/games-manifest-catalog.json'))['count'])")
+      git commit -m "chore(catalog): refresh installable manifests ($COUNT games)"
+      if [ -n "${CATALOG_PUSH_TOKEN:-}" ]; then
+        git push "https://oauth2:${CATALOG_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_COMMIT_REF_NAME}"
+      elif [ -n "${CI_JOB_TOKEN:-}" ] && [ "${CI_COMMIT_BRANCH}" = "${CI_DEFAULT_BRANCH}" ]; then
+        # Prefer project token; job token push needs "CI job token allow push" in project settings.
+        git push "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_COMMIT_REF_NAME}" || true
+      else
+        echo "Set CATALOG_PUSH_TOKEN (write_repository) to push catalog commits"
+        exit 1
+      fi
+  artifacts:
+    paths:
+      - catalog/games-manifest-catalog.json
+    expire_in: 7 days
+
+update-catalog-scheduled:
+  extends: .update-catalog
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+update-catalog-manual:
+  extends: .update-catalog
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      when: manual
+      allow_failure: true
+
+# Full rebuild (all appids) — run manually when needed
+rebuild-catalog-full:
+  extends: .update-catalog
+  timeout: 5h
+  script:
+    - python tools/build_manifest_catalog.py --steam-dates --workers 32 --verbose
+    - |
+      git config user.email "ci@gitlab.com"
+      git config user.name "SteaMidra Catalog Bot"
+      git add catalog/games-manifest-catalog.json config/games-manifest-catalog.json
+      COUNT=$(python -c "import json; print(json.load(open('catalog/games-manifest-catalog.json'))['count'])")
+      git commit -m "chore(catalog): full rebuild installable manifests ($COUNT games)" || exit 0
+      if [ -n "${CATALOG_PUSH_TOKEN:-}" ]; then
+        git push "https://oauth2:${CATALOG_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_COMMIT_REF_NAME}"
+      else
+        echo "Set CATALOG_PUSH_TOKEN to push"
+        exit 1
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual

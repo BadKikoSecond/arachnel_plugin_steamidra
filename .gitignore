@@ -4,6 +4,7 @@ build-win/
 .venv/
 __pycache__/
 *.pyc
+catalog/.cache/
 
 # Vendored large/binary trees (fetch via tools/fetch_third_party.*)
 third_party/linux/dotnet/
@@ -14,3 +15,4 @@ third_party/linux/DDMod/*.dll
 third_party/windows/DDMod/*.dll
 third_party/DDMod/*.dll
 third_party/DDMod/*.exe
+third_party/windows/DDMod/*.exe

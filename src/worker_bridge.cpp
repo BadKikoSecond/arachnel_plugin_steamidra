@@ -6,6 +6,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QProcessEnvironment>
 
 namespace steamidra {
 
@@ -32,6 +33,10 @@ WorkerResult runWorker(const QString& pluginRoot, const QStringList& args, int t
     fullArgs << script << args;
     process.setArguments(fullArgs);
     process.setWorkingDirectory(pluginRoot);
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
+    env.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
+    process.setProcessEnvironment(env);
     process.start();
     if (!process.waitForStarted(10000)) {
         out.error = QStringLiteral("Failed to start python worker");
@@ -71,6 +76,10 @@ WorkerResult runWorkerWithProgress(
     fullArgs << script << QStringLiteral("--progress-json") << args;
     process.setArguments(fullArgs);
     process.setWorkingDirectory(pluginRoot);
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
+    env.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
+    process.setProcessEnvironment(env);
     process.setProcessChannelMode(QProcess::SeparateChannels);
     process.start();
     if (!process.waitForStarted(10000)) {
@@ -105,6 +114,7 @@ WorkerResult runWorkerWithProgress(
             p.bytesDownloaded =
                 static_cast<qint64>(obj.value(QStringLiteral("bytesDownloaded")).toDouble());
             p.totalBytes = static_cast<qint64>(obj.value(QStringLiteral("totalBytes")).toDouble());
+            p.downloadRateBps = obj.value(QStringLiteral("downloadRateBps")).toInt();
             p.detail = obj.value(QStringLiteral("detail")).toString();
             p.status = obj.value(QStringLiteral("status")).toString(QStringLiteral("downloading"));
             if (onProgress)
@@ -126,9 +136,9 @@ WorkerResult runWorkerWithProgress(
             out.error = QStringLiteral("Worker timed out");
             return out;
         }
-        process.waitForReadyRead(200);
+        process.waitForReadyRead(20);
         flushLines(process.readAllStandardOutput());
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
     }
     flushLines(process.readAllStandardOutput());
     out.exitCode = process.exitCode();

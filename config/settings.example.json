@@ -4,5 +4,7 @@
   "steamPath": "",
   "preferMode": "ddmod",
   "libraryFolder": "",
-  "includeDlc": false
+  "includeDlc": false,
+  "manifestCatalogUrl": "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/main/catalog/games-manifest-catalog.json",
+  "manifestCatalogTtlHours": 24
 }

@@ -1,8 +1,30 @@
 # arachnel-plugin-steamidra
 
-GPL-3 source plugin for [Arachnel](https://github.com/PetWork/Arachnel): **self-contained** Steam depot installs via bundled **DepotDownloaderMod** + **.NET 9**, with **LumaCore** (Windows) / **SLSsteam** (Linux) when Steam is present.
+GPL-3 source plugin for [Arachnel](https://github.com/BadKiko/Arachnel): **self-contained** Steam depot installs via bundled **DepotDownloaderMod** + **.NET 9**, with **LumaCore** (Windows) / **SLSsteam** (Linux) when Steam is present.
 
 Inspired by [SteaMidra / SFF](https://github.com/Midrags/SFF) (GPL-3). This repo does **not** vendor SFF Python modules.
+
+## Catalog (installable only)
+
+Daily CI rebuilds [`catalog/games-manifest-catalog.json`](catalog/games-manifest-catalog.json) — **only games with packaged manifests** (MH3 / Hubcap), so installs are expected to work.
+
+Raw URL (used by the plugin):
+
+```
+https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/main/catalog/games-manifest-catalog.json
+```
+
+`uploadDate` / `version` drive **sort by newest** and **library update detection**.
+
+Rebuild locally:
+
+```bash
+python tools/build_manifest_catalog.py --incremental --steam-dates --verbose
+# full:
+python tools/build_manifest_catalog.py --steam-dates --verbose
+```
+
+GitLab: **CI/CD → Schedules** → cron `0 4 * * *`, set `CATALOG_PUSH_TOKEN` (project access token, `write_repository`). Optional: `HUBCAP_API_KEY`.
 
 ## What is bundled
 
@@ -28,13 +50,12 @@ Fetch before release builds:
 - Arachnel checkout (`ARACHNEL_SDK_DIR`)
 - **Steam optional** for download; recommended for library / Proton launch
 
-## Build & install (Linux)
+## Build & install
 
 ```bash
-export ARACHNEL_SDK_DIR=~/PetWork/Arachnel
-./tools/fetch_third_party.sh linux
-chmod +x run.sh
-./run.sh
+export ARACHNEL_SDK_DIR=~/PetWork/Arachnel   # or D:\Work\Arachnel
+./tools/fetch_third_party.sh linux           # or tools\fetch_third_party.ps1 on Windows
+./run.sh                                     # or .\run.ps1
 ```
 
 ## Settings
@@ -44,17 +65,19 @@ chmod +x run.sh
 | `preferMode` | `ddmod` (default), `native`, or `auto` |
 | `libraryFolder` | Override install root when Steam is absent |
 | `includeDlc` | Also download DLC depots (default `false`) |
-| `hubcapApiKey` | Optional Hubcap `smm…` key for full lua library |
+| `hubcapApiKey` | Optional Hubcap `smm…` key for richer library dates |
+| `manifestCatalogUrl` | Override catalog JSON URL |
+| `manifestCatalogTtlHours` | Refresh interval (default `24`) |
 | `steamPath` | Override Steam root |
 
 ## Modes
 
-1. **ddmod (default)** — download depots with bundled DDMod into Steam library (or `~/Games/Arachnel/steamidra/`). Writes ACF + SLS/Luma unlock when Steam exists.
-2. **native** — prepare keys/lua and queue `steam://install/{appid}` (often blocked by ownership ticket for unowned apps).
+1. **ddmod (default)** — download depots with bundled DDMod. Writes ACF + SLS/Luma unlock when Steam exists.
+2. **native** — prepare keys/lua and queue `steam://install/{appid}`.
 
 ## Limits
 
-Needs a **depot key + manifest** for the title. Denuvo / private branches / missing keys → install fails with an error. Catalog without Hubcap = Steam featured/search, not every app.
+Needs a **depot key + manifest**. Catalog lists only titles with a known packaged manifest.
 
 ## License
 
