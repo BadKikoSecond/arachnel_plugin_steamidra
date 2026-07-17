@@ -30,13 +30,27 @@ PY
 )"
     [[ -n "$URL" ]] || { echo "No SLSsteam asset"; exit 1; }
     TMP="$(mktemp -d)"
-    curl -fsSL -o "$TMP/sls.bin" "$URL"
-    if file "$TMP/sls.bin" | grep -qi zip; then
-      unzip -qo "$TMP/sls.bin" -d "$TMP/out"
-    else
-      7z x "$TMP/sls.bin" "-o$TMP/out" -y >/dev/null
+    mkdir -p "$TMP/out"
+    curl -fL --retry 5 --retry-all-errors -o "$TMP/sls.bin" "$URL"
+    # Prefer 7z: `file` reports "7-zip archive", which falsely matches `grep zip`
+    # and then unzip fails on SLSsteam-Any.7z.
+    if ! 7z x "$TMP/sls.bin" "-o$TMP/out" -y >/dev/null; then
+      if file "$TMP/sls.bin" | grep -qiE 'Zip archive|zip compressed data'; then
+        unzip -qo "$TMP/sls.bin" -d "$TMP/out"
+      else
+        echo "Failed to extract SLSsteam from $URL"
+        file "$TMP/sls.bin" || true
+        ls -lh "$TMP/sls.bin" || true
+        exit 1
+      fi
     fi
-    find "$TMP/out" -name 'SLSsteam.so' -o -name 'library-inject.so' | while read -r f; do
+    mapfile -t _sls_files < <(find "$TMP/out" \( -name 'SLSsteam.so' -o -name 'library-inject.so' \) -type f)
+    if [[ "${#_sls_files[@]}" -eq 0 ]]; then
+      echo "SLSsteam.so not found in archive"
+      find "$TMP/out" -maxdepth 3 -type f | head -n 40 || true
+      exit 1
+    fi
+    for f in "${_sls_files[@]}"; do
       cp -a "$f" "$DEST/SLSsteam/"
     done
     rm -rf "$TMP"
