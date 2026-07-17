@@ -128,10 +128,16 @@ void SteamidraPlugin::ensureCatalogSeeded() const
             return false;
         const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
         QJsonArray games;
-        if (doc.isArray())
+        if (doc.isArray()) {
             games = doc.array();
-        else if (doc.isObject())
-            games = doc.object().value(QStringLiteral("games")).toArray();
+        } else if (doc.isObject()) {
+            const QJsonObject root = doc.object();
+            games = root.value(QStringLiteral("entries")).toArray();
+            if (games.isEmpty())
+                games = root.value(QStringLiteral("games")).toArray();
+            if (games.isEmpty())
+                games = root.value(QStringLiteral("downloads")).toArray();
+        }
         if (games.isEmpty())
             return false;
         appendGames(games);
