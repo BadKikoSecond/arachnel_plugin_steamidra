@@ -89,7 +89,7 @@ build:linux:
   timeout: 2h
   before_script:
     - apt-get update
-    - apt-get install -y --no-install-recommends ca-certificates cmake curl file g++ git ninja-build p7zip-full python3 python3-pip python3-venv unzip zip
+    - apt-get install -y --no-install-recommends ca-certificates cmake curl file g++ git ninja-build p7zip-full unrar python3 python3-pip python3-venv unzip zip
   script:
     - bash scripts/ci/build-plugin.sh
   artifacts:

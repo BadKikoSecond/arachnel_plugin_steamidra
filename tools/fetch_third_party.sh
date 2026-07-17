@@ -80,12 +80,21 @@ if [[ ! -f "$DEST/DDMod/DepotDownloaderMod.dll" ]]; then
   else
     echo "Downloading DepotDownloaderMod 3.4.0.2…"
     TMP_DD="$(mktemp -d)"
+    mkdir -p "$TMP_DD/out"
     curl -fL --retry 5 --retry-all-errors \
       -o "$TMP_DD/Release.rar" \
       "https://github.com/SteamAutoCracks/DepotDownloaderMod/releases/download/DepotDownloaderMod_3.4.0.2/Release.rar"
-    7z x "$TMP_DD/Release.rar" "-o$TMP_DD/out" -y >/dev/null
+    # p7zip often lacks RAR codecs ("Unsupported Method"); prefer unrar.
+    if command -v unrar >/dev/null 2>&1; then
+      unrar x -o+ "$TMP_DD/Release.rar" "$TMP_DD/out/" >/dev/null
+    elif 7z x "$TMP_DD/Release.rar" "-o$TMP_DD/out" -y >/dev/null; then
+      :
+    else
+      echo "Failed to extract DepotDownloaderMod RAR (install unrar or p7zip-rar)"
+      exit 1
+    fi
     DD_DLL="$(find "$TMP_DD/out" -type f -name DepotDownloaderMod.dll -print -quit)"
-    [[ -n "$DD_DLL" ]] || { echo "DepotDownloaderMod.dll missing in release"; exit 1; }
+    [[ -n "$DD_DLL" ]] || { echo "DepotDownloaderMod.dll missing in release"; find "$TMP_DD/out" | head -n 40; exit 1; }
     cp -a "$(dirname "$DD_DLL")/." "$DEST/DDMod/"
     rm -rf "$TMP_DD"
   fi

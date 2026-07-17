@@ -13,6 +13,9 @@ third_party/linux/SLSsteam/*.so
 third_party/windows/LumaCore/*.dll
 third_party/linux/DDMod/*.dll
 third_party/windows/DDMod/*.dll
-third_party/DDMod/*.dll
-third_party/DDMod/*.exe
 third_party/windows/DDMod/*.exe
+
+# Shared DDMod is vendored for CI (RAR extract needs unrar).
+!third_party/DDMod/
+!third_party/DDMod/**
+
