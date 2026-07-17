@@ -59,11 +59,21 @@ else
 fi
 
 if [[ ! -f "$DEST/DDMod/DepotDownloaderMod.dll" ]]; then
-  if [[ -f "$ROOT/third_party/linux/DDMod/DepotDownloaderMod.dll" ]]; then
+  if [[ -f "$ROOT/third_party/DDMod/DepotDownloaderMod.dll" ]]; then
+    cp -a "$ROOT/third_party/DDMod/"* "$DEST/DDMod/"
+  elif [[ -f "$ROOT/third_party/linux/DDMod/DepotDownloaderMod.dll" ]]; then
     cp -a "$ROOT/third_party/linux/DDMod/"* "$DEST/DDMod/"
   else
-    echo "Missing DepotDownloaderMod.dll — copy into $DEST/DDMod/"
-    exit 1
+    echo "Downloading DepotDownloaderMod 3.4.0.2…"
+    TMP_DD="$(mktemp -d)"
+    curl -fL --retry 5 --retry-all-errors \
+      -o "$TMP_DD/Release.rar" \
+      "https://github.com/SteamAutoCracks/DepotDownloaderMod/releases/download/DepotDownloaderMod_3.4.0.2/Release.rar"
+    7z x "$TMP_DD/Release.rar" "-o$TMP_DD/out" -y >/dev/null
+    DD_DLL="$(find "$TMP_DD/out" -type f -name DepotDownloaderMod.dll -print -quit)"
+    [[ -n "$DD_DLL" ]] || { echo "DepotDownloaderMod.dll missing in release"; exit 1; }
+    cp -a "$(dirname "$DD_DLL")/." "$DEST/DDMod/"
+    rm -rf "$TMP_DD"
   fi
 fi
 

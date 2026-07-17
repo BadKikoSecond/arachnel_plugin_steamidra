@@ -1,9 +1,12 @@
-# Daily installable-manifest catalog for SteaMidra.
+# Daily catalog plus tagged Steam plugin releases.
 # Schedule in GitLab: CI/CD → Schedules → cron `0 4 * * *` (UTC), target branch main.
 # Optional CI/CD variables: HUBCAP_API_KEY, CATALOG_PUSH_TOKEN (project access token with write_repository)
 
 stages:
   - catalog
+  - build
+  - package
+  - release
 
 variables:
   GIT_DEPTH: "1"
@@ -26,7 +29,7 @@ variables:
         exit 0
       fi
       git config user.email "ci@gitlab.com"
-      git config user.name "SteaMidra Catalog Bot"
+      git config user.name "Steam Catalog Bot"
       git add catalog/games-manifest-catalog.json config/games-manifest-catalog.json
       COUNT=$(python -c "import json; print(json.load(open('catalog/games-manifest-catalog.json'))['count'])")
       git commit -m "chore(catalog): refresh installable manifests ($COUNT games)"
@@ -66,7 +69,7 @@ rebuild-catalog-full:
     - python tools/build_manifest_catalog.py --steam-dates --workers 32 --verbose
     - |
       git config user.email "ci@gitlab.com"
-      git config user.name "SteaMidra Catalog Bot"
+      git config user.name "Steam Catalog Bot"
       git add catalog/games-manifest-catalog.json config/games-manifest-catalog.json
       COUNT=$(python -c "import json; print(json.load(open('catalog/games-manifest-catalog.json'))['count'])")
       git commit -m "chore(catalog): full rebuild installable manifests ($COUNT games)" || exit 0
@@ -79,3 +82,100 @@ rebuild-catalog-full:
   rules:
     - if: $CI_PIPELINE_SOURCE == "web"
       when: manual
+
+build:linux:
+  stage: build
+  image: ubuntu:24.04
+  timeout: 2h
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates cmake curl file g++ git ninja-build p7zip-full python3 python3-pip python3-venv unzip zip
+  script:
+    - bash scripts/ci/build-plugin.sh
+  artifacts:
+    name: steam-linux-$CI_COMMIT_TAG
+    paths:
+      - dist/linux/steam.arach
+    expire_in: 7 days
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[\w.]+)?$/
+
+build:windows:
+  stage: build
+  tags:
+    - saas-windows-medium-amd64
+  timeout: 2h
+  before_script:
+    - if (-not (Get-Command python -ErrorAction SilentlyContinue)) { choco install python3 -y --no-progress --execution-timeout 1200 }
+    - if (-not (Test-Path "C:\Program Files\7-Zip\7z.exe")) { choco install 7zip -y --no-progress --execution-timeout 1200 }
+    - python --version
+  script:
+    - pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/ci/build-plugin.ps1
+  artifacts:
+    name: steam-windows-$CI_COMMIT_TAG
+    paths:
+      - dist/windows/steam.arach
+    expire_in: 7 days
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[\w.]+)?$/
+
+package:universal:
+  stage: package
+  image: ubuntu:24.04
+  needs:
+    - job: build:linux
+      artifacts: true
+    - job: build:windows
+      artifacts: true
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends zip unzip
+  script:
+    - bash scripts/ci/merge-universal-arach.sh
+  artifacts:
+    name: steam-universal-$CI_COMMIT_TAG
+    paths:
+      - dist/universal/steam.arach
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[\w.]+)?$/
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: package:universal
+      artifacts: true
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - cp dist/universal/steam.arach steam.arach
+    - |
+      cat > release-notes.md <<EOF
+      # Steam plugin ${CI_COMMIT_TAG}
+
+      Install in Arachnel: **Settings → Plugins** → \`steam.arach\`.
+
+      Universal bundle for Windows and Linux, built against the Arachnel release toolchain.
+      Internal plugin id remains \`steamidra\` for settings and upgrade compatibility.
+      Requires Arachnel plugin API v3.
+      EOF
+    - |
+      curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --upload-file steam.arach \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/steam/${CI_COMMIT_TAG}/steam.arach"
+    - |
+      PACKAGE_ID="$(curl -fsS --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages?package_type=generic&package_name=steam&package_version=${CI_COMMIT_TAG}" \
+        | jq -r '.[0].id')"
+      FILE_ID="$(curl -fsS --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/${PACKAGE_ID}/package_files" \
+        | jq -r '.[0].id')"
+      DOWNLOAD_URL="${CI_PROJECT_URL}/-/package_files/${FILE_ID}/download"
+      release-cli create \
+        --name "Steam plugin ${CI_COMMIT_TAG}" \
+        --tag-name "${CI_COMMIT_TAG}" \
+        --description "$(cat release-notes.md)" \
+        --assets-link "[{\"name\":\"steam.arach\",\"url\":\"${DOWNLOAD_URL}\",\"link_type\":\"package\"}]"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[\w.]+)?$/

@@ -1,10 +1,10 @@
 {
   "id": "steamidra",
-  "name": "SteaMidra",
-  "version": "0.2.6",
+  "name": "Steam",
+  "version": "0.3.6",
   "apiVersion": 3,
   "library": "steamidra_plugin",
   "iconName": "stadia_controller",
-  "description": "Self-contained Steam depot installs (bundled DDMod + .NET; LumaCore / SLSsteam)",
-  "catalogUrl": "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json"
+  "description": "Steam depot installs via Arachnel Ryuu relay (manifests + fixes as addons)",
+  "catalogUrl": "https://ryuu.badkiko.ru/v1/catalog"
 }

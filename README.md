@@ -1,4 +1,6 @@
-# arachnel-plugin-steamidra
+# Steam plugin for Arachnel
+
+User-facing name: **Steam**. The internal id remains `steamidra` so existing installations and settings keep working.
 
 GPL-3 source plugin for [Arachnel](https://github.com/BadKiko/Arachnel): **self-contained** Steam depot installs via bundled **DepotDownloaderMod** + **.NET 9**, with **LumaCore** (Windows) / **SLSsteam** (Linux) when Steam is present.
 
@@ -26,6 +28,19 @@ python tools/build_manifest_catalog.py --steam-dates --verbose
 ```
 
 GitLab: **CI/CD → Schedules** → cron `0 4 * * *` on branch `master`, set `CATALOG_PUSH_TOKEN` (project access token, `write_repository`). Optional: `HUBCAP_API_KEY`.
+
+## Release
+
+Push a semantic version tag to build and publish a universal `steam.arach`:
+
+```bash
+git tag v0.3.6
+git push origin v0.3.6
+```
+
+GitLab builds Windows and Linux bundles, merges their platform runtimes, uploads the
+package, and creates a Release. The toolchain is pinned in
+`scripts/ci/launcher-toolchain.env`.
 
 ## What is bundled
 

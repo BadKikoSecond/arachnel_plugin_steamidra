@@ -18,6 +18,8 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import deque
+from typing import Any
 import tempfile
 import threading
 import time
@@ -26,7 +28,6 @@ import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any
 
 # Windows consoles often default to cp1251/cp1252 — force UTF-8 for JSON IPC.
 if hasattr(sys.stdout, "reconfigure"):
@@ -36,20 +37,32 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-HUBCAP_BASE = "https://hubcapmanifest.com/api/v1"
-MH3_LUA_URL = "https://steamtools.games/api/files/{appid}/lua"
-# Federated installable-manifest catalog (GitLab raw). Override via settings.manifestCatalogUrl.
-DEFAULT_MANIFEST_CATALOG_URL = (
-    "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json"
-)
+# Arachnel Ryuu relay only (catalog + manifests). Override via settings.relayBaseUrl.
+DEFAULT_RELAY_BASE = "https://ryuu.badkiko.ru"
+DEFAULT_MANIFEST_CATALOG_URL = f"{DEFAULT_RELAY_BASE}/v1/catalog"
 
 
-def _emit_progress(enabled: bool, **kwargs: Any) -> None:
-    if not enabled:
+# When True, also print a 1 Hz human ticker on stderr (CLI testing + debug).
+_cli_ticker = False
+_cli_last_print = 0.0
+_pct_eta_last_pct = 0.0
+_pct_eta_last_t = 0.0
+_pct_eta_rate = 0.0  # percent points per second
+_progress_log_path: Path | None = None
+_progress_phase = "download"  # download | verify
+
+
+def _append_progress_log(line: str) -> None:
+    """Append one full line (no \\r) so CLI tests can be audited after the run."""
+    if _progress_log_path is None:
         return
-    payload = {"type": "progress", **kwargs}
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    try:
+        _progress_log_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%H:%M:%S")
+        with _progress_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{ts} {line.rstrip()}\n")
+    except OSError:
+        pass
 
 
 def _fmt_bytes(n: int | float) -> str:
@@ -64,8 +77,12 @@ def _fmt_bytes(n: int | float) -> str:
     return f"{value:.1f} {units[unit]}"
 
 
+# Below this, treat as idle — never show "1 B/s" from EMA decay crumbs.
+MIN_DISPLAY_BPS = 8 * 1024
+
+
 def _fmt_speed(bps: float) -> str:
-    if bps <= 0:
+    if bps < MIN_DISPLAY_BPS:
         return "—"
     return f"{_fmt_bytes(bps)}/s"
 
@@ -84,19 +101,58 @@ def _fmt_eta(remaining: int, bps: float) -> str:
 def _trustworthy_total(downloaded: int, total: int) -> bool:
     if total <= 0 or downloaded < 0 or total < downloaded:
         return False
-    return total <= max(downloaded * 8, downloaded + 512 * 1024 * 1024)
+    # Never trust invented totals that blow past ~2× downloaded early on.
+    return total <= max(downloaded * 2, downloaded + 256 * 1024 * 1024)
 
 
-def transfer_detail(downloaded: int, total: int, bps: float) -> str:
-    """Size · speed · ETA. Omit fake totals — only show total when trustworthy."""
+def transfer_detail(downloaded: int, total: int, bps: float, *, percent: int = 0) -> str:
+    """Size · speed · ETA. Never invent a total — only show it when known+sane."""
+    global _pct_eta_last_pct, _pct_eta_last_t, _pct_eta_rate
+    now = time.monotonic()
+    # Only estimate ETA from % when bytes are actually moving (real download).
+    moving = bps >= MIN_DISPLAY_BPS
+    if percent > 0 and moving:
+        if _pct_eta_last_t > 0 and percent > _pct_eta_last_pct:
+            dt = now - _pct_eta_last_t
+            if dt >= 0.9:
+                inst = (percent - _pct_eta_last_pct) / dt
+                _pct_eta_rate = inst if _pct_eta_rate <= 0 else _pct_eta_rate * 0.6 + inst * 0.4
+                _pct_eta_last_pct = float(percent)
+                _pct_eta_last_t = now
+        elif _pct_eta_last_t <= 0:
+            _pct_eta_last_pct = float(percent)
+            _pct_eta_last_t = now
+        elif now - _pct_eta_last_t > 8.0:
+            _pct_eta_rate = 0.0
+    else:
+        _pct_eta_rate = 0.0
+
+    eta_from_pct = "—"
+    if moving and _pct_eta_rate > 0.01 and percent < 100:
+        rem_s = int(max(0.0, (100.0 - percent) / _pct_eta_rate))
+        if rem_s < 60:
+            eta_from_pct = f"{rem_s} s"
+        elif rem_s < 3600:
+            eta_from_pct = f"{rem_s // 60} min"
+        else:
+            eta_from_pct = f"{rem_s // 3600} h"
+
     if _trustworthy_total(downloaded, total):
-        return (
-            f"{_fmt_bytes(downloaded)} / {_fmt_bytes(total)} · "
-            f"{_fmt_speed(bps)} · ETA {_fmt_eta(max(0, total - downloaded), bps)}"
-        )
+        parts = [f"{_fmt_bytes(downloaded)} / {_fmt_bytes(total)}"]
+        if bps >= MIN_DISPLAY_BPS:
+            parts.append(_fmt_speed(bps))
+            parts.append(f"ETA {_fmt_eta(max(0, total - downloaded), bps)}")
+        elif eta_from_pct != "—":
+            parts.append(f"ETA {eta_from_pct}")
+        return " · ".join(parts)
     if downloaded > 0:
-        return f"{_fmt_bytes(downloaded)} · {_fmt_speed(bps)}"
-    return "Downloading…"
+        parts = [_fmt_bytes(downloaded)]
+        if bps >= MIN_DISPLAY_BPS:
+            parts.append(_fmt_speed(bps))
+            if eta_from_pct != "—":
+                parts.append(f"ETA {eta_from_pct}")
+        return " · ".join(parts)
+    return "Downloading..."
 
 
 def progress_kwargs(
@@ -113,9 +169,53 @@ def progress_kwargs(
         "detail": detail,
         "status": status,
         "bytesDownloaded": int(downloaded),
-        "totalBytes": int(total),
-        "downloadRateBps": int(max(0, bps)),
+        "totalBytes": int(total) if _trustworthy_total(downloaded, total) else 0,
+        "downloadRateBps": int(bps) if bps >= MIN_DISPLAY_BPS else 0,
     }
+
+
+def _print_cli_ticker(
+    percent: int,
+    downloaded: int,
+    total: int,
+    bps: float,
+    *,
+    detail: str | None = None,
+    force: bool = False,
+) -> None:
+    """Live \\r line on stderr + one appended line in progress log."""
+    global _cli_last_print
+    now = time.monotonic()
+    if not force and now - _cli_last_print < 0.95:
+        return
+    _cli_last_print = now
+    text = detail or transfer_detail(downloaded, total, bps, percent=percent)
+    line = f"[{percent:3d}%] {text}"
+    # Live terminal: overwrite same line.
+    sys.stderr.write(f"\r{line:<90}")
+    sys.stderr.flush()
+    # Audit log: every tick is a NEW line (what you asked for).
+    rate = int(bps) if bps >= MIN_DISPLAY_BPS else 0
+    _append_progress_log(
+        f"pct={percent} bytes={int(downloaded)} bps={rate} phase={_progress_phase} | {line}"
+    )
+
+
+def _emit_progress(enabled: bool, **kwargs: Any) -> None:
+    if enabled:
+        payload = {"type": "progress", **kwargs}
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    if _cli_ticker or enabled or _progress_log_path is not None:
+        _print_cli_ticker(
+            int(kwargs.get("percent") or 0),
+            int(kwargs.get("bytesDownloaded") or 0),
+            int(kwargs.get("totalBytes") or 0),
+            float(kwargs.get("downloadRateBps") or 0),
+            detail=str(kwargs.get("detail") or "") or None,
+            force=bool(kwargs.get("status") == "completed")
+            or int(kwargs.get("percent") or 0) >= 100,
+        )
 
 def dir_byte_size(path: Path) -> int:
     """One-shot directory size (slow on large trees — prefer DirSizeTracker)."""
@@ -136,6 +236,56 @@ def dir_byte_size(path: Path) -> int:
         except OSError:
             pass
     return total
+
+
+def process_io_bytes(pid: int) -> tuple[int, int] | None:
+    """Return process read/write transfer bytes without third-party modules."""
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class IoCounters(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_ulonglong),
+                    ("WriteOperationCount", ctypes.c_ulonglong),
+                    ("OtherOperationCount", ctypes.c_ulonglong),
+                    ("ReadTransferCount", ctypes.c_ulonglong),
+                    ("WriteTransferCount", ctypes.c_ulonglong),
+                    ("OtherTransferCount", ctypes.c_ulonglong),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessIoCounters.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(IoCounters),
+            ]
+            kernel32.GetProcessIoCounters.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                counters = IoCounters()
+                if not kernel32.GetProcessIoCounters(handle, ctypes.byref(counters)):
+                    return None
+                return int(counters.ReadTransferCount), int(counters.WriteTransferCount)
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, ValueError):
+            return None
+    if platform.system() == "Linux":
+        try:
+            values: dict[str, int] = {}
+            for line in Path(f"/proc/{pid}/io").read_text(encoding="ascii").splitlines():
+                key, value = line.split(":", 1)
+                values[key] = int(value.strip())
+            return values.get("read_bytes", 0), values.get("write_bytes", 0)
+        except (OSError, ValueError):
+            return None
+    return None
 
 
 class DirSizeTracker:
@@ -219,10 +369,12 @@ def _emit_result(obj: dict[str, Any], progress_mode: bool) -> None:
 
 def load_settings(path: str | None) -> dict[str, Any]:
     defaults = {
-        "hubcapApiKey": "",
-        "ryuuApiKey": "",
+        "relayBaseUrl": DEFAULT_RELAY_BASE,
+        "relayClientToken": "",
+        "manifestCatalogUrl": DEFAULT_MANIFEST_CATALOG_URL,
+        "manifestCatalogTtlHours": 24,
         "steamPath": "",
-        "preferMode": "ddmod",  # ddmod (default) | native | auto
+        "preferMode": "ddmod",  # ddmod | native | auto
         "libraryFolder": "",
         "includeDlc": False,
     }
@@ -244,16 +396,6 @@ def load_settings(path: str | None) -> dict[str, Any]:
         pass
     return defaults
 
-
-def hubcap_headers(settings: dict[str, Any]) -> dict[str, str] | None:
-    key = (settings.get("hubcapApiKey") or "").strip()
-    if not (key.startswith("smm") and len(key) > 10):
-        return None
-    return {
-        "Authorization": f"Bearer {key}",
-        "User-Agent": "Arachnel-SteaMidra/0.1",
-        "Accept": "application/json",
-    }
 
 
 def find_steam_path(settings: dict[str, Any]) -> Path | None:
@@ -300,36 +442,6 @@ def http_get_bytes(url: str, headers: dict[str, str] | None = None, timeout: int
         return resp.read()
 
 
-def entry_from_hubcap_item(item: dict[str, Any]) -> dict[str, Any] | None:
-    appid = str(item.get("game_id") or item.get("appid") or item.get("id") or "")
-    if not appid or not appid.isdigit():
-        return None
-    title = item.get("game_name") or item.get("name") or item.get("title") or f"App {appid}"
-    size = item.get("manifest_size") or item.get("size") or 0
-    size_label = ""
-    try:
-        n = int(size)
-        if n > 0:
-            size_label = f"{n / (1024 ** 3):.1f} GB" if n > 1024**2 else f"{n // 1024} KB"
-    except Exception:
-        pass
-    uploaded = str(item.get("uploaded_date") or item.get("last_updated") or "").strip()
-    version = uploaded[:10] if uploaded else ""
-    return {
-        "id": f"steam-{appid}",
-        "title": title,
-        "steamAppId": appid,
-        "coverUrl": f"https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg",
-        "description": "",
-        "sizeLabel": size_label,
-        "uploadDate": uploaded,
-        "version": version,
-        "hasManifest": True,
-        "manifestSource": "hubcap",
-        "delivery": "steam-manifest",
-        "sourceId": "steamidra",
-    }
-
 
 def load_local_games_json(plugin_root: Path) -> list[dict[str, Any]]:
     for rel in ("config/games.json", "games.json", "worker/games.json"):
@@ -360,10 +472,6 @@ def load_local_games_json(plugin_root: Path) -> list[dict[str, Any]]:
                         "version": it.get("version") or "",
                     }
                 )
-            else:
-                parsed = entry_from_hubcap_item(it)
-                if parsed:
-                    out.append(parsed)
         if out:
             return out
     return []
@@ -422,83 +530,6 @@ SEED_APPIDS = [
     "892970",
 ]
 
-
-def hubcap_library(settings: dict[str, Any], search: str | None = None, limit: int = 40) -> list[dict[str, Any]]:
-    headers = hubcap_headers(settings)
-    if not headers:
-        return []
-    params: dict[str, Any] = {"limit": limit, "offset": 0, "sort_by": "updated"}
-    if search:
-        params["search"] = search
-    url = f"{HUBCAP_BASE}/library?" + urllib.parse.urlencode(params)
-    try:
-        data = http_get_json(url, headers=headers)
-    except Exception:
-        return []
-    games: list[dict[str, Any]] = []
-    for it in data.get("games") or []:
-        e = entry_from_hubcap_item(it)
-        if e:
-            games.append(e)
-    return games
-
-
-def hubcap_search(settings: dict[str, Any], query: str, limit: int = 40) -> list[dict[str, Any]]:
-    headers = hubcap_headers(settings)
-    if not headers:
-        return []
-    # Numeric query → treat as appid lookup via search
-    params = {"q": query, "limit": limit}
-    if query.strip().isdigit():
-        params["appid"] = "true"
-    url = f"{HUBCAP_BASE}/search?" + urllib.parse.urlencode(params)
-    try:
-        data = http_get_json(url, headers=headers)
-    except Exception:
-        return hubcap_library(settings, search=query, limit=limit)
-    games: list[dict[str, Any]] = []
-    items = data.get("results") or data.get("games") or data.get("items") or []
-    if isinstance(data, list):
-        items = data
-    for it in items:
-        e = entry_from_hubcap_item(it)
-        if e:
-            games.append(e)
-    return games
-
-
-def hubcap_library_pages(settings: dict[str, Any], max_pages: int = 10, page_size: int = 100) -> list[dict[str, Any]]:
-    """Pull multiple Hubcap /library pages (installable manifests), not the full Steam store."""
-    headers = hubcap_headers(settings)
-    if not headers:
-        return []
-    games: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for page in range(max_pages):
-        params = {"limit": page_size, "offset": page * page_size, "sort_by": "updated"}
-        url = f"{HUBCAP_BASE}/library?" + urllib.parse.urlencode(params)
-        try:
-            data = http_get_json(url, headers=headers)
-        except Exception:
-            break
-        batch = data.get("games") or []
-        if not batch:
-            break
-        for it in batch:
-            e = entry_from_hubcap_item(it)
-            if not e:
-                continue
-            appid = e["steamAppId"]
-            if appid in seen:
-                continue
-            seen.add(appid)
-            games.append(e)
-        total = int(data.get("total_count") or 0)
-        if total and len(games) >= total:
-            break
-        if len(batch) < page_size:
-            break
-    return games
 
 
 def steam_featured_fallback(limit: int = 60) -> list[dict[str, Any]]:
@@ -628,8 +659,8 @@ def load_or_build_depotkeys_catalog(
 def manifest_catalog_cache_path(settings: dict[str, Any], plugin_root: Path) -> Path:
     configured = (settings.get("_settingsPath") or "").strip()
     if configured:
-        return Path(configured).parent / "games-manifest-catalog.json"
-    return plugin_root / "config" / "games-manifest-catalog.json"
+        return Path(configured).expanduser().resolve().parent / "games-manifest-catalog.json"
+    return (plugin_root / "games-manifest-catalog.json").resolve()
 
 
 def normalize_catalog_game(raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -653,7 +684,7 @@ def normalize_catalog_game(raw: dict[str, Any]) -> dict[str, Any] | None:
     version = str(raw.get("version") or "").strip() or (upload[:10] if upload else "")
     size = str(raw.get("fileSize") or raw.get("sizeLabel") or "").strip()
     title = str(raw.get("title") or raw.get("name") or f"App {appid}").strip()
-    return {
+    entry: dict[str, Any] = {
         "id": str(raw.get("id") or f"steam-{appid}"),
         "title": title,
         "steamAppId": appid,
@@ -667,7 +698,33 @@ def normalize_catalog_game(raw: dict[str, Any]) -> dict[str, Any] | None:
         "manifestSource": str(raw.get("manifestSource") or raw.get("manifest_source") or ""),
         "delivery": delivery or "steam-manifest",
         "sourceId": source_id or "steamidra",
+        "genres": str(raw.get("genres") or ""),
     }
+    addons_in = raw.get("addons")
+    if isinstance(addons_in, list) and addons_in:
+        addons_out: list[dict[str, Any]] = []
+        for addon in addons_in:
+            if not isinstance(addon, dict):
+                continue
+            uris = addon.get("uris") if isinstance(addon.get("uris"), list) else []
+            uris = [str(u) for u in uris if u]
+            addons_out.append(
+                {
+                    "id": str(addon.get("id") or ""),
+                    "title": str(addon.get("title") or "Fix"),
+                    "kind": str(addon.get("kind") or "addon"),
+                    "delivery": str(addon.get("delivery") or "direct"),
+                    "fileSize": str(addon.get("fileSize") or ""),
+                    "uploadDate": str(addon.get("uploadDate") or ""),
+                    "uris": uris,
+                    "referer": str(addon.get("referer") or ""),
+                    "getfileUrl": str(addon.get("getfileUrl") or ""),
+                    "optional": bool(addon.get("optional", True)),
+                }
+            )
+        if addons_out:
+            entry["addons"] = addons_out
+    return entry
 
 
 def parse_manifest_catalog_payload(data: Any) -> list[dict[str, Any]]:
@@ -695,15 +752,16 @@ def parse_manifest_catalog_payload(data: Any) -> list[dict[str, Any]]:
 def download_manifest_catalog(url: str, dest: Path, *, max_age_s: float = 3600) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and max_age_s > 0:
-        age = time.monotonic() - dest.stat().st_mtime
+        age = time.time() - dest.stat().st_mtime
         if age < max_age_s:
             return True
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Arachnel-SteaMidra/0.2"},
+        headers={"User-Agent": "Arachnel-SteaMidra/0.3"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        # Relay catalog is ~20MB+; allow a long first fetch.
+        with urllib.request.urlopen(req, timeout=300) as resp:
             payload = resp.read()
     except Exception:
         return dest.is_file()
@@ -714,16 +772,14 @@ def download_manifest_catalog(url: str, dest: Path, *, max_age_s: float = 3600) 
     games = parse_manifest_catalog_payload(data)
     if len(games) < 10:
         return dest.is_file()
-    doc = data if isinstance(data, dict) else {"entries": games}
-    if isinstance(doc, dict) and "entries" not in doc and "games" not in doc:
-        doc = {
-            "schemaVersion": 1,
-            "catalogKind": "installable-manifest",
-            "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "count": len(games),
-            "entries": games,
-        }
-    dest.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+    doc = {
+        "schemaVersion": 1,
+        "catalogKind": "ryuu-relay" if "ryuu" in url else "installable-manifest",
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "count": len(games),
+        "entries": games,
+    }
+    dest.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
     return True
 
 
@@ -741,134 +797,103 @@ def load_manifest_catalog_file(path: Path, *, min_entries: int = 10) -> list[dic
 def load_or_sync_manifest_catalog(
     settings: dict[str, Any], plugin_root: Path, *, force_download: bool = False
 ) -> list[dict[str, Any]]:
-    """Installable games only — manifest packages confirmed in federated JSON."""
+    """Fetch catalog from Arachnel Ryuu relay into local cache (no stale bundled dump)."""
     cache = manifest_catalog_cache_path(settings, plugin_root)
-    bundled = plugin_root / "config" / "games-manifest-catalog.json"
     url = str(settings.get("manifestCatalogUrl") or DEFAULT_MANIFEST_CATALOG_URL).strip()
     ttl = float(settings.get("manifestCatalogTtlHours") or 24) * 3600
-    if force_download and url:
-        download_manifest_catalog(url, cache, max_age_s=0)
-    elif url:
-        download_manifest_catalog(url, cache, max_age_s=ttl if not force_download else 0)
+    if not url:
+        return load_manifest_catalog_file(cache, min_entries=1)
 
-    games = load_manifest_catalog_file(cache, min_entries=1)
-    if games:
-        return games
-    games = load_manifest_catalog_file(bundled, min_entries=1)
-    if games:
-        return games
-    return []
+    # Reject stale GitLab dump left in cache from older plugin builds.
+    if cache.is_file():
+        try:
+            peek = json.loads(cache.read_text(encoding="utf-8"))
+            kind = str(peek.get("catalogKind") or "") if isinstance(peek, dict) else ""
+            entries = peek.get("entries") if isinstance(peek, dict) else None
+            count = len(entries) if isinstance(entries, list) else 0
+            if kind in ("installable-manifest",) and count < 10000:
+                cache.unlink(missing_ok=True)
+                force_download = True
+        except Exception:
+            pass
+
+    if force_download:
+        download_manifest_catalog(url, cache, max_age_s=0)
+    else:
+        download_manifest_catalog(url, cache, max_age_s=ttl)
+
+    return load_manifest_catalog_file(cache, min_entries=1)
 
 
 def cmd_catalog_sync(settings: dict[str, Any], plugin_root: Path, *, force: bool = False) -> dict[str, Any]:
     games = load_or_sync_manifest_catalog(settings, plugin_root, force_download=force)
     cache = manifest_catalog_cache_path(settings, plugin_root)
-    if games:
+    if games and cache.is_file():
         return {
             "ok": True,
-            "catalogPath": str(cache if cache.is_file() else plugin_root / "config" / "games-manifest-catalog.json"),
-            "source": "manifest-catalog",
+            "catalogPath": str(cache.resolve()),
+            "source": "ryuu-relay",
             "count": len(games),
             "games": [],
         }
-    return {"ok": False, "error": "Manifest catalog unavailable — publish data/games-manifest-catalog.json or run tools/build_manifest_catalog.py"}
+    return {
+        "ok": False,
+        "error": "Relay catalog unavailable. Check relayBaseUrl / network.",
+        "count": 0,
+        "games": [],
+    }
 
 
 def cmd_catalog_seed(settings: dict[str, Any], plugin_root: Path) -> dict[str, Any]:
-    """Installable catalog = federated manifest JSON (GitLab). Keys-only depot DB is fallback."""
-    manifest = load_or_sync_manifest_catalog(settings, plugin_root)
+    """Pull catalog from Arachnel Ryuu relay."""
+    manifest = load_or_sync_manifest_catalog(settings, plugin_root, force_download=False)
+    if not manifest:
+        manifest = load_or_sync_manifest_catalog(settings, plugin_root, force_download=True)
     if manifest:
         cache = manifest_catalog_cache_path(settings, plugin_root)
-        path = cache if cache.is_file() else plugin_root / "config" / "games-manifest-catalog.json"
+        path = cache if cache.is_file() else (plugin_root / "games-manifest-catalog.json")
         return {
             "ok": True,
             "games": [],
-            "catalogPath": str(path),
-            "source": "manifest-catalog",
+            "catalogPath": str(path.resolve()),
+            "source": "ryuu-relay",
             "count": len(manifest),
         }
-
-    depot_err = ""
-    try:
-        games = load_or_build_depotkeys_catalog(settings, plugin_root)
-        if games:
-            cache = games_catalog_cache_path(settings, plugin_root)
-            return {
-                "ok": True,
-                "games": [],
-                "catalogPath": str(cache),
-                "source": "depotkeys",
-                "count": len(games),
-                "warning": "Manifest catalog missing — showing keys-only titles (download may fail)",
-            }
-    except Exception as exc:
-        depot_err = str(exc)
-
-    # Optional Hubcap library (richer metadata) when API key is set.
-    hub = hubcap_library_pages(settings, max_pages=30, page_size=100)
-    if hub:
-        return {
-            "ok": True,
-            "games": hub,
-            "source": "hubcap",
-            "count": len(hub),
-            "warning": depot_err or None,
-        }
-
-    local = load_local_games_json(plugin_root)
-    if local:
-        return {
-            "ok": True,
-            "games": local,
-            "source": "games.json",
-            "count": len(local),
-            "warning": depot_err or None,
-        }
-
-    featured = steam_featured_fallback()
     return {
-        "ok": True,
-        "games": featured,
-        "source": "steam-featured",
-        "count": len(featured),
-        "warning": depot_err or None,
+        "ok": False,
+        "error": "Relay catalog unavailable. Check relayBaseUrl / network.",
+        "games": [],
+        "count": 0,
     }
+
 
 def cmd_search(query: str, settings: dict[str, Any], plugin_root: Path) -> dict[str, Any]:
     q = query.strip()
+    catalog = load_or_sync_manifest_catalog(settings, plugin_root)
     if not q:
-        return cmd_catalog_seed(settings, plugin_root)
-
-    # Exact appid
+        return {
+            "ok": True,
+            "games": catalog[:200],
+            "source": "ryuu-relay",
+            "count": len(catalog),
+        }
     if q.isdigit():
+        hit = [g for g in catalog if g.get("steamAppId") == q]
+        if hit:
+            return {"ok": True, "games": hit, "source": "ryuu-relay"}
         try:
             g = steam_app_details(q)
             if g:
                 return {"ok": True, "games": [g], "source": "steam-appid"}
         except Exception:
             pass
-
-    hub = hubcap_search(settings, q)
-    if hub:
-        return {"ok": True, "games": hub, "source": "hubcap"}
-
     ql = q.lower()
-    catalog: list[dict[str, Any]] = load_or_sync_manifest_catalog(settings, plugin_root)
-    if not catalog:
-        try:
-            catalog = load_or_build_depotkeys_catalog(settings, plugin_root)
-        except Exception:
-            catalog = load_local_games_json(plugin_root)
-    if catalog:
-        filtered = [
-            g
-            for g in catalog
-            if ql in (g.get("title") or "").lower() or q == g.get("steamAppId")
-        ]
-        if filtered:
-            return {"ok": True, "games": filtered[:80], "source": "depotkeys"}
-
-    return {"ok": True, "games": steam_store_search(q), "source": "steam-store"}
+    filtered = [
+        g
+        for g in catalog
+        if ql in (g.get("title") or "").lower() or q == g.get("steamAppId")
+    ]
+    return {"ok": True, "games": filtered[:80], "source": "ryuu-relay"}
 
 
 def cmd_app_details(appid: str) -> dict[str, Any]:
@@ -1085,7 +1110,7 @@ def build_lua_from_steamcmd(
     if keyed == 0:
         raise RuntimeError(
             f"No depot decryption keys for app {appid} in public key DB "
-            f"({len(depot_ids)} depot(s) known). Set hubcapApiKey or ryuuApiKey in plugin settings."
+            f"({len(depot_ids)} depot(s) known)."
         )
     return "\n".join(lines) + "\n"
 
@@ -1096,16 +1121,7 @@ def fetch_lua(
     staging: Path,
     progress: bool = False,
 ) -> str:
-    """Fetch stplug-in lua + extract any bundled .manifest files into staging.
-
-    Prefer packaged mirrors (revobd/Hubcap) when they include manifests — Steam now
-    returns HTTP 401 for anonymous manifest CDN downloads. Depot-key DB is the
-    fast offline fallback for keys, then we still probe packages for manifests.
-    Prep phase always reports 0%.
-    """
-    headers = hubcap_headers(settings)
-    errors: list[str] = []
-    probe_timeout = 8
+    """Fetch lua + .manifest package from Arachnel Ryuu relay only."""
 
     def _prep(msg: str) -> None:
         _emit_progress(progress, percent=0, detail=msg, status="downloading")
@@ -1116,108 +1132,54 @@ def fetch_lua(
             return None
         return lua
 
-    def _package_has_manifests() -> bool:
+    def _has_manifests() -> bool:
         return any(staging.glob("*.manifest"))
 
-    _prep("Getting game info…")
+    relay = str(settings.get("relayBaseUrl") or DEFAULT_RELAY_BASE).strip().rstrip("/")
+    if not relay:
+        raise RuntimeError("relayBaseUrl is empty")
 
-    # 1) Packaged sources first (lua + .manifest) — required since Steam 401 on CDN.
-    if headers:
-        for path in (f"/lua/{appid}", f"/manifest/{appid}"):
-            try:
-                raw = http_get_bytes(
-                    f"{HUBCAP_BASE}{path}", headers=headers, timeout=probe_timeout
-                )
-                lua = _from_package(raw)
-                if lua and (_package_has_manifests() or "setmanifestid" in lua.lower()):
-                    return lua
-                if lua:
-                    errors.append(f"hubcap{path}: lua without manifests")
-            except Exception as exc:
-                errors.append(f"hubcap{path}: {exc}")
+    headers = {"User-Agent": "Arachnel-SteaMidra/0.3", "Accept": "*/*"}
+    token = str(settings.get("relayClientToken") or "").strip()
+    if token:
+        headers["X-Arachnel-Token"] = token
 
-    try:
-        raw = http_get_bytes(
-            f"https://api.luagen.revobd.club/{appid}.zip", timeout=probe_timeout
-        )
-        lua = _from_package(raw)
-        if lua and (_package_has_manifests() or "setmanifestid" in lua.lower()):
-            return lua
-        if lua:
-            # Keep lua/keys; manifests may still be missing (e.g. MECCHA package).
-            errors.append("revobd: lua without manifests")
-            packaged_lua = lua
-        else:
-            packaged_lua = None
-            errors.append("revobd: no lua in zip")
-    except Exception as exc:
-        packaged_lua = None
-        errors.append(f"revobd: {exc}")
-
-    ryuu_key = (settings.get("ryuuApiKey") or "").strip()
-    try:
-        url = f"https://generator.ryuu.lol/secure_download?appid={appid}"
-        if ryuu_key:
-            url += f"&auth_code={urllib.parse.quote(ryuu_key)}"
-        raw = http_get_bytes(url, timeout=probe_timeout)
-        lua = _from_package(raw)
-        if lua and (_package_has_manifests() or "setmanifestid" in lua.lower()):
-            return lua
-        if lua:
-            packaged_lua = packaged_lua or lua
-            errors.append("ryuu: lua without manifests")
-    except Exception as exc:
-        errors.append(f"ryuu: {exc}")
-
-    for url in (
-        f"https://cdn.jsdelivr.net/gh/oureveryday/Steam-Depot-Manifest-Database@main/depots/{appid}.lua",
-        f"https://raw.githubusercontent.com/oureveryday/Steam-Depot-Manifest-Database/main/depots/{appid}.lua",
-    ):
+    errors: list[str] = []
+    _prep("Relay…")
+    for file_type in ("manifest", "lua"):
         try:
-            raw = http_get_bytes(url, timeout=probe_timeout)
-            text = raw.decode("utf-8", errors="replace")
-            if "addappid" in text.lower() and "setmanifestid" in text.lower():
-                return text
-            if "addappid" in text.lower():
-                packaged_lua = packaged_lua or text
+            _prep(f"Relay ({file_type})…")
+            raw = http_get_bytes(
+                f"{relay}/v1/download/{appid}?file_type={file_type}",
+                headers=headers,
+                timeout=120,
+            )
+            if file_type == "lua":
+                text_lua = raw.decode("utf-8", errors="replace")
+                if "addappid" not in text_lua.lower():
+                    errors.append("relay lua: invalid")
+                    continue
+                (staging / f"{appid}.lua").write_text(text_lua, encoding="utf-8")
+                if _has_manifests() or "setmanifestid" in text_lua.lower():
+                    return text_lua
+                errors.append("relay lua: no manifests")
+                continue
+            lua = _from_package(raw)
+            if lua and (_has_manifests() or "setmanifestid" in lua.lower()):
+                return lua
+            if lua:
+                errors.append("relay zip: lua without manifests")
+            else:
+                errors.append("relay zip: no lua")
         except Exception as exc:
-            errors.append(f"mirror: {exc}")
+            errors.append(f"relay {file_type}: {exc}")
 
-    # 2) Offline depot-key DB (keys only — Steam will 401 without local manifests).
-    depotkeys_lua: str | None = None
-    no_keys = False
-    try:
-        depotkeys_lua = build_lua_from_depotkeys(appid, settings, progress=progress)
-    except Exception as exc:
-        errors.append(f"depotkeys: {exc}")
-        no_keys = "No depot decryption keys" in str(exc)
-
-    # Prefer package lua if it has keys; otherwise depotkeys. Manifests already in staging.
-    chosen = packaged_lua or depotkeys_lua
-    if chosen and (_package_has_manifests() or "setmanifestid" in chosen.lower()):
-        return chosen
-
-    # 3) steamcmd enrichment (often down) — only if we still lack manifests.
-    if depotkeys_lua and not _package_has_manifests():
-        try:
-            enriched = build_lua_from_steamcmd(appid, settings, progress=progress)
-            if enriched:
-                return enriched
-        except Exception as exc:
-            errors.append(f"steamcmd: {exc}")
-
-    if chosen:
-        # May still fail at DDMod with Steam 401 — caller surfaces a clear error.
-        return chosen
-
-    if no_keys:
-        raise RuntimeError(
-            "This game is not available for download right now. Try another title."
-        )
-
+    detail = "; ".join(errors[-4:]) if errors else "unknown"
     raise RuntimeError(
-        "Could not prepare this game for download. Try again later or pick another title."
+        f"Relay could not prepare app {appid} ({detail}). "
+        "Check https://ryuu.badkiko.ru and RYUU_AUTH_KEY on the relay host."
     )
+
 
 
 def write_stplugin_lua(steam: Path, appid: str, lua: str) -> Path:
@@ -1818,10 +1780,10 @@ def write_acf_stub(steam: Path, appid: str, title: str, installdir: str, size: i
 
 
 def find_ddmod(plugin_root: Path) -> Path | None:
+    os_dir = "windows" if platform.system() == "Windows" else "linux"
     candidates = [
+        plugin_root / "third_party" / os_dir / "DDMod" / "DepotDownloaderMod.dll",
         plugin_root / "third_party" / "DDMod" / "DepotDownloaderMod.dll",
-        plugin_root / "third_party" / "linux" / "DDMod" / "DepotDownloaderMod.dll",
-        plugin_root / "third_party" / "windows" / "DDMod" / "DepotDownloaderMod.dll",
         plugin_root / "third_party" / "DepotDownloaderMod.dll",
     ]
     for c in candidates:
@@ -1833,12 +1795,14 @@ def find_ddmod(plugin_root: Path) -> Path | None:
 def find_dotnet(plugin_root: Path | None = None) -> str | None:
     cands: list[str] = []
     if plugin_root:
+        if platform.system() == "Windows":
+            platform_dotnet = ("third_party/windows/dotnet/dotnet.exe",)
+        else:
+            platform_dotnet = ("third_party/linux/dotnet/dotnet",)
         for rel in (
+            *platform_dotnet,
             "third_party/dotnet/dotnet",
             "third_party/dotnet/dotnet.exe",
-            "third_party/linux/dotnet/dotnet",
-            "third_party/windows/dotnet/dotnet.exe",
-            "third_party/windows/dotnet/dotnet",
         ):
             cands.append(str(plugin_root / rel))
     cands.extend(
@@ -1981,6 +1945,41 @@ def find_game_exe(install_path: Path) -> Path | None:
     return exes[0]
 
 
+# Partial downloads are usually far smaller; skip DDMod verify theater above this.
+_ALREADY_INSTALLED_MIN_BYTES = 80 * 1024 * 1024
+
+
+def already_installed_hint(install_path: Path, appid: str) -> dict[str, Any] | None:
+    """Return meta if target looks fully installed (marker and/or exe + size)."""
+    if not install_path.is_dir():
+        return None
+    exe = find_game_exe(install_path)
+    if exe is None:
+        return None
+    marker = install_path / ".arachnel-steamidra"
+    meta: dict[str, Any] = {}
+    if marker.is_file():
+        try:
+            meta = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        if str(meta.get("appid") or "") not in ("", str(appid)):
+            return None
+        if str(meta.get("appid") or "") == str(appid):
+            return meta
+    # Interrupted install left files but no marker — don't re-verify for minutes.
+    size = dir_byte_size(install_path)
+    if size < _ALREADY_INSTALLED_MIN_BYTES:
+        return None
+    return {
+        "appid": str(appid),
+        "mode": "ddmod",
+        "launch": {"type": "exe", "path": str(exe)},
+        "inferred": True,
+        "bytes": size,
+    }
+
+
 def launch_hint(steam: Path | None, appid: str, install_path: Path) -> dict[str, Any]:
     if steam is not None and (steam / "steamapps" / f"appmanifest_{appid}.acf").is_file():
         return {"type": "steam", "uri": f"steam://rungameid/{appid}"}
@@ -2022,66 +2021,98 @@ def run_ddmod(
     depot_os = resolve_depot_os(appid)
     total = max(1, len(depots))
     pct_re = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*%")
-    size_origin = dir_byte_size(dest) if dest.is_dir() else 0
-    size_tracker = DirSizeTracker(dest, interval_s=0.15)
+    # Folder size is only a total-size hint: DDMod preallocates large files, so
+    # logical size must never be used as downloaded bytes or download speed.
+    size_tracker = DirSizeTracker(dest, interval_s=0.2)
     size_tracker.start()
-    estimated_total_bytes = max(0, size_origin)
-    t0 = time.monotonic()
-    last_bytes = 0
-    last_t = t0
-    speed = 0.0
+    # Actual downloaded bytes/s come from the child process I/O counters.
+    # Percent: DDMod is per-file — rate-limit display to +1%/s (no 12→26 jumps).
+    speed_samples: deque[tuple[float, int]] = deque(maxlen=16)
+    speed_samples.append((time.monotonic(), 0))
+    speed_ema = 0.0
+    pct_smooth = 1.0
+    pct_last_t = time.monotonic()
     err_tail: list[str] = []
+    last_emit_downloaded = -1
+    depot_peak_local = 0.0
+    completed_written = 0
 
-    def _current_downloaded() -> int:
-        return max(0, size_tracker.snapshot() - size_origin)
+    def _update_speed(now: float, downloaded: int) -> float:
+        nonlocal speed_ema
+        speed_samples.append((now, downloaded))
+        while len(speed_samples) >= 2 and now - speed_samples[0][0] > 5.0:
+            speed_samples.popleft()
+        if len(speed_samples) < 2:
+            return speed_ema if speed_ema >= MIN_DISPLAY_BPS else 0.0
+        t0, b0 = speed_samples[0]
+        t1, b1 = speed_samples[-1]
+        dt = t1 - t0
+        if dt < 0.9:
+            return speed_ema if speed_ema >= MIN_DISPLAY_BPS else 0.0
+        delta = b1 - b0
+        if delta <= 0:
+            # Idle / verifying — clear crumb speeds (avoids perpetual "1 B/s").
+            speed_ema = 0.0
+            return 0.0
+        inst = delta / dt
+        alpha = min(1.0, dt / 2.5)
+        speed_ema = inst if speed_ema < MIN_DISPLAY_BPS else speed_ema * (1.0 - alpha) + inst * alpha
+        if speed_ema < MIN_DISPLAY_BPS:
+            speed_ema = 0.0
+        return speed_ema
 
-    def _update_speed(now: float, downloaded: int) -> None:
-        nonlocal last_bytes, last_t, speed
-        dt = now - last_t
-        if dt < 0.15 or downloaded <= last_bytes:
-            return
-        delta = downloaded - last_bytes
-        if delta < 80 * 1024 * 1024:
-            speed = delta / dt
-        last_bytes = downloaded
-        last_t = now
-
-    def _resolve_progress(
-        overall_pct: int, raw_downloaded: int
-    ) -> tuple[int, int, int]:
-        nonlocal estimated_total_bytes
-        downloaded = max(0, raw_downloaded)
-        # DDMod prints per-file percent — ignore low % when inferring total size.
-        if overall_pct >= 8 and downloaded > 0:
-            candidate = int(downloaded * 100 / overall_pct)
-            if _trustworthy_total(downloaded, candidate):
-                estimated_total_bytes = max(estimated_total_bytes, candidate)
-        total = estimated_total_bytes
-        if not _trustworthy_total(downloaded, total):
-            total = 0
-            estimated_total_bytes = 0
-        if downloaded <= 0 and total > 0 and overall_pct > 0:
-            downloaded = int(total * overall_pct / 100)
-        if total > 0 and downloaded > 0:
-            byte_pct = max(1, min(99, int(downloaded * 100 / total)))
-            overall_pct = max(overall_pct, byte_pct)
-        return overall_pct, downloaded, total
+    def _smooth_pct(raw: float, *, verifying: bool = False) -> int:
+        """Smooth DDMod %. Download: ~1.5%/s. Verify: catch up fast (no 100s crawl)."""
+        nonlocal pct_smooth, pct_last_t
+        now = time.monotonic()
+        dt = max(0.05, now - pct_last_t)
+        pct_last_t = now
+        target = max(1.0, min(99.0, float(raw)))
+        # Verifying already-on-disk files must not crawl at 1%/s for minutes.
+        max_step = (20.0 if verifying else 1.5) * dt
+        if target > pct_smooth:
+            pct_smooth = min(target, pct_smooth + max_step)
+        elif target < pct_smooth:
+            # Never drop from DDMod per-file reset.
+            pct_smooth = max(target, pct_smooth - 0.15 * dt)
+        return max(1, min(99, int(round(pct_smooth))))
 
     def _emit_download(
         overall_pct: int,
         raw_downloaded: int,
         *,
         detail: str | None = None,
+        reading: bool = False,
     ) -> None:
-        overall_pct, downloaded, total = _resolve_progress(overall_pct, raw_downloaded)
+        global _progress_phase
+        nonlocal last_emit_downloaded
+        downloaded = max(0, raw_downloaded)
+        bps = _update_speed(time.monotonic(), downloaded)
+        stagnant = last_emit_downloaded >= 0 and downloaded <= last_emit_downloaded
+        last_emit_downloaded = downloaded
+        verifying = stagnant and reading and bps < MIN_DISPLAY_BPS
+        _progress_phase = "verify" if verifying else "download"
+        percent = _smooth_pct(overall_pct, verifying=verifying)
+        total_hint = max(downloaded, size_tracker.snapshot())
+        # Unlike downloaded bytes, DDMod's preallocated logical file size is a
+        # useful total. Prefer byte progress once that total becomes available.
+        if total_hint >= 64 * 1024 * 1024 and 0 < downloaded <= total_hint:
+            percent = max(percent, min(99, int(downloaded * 99 / total_hint)))
+        if detail is None:
+            if verifying and percent >= 3:
+                auto_detail = f"{_fmt_bytes(downloaded)} · verifying..."
+            else:
+                auto_detail = transfer_detail(downloaded, total_hint, bps, percent=percent)
+        else:
+            auto_detail = detail
         _emit_progress(
             progress,
             **progress_kwargs(
-                percent=overall_pct,
-                detail=detail or transfer_detail(downloaded, total, speed),
+                percent=percent,
+                detail=auto_detail,
                 downloaded=downloaded,
-                total=total,
-                bps=speed,
+                total=total_hint,
+                bps=bps,
             ),
         )
 
@@ -2090,8 +2121,8 @@ def run_ddmod(
             frac0 = i / total
             _emit_download(
                 max(1, int(99 * frac0)),
-                _current_downloaded(),
-                detail="Downloading…",
+                completed_written,
+                detail="Downloading...",
             )
             cmd = [
                 str(dotnet),
@@ -2174,12 +2205,17 @@ def run_ddmod(
 
             threading.Thread(target=_stdout_reader, name="ddmod-stdout", daemon=True).start()
 
+            io_start = process_io_bytes(proc.pid)
+            read_start, write_start = io_start if io_start is not None else (0, 0)
+            last_read = read_start
+            proc_written_max = 0
             local_pct = 0.0
+            depot_peak_local = 0.0
             last_emit = 0.0
             downloaded = 0
             while proc.poll() is None or not line_queue.empty():
                 try:
-                    line = line_queue.get(timeout=0.08)
+                    line = line_queue.get(timeout=0.25)
                 except queue.Empty:
                     line = ""
 
@@ -2194,37 +2230,70 @@ def run_ddmod(
                     if m:
                         try:
                             local_pct = float(m.group(1))
+                            # DDMod resets to 0% on each file — keep peak so overall
+                            # doesn't thrash within the depot.
+                            depot_peak_local = max(depot_peak_local, min(local_pct, 100.0))
                         except ValueError:
                             pass
 
                 now = time.monotonic()
-                if now - last_emit < 0.08 and proc.poll() is None:
+                # Steady 1 Hz ticks — smooth % / speed for UI + CLI.
+                if now - last_emit < 1.0 and proc.poll() is None:
                     continue
                 last_emit = now
 
-                downloaded = _current_downloaded()
-                _update_speed(now, downloaded)
-                frac = (i + min(local_pct, 100.0) / 100.0) / total
+                io_now = process_io_bytes(proc.pid)
+                reading = False
+                if io_now is not None:
+                    read_now, write_now = io_now
+                    reading = read_now > last_read
+                    last_read = read_now
+                    proc_written_max = max(proc_written_max, max(0, write_now - write_start))
+                downloaded = completed_written + proc_written_max
+                # Blend depot index with a damped in-depot peak (not raw per-file %).
+                frac = (i + depot_peak_local / 100.0) / total
                 overall = max(1, min(99, int(99 * frac)))
-                _emit_download(overall, downloaded)
+                _emit_download(overall, downloaded, reading=reading)
 
             rc = proc.wait()
             if rc != 0:
                 tail = "\n".join(err_tail)
-                sys.stderr.write(tail[-800:] + "\n")
+                sys.stderr.write(("\n" if _cli_ticker or progress else "") + tail[-800:] + "\n")
                 if "401" in tail or "No manifest request code" in tail:
                     raise RuntimeError(
                         "Steam blocked downloading game files (need a packaged manifest). "
-                        "Try another title, or set hubcapApiKey in plugin settings."
+                        "Try another title, or check the Ryuu relay."
                     )
                 raise RuntimeError("Download failed. Try again or pick another game.")
 
-            downloaded = _current_downloaded()
-            _update_speed(time.monotonic(), downloaded)
+            completed_written += proc_written_max
+            downloaded = completed_written
             done_frac = (i + 1) / total
             _emit_download(max(1, min(99, int(99 * done_frac))), downloaded)
     finally:
         size_tracker.stop()
+        if _cli_ticker or progress:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+
+def cmd_install_addon(zip_path: str, dest_path: str) -> dict[str, Any]:
+    """Extract a Ryuu fix zip into the game install directory (overlay)."""
+    src = Path(zip_path)
+    dest = Path(dest_path)
+    if not src.is_file():
+        return {"ok": False, "error": f"Add-on archive not found: {zip_path}"}
+    if not dest.is_dir():
+        return {"ok": False, "error": f"Game install path missing: {dest_path}"}
+    try:
+        if zipfile.is_zipfile(src):
+            with zipfile.ZipFile(src) as zf:
+                zf.extractall(dest)
+        else:
+            shutil.copy2(src, dest / src.name)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "installPath": str(dest), "addon": src.name}
 
 
 def install_game(
@@ -2235,9 +2304,60 @@ def install_game(
     settings: dict[str, Any],
     mode: str,
     progress: bool,
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
     steam = find_steam_path(settings)
     prefer = mode if mode not in ("", "auto") else (settings.get("preferMode") or "ddmod")
+
+    installdir = re.sub(r"[^\w\- ]+", "", title).strip() or f"App{appid}"
+    installdir = installdir.replace(" ", "")[:40] or f"App{appid}"
+    lib_folder = (settings.get("libraryFolder") or "").strip()
+    if target:
+        install_path_early = Path(target)
+    elif lib_folder:
+        install_path_early = Path(lib_folder) / installdir
+    elif steam:
+        install_path_early = steam / "steamapps" / "common" / installdir
+    else:
+        install_path_early = default_library_root(settings) / f"{appid}-{installdir}"
+
+    # Skip DepotDownloader verify theater when the game is already on disk.
+    # DDMod re-checks every file (minutes for multi-GB) even when nothing downloads.
+    if not force:
+        prior = already_installed_hint(install_path_early, appid)
+        if prior is not None:
+            size = int(prior.get("bytes") or 0) or dir_byte_size(install_path_early)
+            hint = launch_hint(steam, appid, install_path_early)
+            marker = install_path_early / ".arachnel-steamidra"
+            if not marker.is_file() or prior.get("inferred"):
+                marker.write_text(
+                    json.dumps(
+                        {"appid": str(appid), "mode": "ddmod", "launch": hint},
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            detail = f"Already installed · {_fmt_bytes(size)}"
+            sys.stderr.write(detail + " (skip verify; use --force to re-download)\n")
+            _emit_progress(
+                progress,
+                percent=100,
+                detail=detail,
+                status="completed",
+                bytesDownloaded=size,
+                totalBytes=size,
+                downloadRateBps=0,
+            )
+            return {
+                "ok": True,
+                "installPath": str(install_path_early),
+                "mode": "already-installed",
+                "launch": hint,
+                "steamPath": str(steam) if steam else "",
+                "skippedDownload": True,
+            }
+
     ensure_inject(steam, progress, plugin_root=plugin_root)
 
     staging = Path(tempfile.mkdtemp(prefix=f"arachnel_sm_{appid}_"))
@@ -2249,7 +2369,7 @@ def install_game(
             return {"ok": False, "error": str(exc)}
 
         parsed = parse_lua(lua)
-        # Manifests bundled next to lua (revobd/Hubcap) — recover IDs from filenames
+        # Manifests bundled next to lua (relay zip) — recover IDs from filenames
         # even when the lua has keys only.
         for mf in staging.glob("*.manifest"):
             stem = mf.stem  # e.g. 391541_3413030246586915448
@@ -2295,13 +2415,15 @@ def install_game(
             install_path = steam / "steamapps" / "common" / installdir
         else:
             install_path = default_library_root(settings) / f"{appid}-{installdir}"
+        # Keep path consistent with the early already-installed check.
+        install_path = install_path_early
 
         force_ddmod = prefer == "ddmod"
         force_native = prefer == "native"
         can_ddmod = find_ddmod(plugin_root) is not None
 
         def do_ddmod() -> dict[str, Any]:
-            _emit_progress(progress, percent=0, detail="Downloading…", status="downloading")
+            _emit_progress(progress, percent=0, detail="Downloading...", status="downloading")
             for mf in staging.glob("*.manifest"):
                 try:
                     shutil.copy2(mf, Path(tempfile.gettempdir()) / mf.name)
@@ -2427,6 +2549,11 @@ def install_game(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--progress-json", action="store_true")
+    parser.add_argument(
+        "--progress-log",
+        default="",
+        help="Append each progress tick as a new line (for debugging CLI speed/%%)",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_seed = sub.add_parser("catalog-seed")
@@ -2451,6 +2578,15 @@ def main() -> int:
     p_inst.add_argument("--downloads", default="")
     p_inst.add_argument("--settings", default="")
     p_inst.add_argument("--mode", default="auto")
+    p_inst.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even if .arachnel-steamidra marker says already installed",
+    )
+
+    p_addon = sub.add_parser("install-addon")
+    p_addon.add_argument("--zip", required=True)
+    p_addon.add_argument("--dest", required=True)
 
     p_setup = sub.add_parser("setup-inject")
     p_setup.add_argument("--settings", default="")
@@ -2459,6 +2595,23 @@ def main() -> int:
 
     args = parser.parse_args()
     progress = bool(args.progress_json)
+    global _cli_ticker, _progress_log_path
+    # Always show 1 Hz human ticker on stderr for install (CLI testing).
+    _cli_ticker = args.cmd == "install"
+    log_arg = (getattr(args, "progress_log", "") or "").strip()
+    if log_arg:
+        _progress_log_path = Path(log_arg)
+    elif args.cmd == "install":
+        appid = getattr(args, "appid", "game")
+        _progress_log_path = Path.cwd() / f"progress-{appid}.log"
+    else:
+        _progress_log_path = None
+    if _progress_log_path is not None:
+        try:
+            _progress_log_path.write_text("", encoding="utf-8")  # truncate
+            sys.stderr.write(f"Progress log: {_progress_log_path.resolve()}\n")
+        except OSError:
+            pass
     settings = load_settings(getattr(args, "settings", "") or None)
     plugin_root = Path(__file__).resolve().parent.parent
 
@@ -2479,6 +2632,8 @@ def main() -> int:
             steam = find_steam_path(settings)
             ensure_inject(steam, progress, plugin_root=plugin_root)
             result = {"ok": True, "steamPath": str(steam) if steam else "", "os": platform.system()}
+        elif args.cmd == "install-addon":
+            result = cmd_install_addon(args.zip, args.dest)
         elif args.cmd == "install":
             result = install_game(
                 plugin_root,
@@ -2488,6 +2643,7 @@ def main() -> int:
                 settings,
                 args.mode,
                 progress,
+                force=bool(getattr(args, "force", False)),
             )
         else:
             result = {"ok": False, "error": "unknown command"}

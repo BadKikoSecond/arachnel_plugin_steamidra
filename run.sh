@@ -10,10 +10,20 @@ fi
 BUILD="$ROOT/build"
 cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build "$BUILD" --target steamidra_arach
+BUNDLE="$BUILD/plugin-bundle"
+# POST_BUILD may skip when the DLL is unchanged — always refresh loose assets.
+cp -f "$ROOT/plugin.json" "$BUNDLE/plugin.json"
+rm -rf "$BUNDLE/worker"
+cp -a "$ROOT/worker" "$BUNDLE/worker"
+if [[ -d "$ROOT/config" ]]; then
+  cp -a "$ROOT/config/." "$BUNDLE/config/"
+fi
 DEST="${XDG_DATA_HOME:-$HOME/.local/share}/PetWork/Arachnel/plugins/steamidra"
+rm -rf "$DEST"
 mkdir -p "$DEST"
-cp -a "$BUILD/plugin-bundle/." "$DEST/"
-echo "Installed to $DEST"
+cp -a "$BUNDLE/." "$DEST/"
+VER="$(python3 -c "import json; print(json.load(open('$DEST/plugin.json'))['version'])" 2>/dev/null || echo "?")"
+echo "Reinstalled steamidra v$VER -> $DEST"
 if [[ -f "$BUILD/dist/steamidra.arach" ]]; then
   echo "Package: $BUILD/dist/steamidra.arach ($(du -h "$BUILD/dist/steamidra.arach" | awk '{print $1}'))"
 fi

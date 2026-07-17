@@ -2,7 +2,7 @@
 
 #include "plugin_interface.h"
 
-#include <QMutex>
+#include <QRecursiveMutex>
 #include <QSet>
 #include <QString>
 #include <QVector>
@@ -26,6 +26,9 @@ public:
 
     arachnel::core::InstallResult installFromDownload(
         const arachnel::core::InstallContext& ctx) const override;
+
+    arachnel::core::InstallResult installAddonFromDownload(
+        const arachnel::core::AddonInstallContext& ctx) const override;
 
     arachnel::core::InstallAnalysis analyzeDownload(
         const arachnel::core::InstallContext& ctx) const override;
@@ -54,6 +57,7 @@ private:
     QString m_rootPath;
     mutable QVector<arachnel::core::CatalogEntry> m_catalog;
     mutable bool m_catalogLoaded = false;
+    mutable QRecursiveMutex m_catalogMutex;
     mutable QMutex m_cancelMutex;
     mutable QSet<QString> m_cancelledJobs;
 };

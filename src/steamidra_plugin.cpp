@@ -2,6 +2,7 @@
 
 #include "worker_bridge.h"
 
+#include "catalog_types.h"
 #include "install_analysis.h"
 #include "install_kind.h"
 
@@ -23,6 +24,51 @@ namespace {
 
 constexpr auto kSourceId = "steamidra";
 
+arachnel::core::CatalogItemKind itemKindFromString(const QString& value)
+{
+    const QString normalized = value.trimmed().toLower();
+    if (normalized == QStringLiteral("dlc"))
+        return arachnel::core::CatalogItemKind::Dlc;
+    if (normalized == QStringLiteral("addon") || normalized == QStringLiteral("add-on"))
+        return arachnel::core::CatalogItemKind::Addon;
+    return arachnel::core::CatalogItemKind::Game;
+}
+
+arachnel::core::CatalogComponent addonFromJson(const QJsonObject& obj, const QString& parentId)
+{
+    arachnel::core::CatalogComponent component;
+    const QString title = obj.value(QStringLiteral("title")).toString();
+    component.title = title;
+    component.id = obj.value(QStringLiteral("id")).toString();
+    if (component.id.isEmpty()) {
+        component.id = arachnel::core::slugifyCatalogId(
+            title, QString::fromLatin1(kSourceId) + QStringLiteral("-addon"));
+    }
+    component.fileSize = obj.value(QStringLiteral("fileSize")).toString();
+    component.uploadDate = obj.value(QStringLiteral("uploadDate")).toString();
+    component.kind = itemKindFromString(obj.value(QStringLiteral("kind")).toString());
+    const QString delivery = obj.value(QStringLiteral("delivery")).toString().trimmed().toLower();
+    component.delivery = delivery == QStringLiteral("direct")
+                             ? arachnel::core::ComponentDelivery::Direct
+                             : arachnel::core::ComponentDelivery::Magnet;
+    component.referer = obj.value(QStringLiteral("referer")).toString();
+    component.getfileUrl = obj.value(QStringLiteral("getfileUrl")).toString();
+    component.optional = obj.value(QStringLiteral("optional")).toBool(true);
+
+    const QJsonArray uris = obj.value(QStringLiteral("uris")).toArray();
+    for (const QJsonValue& uri : uris) {
+        const QString value = uri.toString();
+        if (value.startsWith(QStringLiteral("magnet:"), Qt::CaseInsensitive))
+            component.magnetUris.append(value);
+        else if (value.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive)
+                 || value.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive))
+            component.downloadUrl = value;
+    }
+    if (component.id == parentId)
+        component.id += QStringLiteral("-component");
+    return component;
+}
+
 arachnel::core::CatalogEntry entryFromJson(const QJsonObject& obj)
 {
     arachnel::core::CatalogEntry e;
@@ -32,6 +78,7 @@ arachnel::core::CatalogEntry entryFromJson(const QJsonObject& obj)
     e.sourceId = QString::fromLatin1(kSourceId);
     e.steamAppId = obj.value(QStringLiteral("steamAppId")).toString();
     e.description = obj.value(QStringLiteral("description")).toString();
+    e.genres = obj.value(QStringLiteral("genres")).toString();
     e.sizeLabel = obj.value(QStringLiteral("sizeLabel")).toString();
     if (e.sizeLabel.isEmpty())
         e.sizeLabel = obj.value(QStringLiteral("fileSize")).toString();
@@ -46,6 +93,14 @@ arachnel::core::CatalogEntry entryFromJson(const QJsonObject& obj)
     if (e.coverUrl.isEmpty() && !e.steamAppId.isEmpty()) {
         e.coverUrl = QStringLiteral("https://cdn.akamai.steamstatic.com/steam/apps/%1/header.jpg")
                          .arg(e.steamAppId);
+    }
+
+    const QJsonArray addons = obj.value(QStringLiteral("addons")).toArray();
+    e.addons.reserve(addons.size());
+    for (const QJsonValue& addonValue : addons) {
+        if (!addonValue.isObject())
+            continue;
+        e.addons.append(addonFromJson(addonValue.toObject(), e.id));
     }
     return e;
 }
@@ -64,18 +119,17 @@ QString SteamidraPlugin::id() const
 
 QString SteamidraPlugin::name() const
 {
-    return QStringLiteral("SteaMidra");
+    return QStringLiteral("Steam");
 }
 
 QString SteamidraPlugin::description() const
 {
-    return QStringLiteral(
-        "Steam depot installs via LumaCore / SLSsteam + DepotDownloader (no torrents)");
+    return QStringLiteral("Steam depot installs via Arachnel Ryuu relay (no torrents)");
 }
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.1.0");
+    return QStringLiteral("0.3.6");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -100,15 +154,17 @@ QString SteamidraPlugin::settingsPath() const
 
 void SteamidraPlugin::resetCatalogCache()
 {
+    QMutexLocker lock(&m_catalogMutex);
     m_catalogLoaded = false;
     m_catalog.clear();
 }
 
 void SteamidraPlugin::ensureCatalogSeeded() const
 {
-    if (m_catalogLoaded)
+    QMutexLocker lock(&m_catalogMutex);
+    if (m_catalogLoaded && !m_catalog.isEmpty())
         return;
-    m_catalogLoaded = true;
+
     m_catalog.clear();
 
     const auto appendGames = [this](const QJsonArray& games) {
@@ -135,46 +191,48 @@ void SteamidraPlugin::ensureCatalogSeeded() const
             games = root.value(QStringLiteral("entries")).toArray();
             if (games.isEmpty())
                 games = root.value(QStringLiteral("games")).toArray();
-            if (games.isEmpty())
-                games = root.value(QStringLiteral("downloads")).toArray();
         }
         if (games.isEmpty())
             return false;
         appendGames(games);
-        return true;
+        return !m_catalog.isEmpty();
     };
 
-    // Installable manifest catalog (GitLab / local cache) — keys-only DB is fallback.
     const QString settingsDir = QFileInfo(settingsPath()).absolutePath();
-    if (loadCatalogFile(settingsDir + QStringLiteral("/games-manifest-catalog.json")))
-        return;
-    if (loadCatalogFile(m_rootPath + QStringLiteral("/config/games-manifest-catalog.json")))
-        return;
+    const QString localCache = settingsDir + QStringLiteral("/games-manifest-catalog.json");
 
-    // Legacy full depot-keys catalog (~90k, no manifest guarantee).
-    if (loadCatalogFile(settingsDir + QStringLiteral("/games-depotkeys.json")))
+    // Fast path: use local cache first (avoid blocking UI on a 20MB relay fetch).
+    if (loadCatalogFile(localCache)) {
+        m_catalogLoaded = true;
         return;
+    }
+    if (loadCatalogFile(m_rootPath + QStringLiteral("/games-manifest-catalog.json"))) {
+        m_catalogLoaded = true;
+        return;
+    }
 
-    // First run: download public depot-key DB and build catalog (~90k apps).
-    // 5 min covers a cold 65MB download + JSON parse on slow links.
-    const WorkerResult r =
+    // Sync from Ryuu relay (TTL inside worker; first fetch ~20MB).
+    const WorkerResult sync =
         runWorker(m_rootPath,
                   {QStringLiteral("catalog-seed"), QStringLiteral("--settings"), settingsPath()},
-                  300000);
-    const QJsonObject obj = parseWorkerJson(r);
-    const QString catalogPath = obj.value(QStringLiteral("catalogPath")).toString();
-    if (loadCatalogFile(catalogPath))
+                  600000);
+    const QJsonObject syncObj = parseWorkerJson(sync);
+    QString catalogPath = syncObj.value(QStringLiteral("catalogPath")).toString();
+    if (!catalogPath.isEmpty() && !QFileInfo(catalogPath).isAbsolute())
+        catalogPath = settingsDir + QLatin1Char('/') + catalogPath;
+    if (loadCatalogFile(catalogPath) || loadCatalogFile(localCache)) {
+        m_catalogLoaded = true;
         return;
-    if (loadCatalogFile(settingsDir + QStringLiteral("/games-manifest-catalog.json")))
-        return;
-    if (loadCatalogFile(settingsDir + QStringLiteral("/games-depotkeys.json")))
-        return;
-    appendGames(obj.value(QStringLiteral("games")).toArray());
+    }
+    // Do not fall back to a stale bundled GitLab catalog — relay only.
+    appendGames(syncObj.value(QStringLiteral("games")).toArray());
+    m_catalogLoaded = !m_catalog.isEmpty();
 }
 
 QVector<arachnel::core::CatalogEntry> SteamidraPlugin::catalog() const
 {
     ensureCatalogSeeded();
+    QMutexLocker lock(&m_catalogMutex);
     return m_catalog;
 }
 
@@ -187,7 +245,7 @@ QVector<arachnel::core::CatalogEntry> SteamidraPlugin::search(const QString& que
         m_rootPath,
         {QStringLiteral("search"), QStringLiteral("--query"), query, QStringLiteral("--settings"),
          settingsPath()},
-        60000);
+        120000);
     const QJsonObject obj = parseWorkerJson(r);
     QVector<arachnel::core::CatalogEntry> out;
     const QJsonArray games = obj.value(QStringLiteral("games")).toArray();
@@ -206,7 +264,6 @@ std::optional<arachnel::core::CatalogEntry> SteamidraPlugin::entryById(const QSt
         if (e.id == entryId)
             return e;
     }
-    // steam-12345 style
     QString appId = entryId;
     if (appId.startsWith(QStringLiteral("steam-")))
         appId = appId.mid(6);
@@ -234,6 +291,36 @@ arachnel::core::InstallResult SteamidraPlugin::installFromDownload(
     arachnel::core::InstallResult result;
     result.success = false;
     result.error = QStringLiteral("Use owns_download path (startOwnedDownload)");
+    return result;
+}
+
+arachnel::core::InstallResult SteamidraPlugin::installAddonFromDownload(
+    const arachnel::core::AddonInstallContext& ctx) const
+{
+    arachnel::core::InstallResult result;
+    if (ctx.gameInstallPath.isEmpty() || !QDir(ctx.gameInstallPath).exists()) {
+        result.error = QStringLiteral("Install the game first");
+        return result;
+    }
+    if (ctx.downloadPath.isEmpty() || !QFileInfo::exists(ctx.downloadPath)) {
+        result.error = QStringLiteral("Add-on files not found");
+        return result;
+    }
+
+    const WorkerResult r = runWorker(
+        m_rootPath,
+        {QStringLiteral("install-addon"), QStringLiteral("--zip"), ctx.downloadPath,
+         QStringLiteral("--dest"), ctx.gameInstallPath},
+        600000);
+    const QJsonObject obj = parseWorkerJson(r);
+    if (!r.ok || !obj.value(QStringLiteral("ok")).toBool()) {
+        result.error = obj.value(QStringLiteral("error")).toString();
+        if (result.error.isEmpty())
+            result.error = r.error.isEmpty() ? QStringLiteral("Add-on install failed") : r.error;
+        return result;
+    }
+    result.success = true;
+    result.installPath = ctx.gameInstallPath;
     return result;
 }
 
@@ -291,7 +378,6 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
     if (local.id.startsWith(QStringLiteral("steam-")))
         appId = local.id.mid(6);
     if (appId.isEmpty()) {
-        // magnetUri may store steam app id for this plugin
         appId = local.magnetUri;
         if (appId.startsWith(QStringLiteral("steam://app/")))
             appId = appId.mid(QStringLiteral("steam://app/").size());
@@ -317,7 +403,7 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         m_cancelledJobs.remove(ctx.jobId);
     }
 
-    QString appId = ctx.magnetUri; // we pass steamAppId here from core
+    QString appId = ctx.magnetUri;
     if (appId.startsWith(QStringLiteral("steam://app/")))
         appId = appId.mid(QStringLiteral("steam://app/").size());
     if (appId.isEmpty() && ctx.entryId.startsWith(QStringLiteral("steam-")))
@@ -340,7 +426,6 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         onProgress(p);
     }
 
-    // Mode: auto (native then ddmod), or forced via settings
     const WorkerResult r = runWorkerWithProgress(
         m_rootPath,
         {QStringLiteral("install"), QStringLiteral("--appid"), appId, QStringLiteral("--title"),

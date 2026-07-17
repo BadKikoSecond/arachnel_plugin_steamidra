@@ -70,11 +70,52 @@ cmake --build $buildPath --target steamidra_arach
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $bundle = Join-Path $buildPath "plugin-bundle"
-$dest = Join-Path $env:LOCALAPPDATA "PetWork\Arachnel\plugins\steamidra"
+# POST_BUILD may skip when the DLL is unchanged — always refresh loose assets.
+Copy-Item -Force (Join-Path $Root "plugin.json") (Join-Path $bundle "plugin.json")
+if (Test-Path (Join-Path $bundle "worker")) {
+    Remove-Item -Recurse -Force (Join-Path $bundle "worker")
+}
+Copy-Item -Recurse -Force (Join-Path $Root "worker") (Join-Path $bundle "worker")
+if (Test-Path (Join-Path $Root "config")) {
+    Copy-Item -Recurse -Force (Join-Path $Root "config") (Join-Path $bundle "config")
+}
+
+# Arachnel uses QStandardPaths::AppDataLocation → Roaming on Windows
+$dest = Join-Path $env:APPDATA "PetWork\Arachnel\plugins\steamidra"
 if (Test-Path (Join-Path $bundle "steamidra_plugin.dll")) {
+    # Keep local catalog cache + settings across reinstalls (20MB relay fetch).
+    $keepDir = Join-Path $env:TEMP ("arachnel-steamidra-keep-" + [guid]::NewGuid().ToString("n"))
+    New-Item -ItemType Directory -Force -Path $keepDir | Out-Null
+    foreach ($name in @("games-manifest-catalog.json", "settings.json")) {
+        $srcKeep = Join-Path $dest $name
+        if (Test-Path $srcKeep) {
+            Copy-Item -Force $srcKeep (Join-Path $keepDir $name)
+        }
+    }
+    $replaced = $false
+    if (Test-Path $dest) {
+        try {
+            Remove-Item -Recurse -Force $dest -ErrorAction Stop
+            $replaced = $true
+        } catch {
+            Write-Host "Plugin folder locked (close Arachnel for a clean wipe). Overwriting files in place…"
+        }
+    }
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
     Copy-Item -Path (Join-Path $bundle "*") -Destination $dest -Recurse -Force
-    Write-Host "Deployed to $dest"
+    foreach ($name in @("games-manifest-catalog.json", "settings.json")) {
+        $kept = Join-Path $keepDir $name
+        if (Test-Path $kept) {
+            Copy-Item -Force $kept (Join-Path $dest $name)
+        }
+    }
+    Remove-Item -Recurse -Force $keepDir -ErrorAction SilentlyContinue
+    $ver = (Get-Content (Join-Path $dest "plugin.json") -Raw | ConvertFrom-Json).version
+    if ($replaced) {
+        Write-Host "Reinstalled steamidra v$ver -> $dest"
+    } else {
+        Write-Host "Updated steamidra v$ver in place -> $dest (restart Arachnel to unload old DLL)"
+    }
 }
 
 $arach = Join-Path $buildPath "dist\steamidra.arach"
