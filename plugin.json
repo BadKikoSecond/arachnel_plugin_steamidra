@@ -6,5 +6,5 @@
   "library": "steamidra_plugin",
   "iconName": "stadia_controller",
   "description": "Self-contained Steam depot installs (bundled DDMod + .NET; LumaCore / SLSsteam)",
-  "catalogUrl": "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/main/catalog/games-manifest-catalog.json"
+  "catalogUrl": "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json"
 }

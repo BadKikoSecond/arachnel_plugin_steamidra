@@ -11,7 +11,7 @@ Daily CI rebuilds [`catalog/games-manifest-catalog.json`](catalog/games-manifest
 Raw URL (used by the plugin):
 
 ```
-https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/main/catalog/games-manifest-catalog.json
+https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json
 ```
 
 `uploadDate` / `version` drive **sort by newest** and **library update detection**.
@@ -24,7 +24,7 @@ python tools/build_manifest_catalog.py --incremental --steam-dates --verbose
 python tools/build_manifest_catalog.py --steam-dates --verbose
 ```
 
-GitLab: **CI/CD → Schedules** → cron `0 4 * * *`, set `CATALOG_PUSH_TOKEN` (project access token, `write_repository`). Optional: `HUBCAP_API_KEY`.
+GitLab: **CI/CD → Schedules** → cron `0 4 * * *` on branch `master`, set `CATALOG_PUSH_TOKEN` (project access token, `write_repository`). Optional: `HUBCAP_API_KEY`.
 
 ## What is bundled
 

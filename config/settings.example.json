@@ -5,6 +5,6 @@
   "preferMode": "ddmod",
   "libraryFolder": "",
   "includeDlc": false,
-  "manifestCatalogUrl": "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/main/catalog/games-manifest-catalog.json",
+  "manifestCatalogUrl": "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json",
   "manifestCatalogTtlHours": 24
 }

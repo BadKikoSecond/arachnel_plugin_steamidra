@@ -40,7 +40,7 @@ HUBCAP_BASE = "https://hubcapmanifest.com/api/v1"
 MH3_LUA_URL = "https://steamtools.games/api/files/{appid}/lua"
 # Federated installable-manifest catalog (GitLab raw). Override via settings.manifestCatalogUrl.
 DEFAULT_MANIFEST_CATALOG_URL = (
-    "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/main/catalog/games-manifest-catalog.json"
+    "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json"
 )
 
 
