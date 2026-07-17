@@ -6,7 +6,7 @@ Inspired by [SteaMidra / SFF](https://github.com/Midrags/SFF) (GPL-3). This repo
 
 ## Catalog (installable only)
 
-Daily CI rebuilds [`catalog/games-manifest-catalog.json`](catalog/games-manifest-catalog.json) — **only games with packaged manifests** (MH3 / Hubcap), so installs are expected to work.
+Daily CI rebuilds [`catalog/games-manifest-catalog.json`](catalog/games-manifest-catalog.json) — **only games we can actually download**: packaged manifests on MH3, revobd, or oureveryday (same mirrors as install). Not the full ~94k keys-only list.
 
 Raw URL (used by the plugin):
 
@@ -19,8 +19,9 @@ https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-
 Rebuild locally:
 
 ```bash
+# add newly key'd apps + any new mirror hits
 python tools/build_manifest_catalog.py --incremental --steam-dates --verbose
-# full:
+# full re-probe of everything not yet in catalog:
 python tools/build_manifest_catalog.py --steam-dates --verbose
 ```
 

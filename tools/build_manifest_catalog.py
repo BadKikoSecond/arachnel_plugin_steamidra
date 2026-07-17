@@ -37,6 +37,11 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 HUBCAP_BASE = "https://hubcapmanifest.com/api/v1"
 MH3_LUA_URL = "https://steamtools.games/api/files/{appid}/lua"
+REVOBD_ZIP_URL = "https://api.luagen.revobd.club/{appid}.zip"
+OUREVERYDAY_LUA_URLS = (
+    "https://cdn.jsdelivr.net/gh/oureveryday/Steam-Depot-Manifest-Database@main/depots/{appid}.lua",
+    "https://raw.githubusercontent.com/oureveryday/Steam-Depot-Manifest-Database/main/depots/{appid}.lua",
+)
 STEAM_HEADER = "https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"
 DEPOTKEYS_URLS = (
     "https://pub-d3ba7941fdf24c2c84da530b93221e1c.r2.dev/fallback_depotkeys.json",
@@ -252,14 +257,54 @@ def fetch_hubcap_library(api_key: str, max_pages: int, page_size: int) -> list[d
 
 def probe_mh3_lua(appid: str) -> tuple[str, str]:
     url = MH3_LUA_URL.format(appid=appid)
-    status, headers, _ = http_request(url, method="HEAD", timeout=12)
+    status, headers, _ = http_request(url, method="HEAD", timeout=10)
     if status != 200:
         return "", ""
-    # Prefer Last-Modified when present; Date is just response time (weak).
     uploaded = parse_http_date(headers.get("Last-Modified", "")) or parse_http_date(
         headers.get("Date", "")
     )
     return appid, uploaded
+
+
+def probe_revobd_zip(appid: str) -> tuple[str, str]:
+    url = REVOBD_ZIP_URL.format(appid=appid)
+    status, headers, _ = http_request(url, method="HEAD", timeout=10)
+    if status != 200:
+        return "", ""
+    uploaded = parse_http_date(headers.get("Last-Modified", "")) or parse_http_date(
+        headers.get("Date", "")
+    )
+    return appid, uploaded
+
+
+def probe_oureveryday_lua(appid: str) -> tuple[str, str]:
+    for template in OUREVERYDAY_LUA_URLS:
+        url = template.format(appid=appid)
+        status, headers, body = http_request(url, method="GET", timeout=10)
+        if status != 200 or not body:
+            continue
+        text = body.decode("utf-8", errors="replace").lower()
+        # Same bar as install: need setManifestid, not keys-only lua.
+        if "addappid" in text and "setmanifestid" in text:
+            uploaded = parse_http_date(headers.get("Last-Modified", "")) or parse_http_date(
+                headers.get("Date", "")
+            )
+            return appid, uploaded
+    return "", ""
+
+
+def probe_installable(appid: str) -> tuple[str, str, str]:
+    """Match SteaMidra fetch_lua mirrors (free). Return (appid, source, uploadDate)."""
+    hit, uploaded = probe_mh3_lua(appid)
+    if hit:
+        return hit, "mh3", uploaded
+    hit, uploaded = probe_revobd_zip(appid)
+    if hit:
+        return hit, "revobd", uploaded
+    hit, uploaded = probe_oureveryday_lua(appid)
+    if hit:
+        return hit, "oureveryday", uploaded
+    return "", "", ""
 
 
 def fetch_steam_release_date(appid: str) -> str:
@@ -347,59 +392,64 @@ def build_catalog(
         to_probe = [a for a in appids if a not in by_appid]
         if verbose:
             print(
-                f"Incremental: {len(existing)} known, probing {len(to_probe)} new appids…",
+                f"Incremental: {len(existing)} known, probing {len(to_probe)} new "
+                f"(MH3 → revobd → oureveryday)…",
                 file=sys.stderr,
             )
     else:
-        to_probe = [a for a in appids if a not in by_appid or not by_appid[a].get("hasManifest")]
+        to_probe = [a for a in appids if a not in by_appid]
         if verbose:
-            print(f"Probing MH3 lua for {len(to_probe)} appids ({workers} workers)…", file=sys.stderr)
+            print(
+                f"Probing installable packages for {len(to_probe)} appids "
+                f"(MH3 → revobd → oureveryday, {workers} workers)…",
+                file=sys.stderr,
+            )
 
-    mh3_hits = 0
+    hits = 0
     t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(probe_mh3_lua, appid): appid for appid in to_probe}
+        futures = {pool.submit(probe_installable, appid): appid for appid in to_probe}
         done = 0
         for fut in as_completed(futures):
             done += 1
-            appid, weak_date = fut.result()
+            appid, source, weak_date = fut.result()
             if not appid:
                 continue
-            mh3_hits += 1
+            hits += 1
             base = depotkeys.get(appid) or by_appid.get(appid) or {
                 "id": f"steam-{appid}",
                 "title": f"App {appid}",
                 "steamAppId": appid,
             }
             prev = by_appid.get(appid)
-            # Keep a better previous uploadDate if we only got a weak HTTP Date.
             upload = weak_date
             if prev and prev.get("uploadDate") and prev.get("manifestSource") == "hubcap":
                 upload = prev["uploadDate"]
-            elif prev and prev.get("uploadDate") and (not upload or prev.get("dateKind") == "steam-release"):
-                if prev.get("manifestSource") == "mh3" and prev.get("dateKind") != "steam-release":
-                    upload = prev["uploadDate"]
+                source = "hubcap"
             entry = merge_entry(
                 {
                     "id": base.get("id") or f"steam-{appid}",
                     "title": base.get("title") or (prev or {}).get("title") or f"App {appid}",
                     "steamAppId": appid,
                     "coverUrl": base.get("coverUrl") or STEAM_HEADER.format(appid=appid),
-                    "fileSize": base.get("sizeLabel") or base.get("fileSize") or (prev or {}).get("fileSize") or "",
+                    "fileSize": base.get("sizeLabel")
+                    or base.get("fileSize")
+                    or (prev or {}).get("fileSize")
+                    or "",
                 },
                 upload_date=upload,
-                manifest_source="mh3" if not (prev and prev.get("manifestSource") == "hubcap") else "hubcap",
+                manifest_source=source,
             )
             by_appid[appid] = entry
-            if verbose and done % 5000 == 0:
+            if verbose and done % 2000 == 0:
                 elapsed = time.monotonic() - t0
                 print(
-                    f"  …{done}/{len(to_probe)} probed, {mh3_hits} hits ({elapsed:.0f}s)",
+                    f"  …{done}/{len(to_probe)} probed, {hits} installable ({elapsed:.0f}s)",
                     file=sys.stderr,
                 )
 
     if verbose:
-        print(f"  MH3 new hits: {mh3_hits} ({time.monotonic() - t0:.0f}s)", file=sys.stderr)
+        print(f"  new installable hits: {hits} ({time.monotonic() - t0:.0f}s)", file=sys.stderr)
 
     if steam_dates:
         need = [a for a, e in by_appid.items() if not e.get("uploadDate")]
