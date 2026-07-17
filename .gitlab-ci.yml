@@ -156,7 +156,8 @@ release:
 
       Install in Arachnel: **Settings → Plugins** → \`steam.arach\`.
 
-      Universal bundle for Windows and Linux, built against the Arachnel release toolchain.
+      Universal bundle for Windows and Linux.
+      Built against Arachnel plugin API v3 (\`feature/new_plugin_sdk\` until the next launcher release).
       Internal plugin id remains \`steamidra\` for settings and upgrade compatibility.
       Requires Arachnel plugin API v3.
       EOF

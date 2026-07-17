@@ -34,8 +34,8 @@ GitLab: **CI/CD → Schedules** → cron `0 4 * * *` on branch `master`, set `CA
 Push a semantic version tag to build and publish a universal `steam.arach`:
 
 ```bash
-git tag v0.3.9
-git push origin v0.3.9
+git tag v0.3.10
+git push origin v0.3.10
 ```
 
 GitLab builds Windows and Linux bundles, merges their platform runtimes, uploads the
