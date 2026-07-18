@@ -86,6 +86,8 @@ rebuild-catalog-full:
 build:linux:
   stage: build
   image: ubuntu:24.04
+  tags:
+    - vps
   timeout: 2h
   before_script:
     - apt-get update
@@ -122,6 +124,8 @@ build:windows:
 package:universal:
   stage: package
   image: ubuntu:24.04
+  tags:
+    - vps
   needs:
     - job: build:linux
       artifacts: true
@@ -143,6 +147,8 @@ package:universal:
 release:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - vps
   needs:
     - job: package:universal
       artifacts: true
