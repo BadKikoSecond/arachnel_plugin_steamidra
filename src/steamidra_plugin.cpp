@@ -129,7 +129,7 @@ QString SteamidraPlugin::description() const
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.3.10");
+    return QStringLiteral("0.3.11");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -328,10 +328,11 @@ arachnel::core::InstallAnalysis SteamidraPlugin::analyzeDownload(
     const arachnel::core::InstallContext& ctx) const
 {
     (void)ctx;
+    // Never claim torrent/HTTP folders — install goes only through startOwnedDownload.
     return arachnel::core::makeInstallAnalysis(arachnel::core::InstallKind::BundledFix,
-                                              QStringLiteral("steamidra-owned"), 100,
-                                              QStringLiteral("Plugin-owned Steam depot install"),
-                                              true);
+                                              QStringLiteral("steamidra-owned"), 0,
+                                              QStringLiteral("Steam installs via owns_download only"),
+                                              false);
 }
 
 arachnel::core::InstallAnalysis SteamidraPlugin::analyzeFileNames(
