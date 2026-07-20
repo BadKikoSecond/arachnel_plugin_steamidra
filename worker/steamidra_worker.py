@@ -973,7 +973,7 @@ def depotkeys_cache_path(settings: dict[str, Any]) -> Path:
     configured = (settings.get("_settingsPath") or "").strip()
     if configured:
         return Path(configured).parent / "fallback_depotkeys.json"
-    return Path.home() / ".local" / "share" / "PetWork" / "Arachnel" / "plugins" / "steamidra" / "fallback_depotkeys.json"
+    return Path.home() / ".local" / "share" / "Arachnel" / "plugins" / "steamidra" / "fallback_depotkeys.json"
 
 
 def ensure_depotkeys_db(

@@ -69,7 +69,7 @@ Fetch before release builds:
 ## Build & install
 
 ```bash
-export ARACHNEL_SDK_DIR=~/PetWork/Arachnel   # or D:\Work\Arachnel
+export ARACHNEL_SDK_DIR=~/path/to/Arachnel   # or D:\Work\Arachnel
 ./tools/fetch_third_party.sh linux           # or tools\fetch_third_party.ps1 on Windows
 ./run.sh                                     # or .\run.ps1
 ```

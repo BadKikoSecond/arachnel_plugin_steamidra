@@ -81,7 +81,7 @@ if (Test-Path (Join-Path $Root "config")) {
 }
 
 # Arachnel uses QStandardPaths::AppDataLocation → Roaming on Windows
-$dest = Join-Path $env:APPDATA "PetWork\Arachnel\plugins\steamidra"
+$dest = Join-Path $env:APPDATA "Arachnel\plugins\steamidra"
 if (Test-Path (Join-Path $bundle "steamidra_plugin.dll")) {
     # Keep local catalog cache + settings across reinstalls (20MB relay fetch).
     $keepDir = Join-Path $env:TEMP ("arachnel-steamidra-keep-" + [guid]::NewGuid().ToString("n"))

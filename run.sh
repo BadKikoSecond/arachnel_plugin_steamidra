@@ -18,7 +18,7 @@ cp -a "$ROOT/worker" "$BUNDLE/worker"
 if [[ -d "$ROOT/config" ]]; then
   cp -a "$ROOT/config/." "$BUNDLE/config/"
 fi
-DEST="${XDG_DATA_HOME:-$HOME/.local/share}/PetWork/Arachnel/plugins/steamidra"
+DEST="${XDG_DATA_HOME:-$HOME/.local/share}/Arachnel/plugins/steamidra"
 rm -rf "$DEST"
 mkdir -p "$DEST"
 cp -a "$BUNDLE/." "$DEST/"
