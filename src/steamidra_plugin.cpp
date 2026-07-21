@@ -18,11 +18,57 @@
 #include <QStandardPaths>
 #include <QUrl>
 
+#if defined(Q_OS_WIN)
+#  include <windows.h>
+#endif
+
 namespace steamidra {
 
 namespace {
 
 constexpr auto kSourceId = "steamidra";
+
+QString steamExecutablePath()
+{
+#if defined(Q_OS_WIN)
+    auto fromReg = [](HKEY hive, const wchar_t* subkey, const wchar_t* valueName) -> QString {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(hive, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS)
+            return {};
+        wchar_t buf[512];
+        DWORD size = sizeof(buf);
+        DWORD type = 0;
+        const LONG ok = RegQueryValueExW(key, valueName, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &size);
+        RegCloseKey(key);
+        if (ok != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ))
+            return {};
+        QString path = QString::fromWCharArray(buf).trimmed();
+        if (path.isEmpty())
+            return {};
+        path.replace(QLatin1Char('\\'), QLatin1Char('/'));
+        const QFileInfo exe(path);
+        if (exe.isFile())
+            return exe.absoluteFilePath();
+        const QFileInfo asDir(path + QStringLiteral("/steam.exe"));
+        if (asDir.isFile())
+            return asDir.absoluteFilePath();
+        return {};
+    };
+    if (const QString p = fromReg(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamExe"); !p.isEmpty())
+        return p;
+    if (const QString p = fromReg(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath"); !p.isEmpty())
+        return p;
+    if (const QString p = fromReg(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Valve\\Steam", L"InstallPath");
+        !p.isEmpty())
+        return p;
+    if (const QString p = fromReg(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Valve\\Steam", L"InstallPath"); !p.isEmpty())
+        return p;
+#endif
+    const QString found = QStandardPaths::findExecutable(QStringLiteral("steam"));
+    if (!found.isEmpty())
+        return found;
+    return {};
+}
 
 arachnel::core::CatalogItemKind itemKindFromString(const QString& value)
 {
@@ -86,7 +132,18 @@ arachnel::core::CatalogEntry entryFromJson(const QJsonObject& obj)
     e.version = obj.value(QStringLiteral("version")).toString();
     if (e.version.isEmpty() && !e.uploadDate.isEmpty())
         e.version = e.uploadDate.left(10);
-    e.installKind = arachnel::core::InstallKind::BundledFix;
+    {
+        const int rawKind = obj.value(QStringLiteral("installKind")).toInt(-1);
+        if (rawKind >= static_cast<int>(arachnel::core::InstallKind::PortableArchive)
+            && rawKind <= static_cast<int>(arachnel::core::InstallKind::FixDownload)) {
+            e.installKind = static_cast<arachnel::core::InstallKind>(rawKind);
+        } else if (obj.value(QStringLiteral("needsOnlineFix")).toBool()) {
+            e.installKind = arachnel::core::InstallKind::BundledFix;
+        } else {
+            // SteaMidra downloads depots; SteamFix is auto-embedded only for online titles.
+            e.installKind = arachnel::core::InstallKind::PortableArchive;
+        }
+    }
     e.itemKind = arachnel::core::CatalogItemKind::Game;
     if (e.id.isEmpty() && !e.steamAppId.isEmpty())
         e.id = QStringLiteral("steam-%1").arg(e.steamAppId);
@@ -129,7 +186,7 @@ QString SteamidraPlugin::description() const
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.3.12");
+    return QStringLiteral("0.3.22");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -150,6 +207,26 @@ QString SteamidraPlugin::settingsPath() const
     const QString dir = base + QStringLiteral("/plugins/steamidra");
     QDir().mkpath(dir);
     return dir + QStringLiteral("/settings.json");
+}
+
+void writePreferModeToSettings(const QString& settingsFile, const QString& mode)
+{
+    if (mode.isEmpty() || mode == QStringLiteral("auto"))
+        return;
+
+    QJsonObject obj;
+    {
+        QFile in(settingsFile);
+        if (in.open(QIODevice::ReadOnly))
+            obj = QJsonDocument::fromJson(in.readAll()).object();
+    }
+    if (obj.value(QStringLiteral("preferMode")).toString() == mode)
+        return;
+    obj.insert(QStringLiteral("preferMode"), mode);
+    QFile out(settingsFile);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return;
+    out.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
 }
 
 void SteamidraPlugin::resetCatalogCache()
@@ -375,6 +452,100 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
     const arachnel::core::LibraryGame& local) const
 {
     arachnel::core::LaunchInfo info;
+    info.workingDirectory = local.installPath;
+
+    auto fileExists = [](const QString& path) {
+        return !path.isEmpty() && QFileInfo::exists(path);
+    };
+
+    const QString overridePath = local.executableOverride.trimmed();
+    if (fileExists(overridePath)) {
+        info.executable = overridePath;
+        info.workingDirectory = QFileInfo(overridePath).absolutePath();
+        if (QFileInfo::exists(info.workingDirectory + QLatin1Char('/')
+                              + QFileInfo(overridePath).completeBaseName()
+                              + QStringLiteral(".pck")))
+            info.arguments.append(QStringLiteral("--steam"));
+        return info;
+    }
+
+    QString markerExe;
+    bool markerPrefersLocal = false;
+    const QString markerPath = local.installPath + QStringLiteral("/.arachnel-steamidra");
+    if (QFileInfo::exists(markerPath)) {
+        QFile markerFile(markerPath);
+        if (markerFile.open(QIODevice::ReadOnly)) {
+            const QJsonObject root =
+                QJsonDocument::fromJson(markerFile.readAll()).object();
+            const QString mode = root.value(QStringLiteral("mode")).toString();
+            if (mode == QStringLiteral("ddmod") || mode == QStringLiteral("already-installed")
+                || root.value(QStringLiteral("onlineFix")).isObject())
+                markerPrefersLocal = true;
+            const QJsonObject launch = root.value(QStringLiteral("launch")).toObject();
+            if (launch.value(QStringLiteral("type")).toString() == QStringLiteral("exe")) {
+                markerExe = launch.value(QStringLiteral("path")).toString().trimmed();
+                const QJsonArray args = launch.value(QStringLiteral("args")).toArray();
+                for (const QJsonValue& a : args) {
+                    if (a.isString() && !a.toString().isEmpty())
+                        info.arguments.append(a.toString());
+                }
+            }
+        }
+    }
+    if (fileExists(markerExe)) {
+        info.executable = markerExe;
+        info.workingDirectory = QFileInfo(markerExe).absolutePath();
+        // Godot Steam builds need --steam (FreeTP Pratfall Launcher.bat).
+        if (info.arguments.isEmpty()
+            && QFileInfo::exists(QFileInfo(markerExe).absolutePath() + QLatin1Char('/')
+                                 + QFileInfo(markerExe).completeBaseName() + QStringLiteral(".pck")))
+            info.arguments.append(QStringLiteral("--steam"));
+        return info;
+    }
+
+    const QDir installDir(local.installPath);
+    const bool hasFixOverlay = installDir.exists(QStringLiteral("winmm.dll"))
+        || installDir.exists(QStringLiteral("SteamFix.ini"));
+
+    // Owned depot installs (and anything with SteamFix) must start the local binary.
+    // steam:// skips winmm inject and often runs GameLauncher stubs → crashes (Pratfall).
+    if (markerPrefersLocal || hasFixOverlay || !local.installPath.isEmpty()) {
+        if (!local.installPath.isEmpty()) {
+            const QStringList exes =
+                installDir.entryList({QStringLiteral("*.exe")}, QDir::Files, QDir::Name);
+            QString best;
+            qint64 bestScore = -1;
+            for (const QString& name : exes) {
+                const QString lower = name.toLower();
+                if (lower.contains(QStringLiteral("crash"))
+                    || lower.contains(QStringLiteral("unins"))
+                    || lower.contains(QStringLiteral("redist"))
+                    || lower.contains(QStringLiteral("prereq")))
+                    continue;
+                qint64 score = QFileInfo(installDir.filePath(name)).size();
+                if (lower.contains(QStringLiteral("launcher"))
+                    || lower.contains(QStringLiteral("bootstrap")))
+                    score -= 50LL * 1024 * 1024;
+                const QString stem = QFileInfo(name).completeBaseName();
+                if (installDir.exists(stem + QStringLiteral(".pck")))
+                    score += 200LL * 1024 * 1024;
+                if (installDir.exists(stem + QStringLiteral("_Data")))
+                    score += 200LL * 1024 * 1024;
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = installDir.filePath(name);
+                }
+            }
+            if (!best.isEmpty()) {
+                info.executable = best;
+                const QString stem = QFileInfo(best).completeBaseName();
+                if (installDir.exists(stem + QStringLiteral(".pck")))
+                    info.arguments.append(QStringLiteral("--steam"));
+                return info;
+            }
+        }
+    }
+
     QString appId;
     if (local.id.startsWith(QStringLiteral("steam-")))
         appId = local.id.mid(6);
@@ -384,12 +555,14 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
             appId = appId.mid(QStringLiteral("steam://app/").size());
     }
     if (!appId.isEmpty()) {
-        info.executable = QStringLiteral("steam");
+        const QString steamExe = steamExecutablePath();
+        if (!steamExe.isEmpty()) {
+            info.executable = steamExe;
+            info.workingDirectory = QFileInfo(steamExe).absolutePath();
+        } else {
+            info.executable = QStringLiteral("steam");
+        }
         info.arguments = {QStringLiteral("steam://rungameid/%1").arg(appId)};
-        info.workingDirectory = local.installPath;
-    } else if (!local.executableOverride.isEmpty()) {
-        info.executable = local.executableOverride;
-        info.workingDirectory = local.installPath;
     }
     return info;
 }
@@ -419,11 +592,21 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         return m_cancelledJobs.contains(jobId);
     };
 
+    const QString resolvedMode =
+        ctx.installMode.isEmpty() ? QStringLiteral("auto") : ctx.installMode.trimmed().toLower();
+    writePreferModeToSettings(settingsPath(),
+                              resolvedMode == QStringLiteral("auto") ? QString() : resolvedMode);
+
     if (onProgress) {
         arachnel::core::OwnedDownloadProgress p;
         p.percent = 0;
         p.status = QStringLiteral("downloading");
-        p.detail = QStringLiteral("Preparing…");
+        if (resolvedMode == QStringLiteral("native"))
+            p.detail = QStringLiteral("Preparing Steam client…");
+        else if (resolvedMode == QStringLiteral("ddmod"))
+            p.detail = QStringLiteral("Downloading from Steam CDN…");
+        else
+            p.detail = QStringLiteral("Preparing…");
         onProgress(p);
     }
 
@@ -432,7 +615,7 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         {QStringLiteral("install"), QStringLiteral("--appid"), appId, QStringLiteral("--title"),
          ctx.title, QStringLiteral("--target"), ctx.targetPath, QStringLiteral("--downloads"),
          ctx.downloadsPath, QStringLiteral("--settings"), settingsPath(),
-         QStringLiteral("--mode"), QStringLiteral("auto")},
+         QStringLiteral("--mode"), resolvedMode},
         onProgress, cancelled, 0);
 
     if (cancelled()) {

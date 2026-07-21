@@ -1,0 +1,1019 @@
+"""Embed FreeTP-compatible SteamFix overlay into a SteaMidra install.
+
+Anchors learned from FreeTP / Hydra installs on disk
+----------------------------------------------------
+Unity (Cat Mail, Ore Factory, Dont Panic, Gamble…):
+  - Overlay next to `<Game>.exe` + `<Game>_Data/`
+  - Files: SteamFix64.dll + winmm.dll + winmm.txt("SteamFix64.dll") + SteamFix.ini
+  - No steam_appid.txt, no EpicFix
+
+Unreal without EOS (Into the Radius 2, Chopping Trees):
+  - Overlay in `<Game>/Binaries/Win64` next to `*-Win64-Shipping.exe`
+  - Same SteamFix trio as Unity; never under `Engine/`
+
+Unreal with EOS / RedpointEOS (MECCHA CHAMELEON):
+  - Same Win64 shipping dir ONLY (not install root, not Engine/Steamworks)
+  - Extra: EpicFix64.dll + EpicFix.ini with `[EOS]\\nNoAuth=true`
+  - winmm.txt loads BOTH: SteamFix64.dll then EpicFix64.dll
+  - SteamFix.ini: FakeWorkshop=true + Workshop=true when Store has Workshop
+
+Binaries are NOT shipped in the repo — harvested into online_fix_kit/.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+# Steam Store category IDs (ajaxgetstorecategories / appdetails.categories).
+#
+# Decision tree (anchors validated against FreeTP/Hydra installs + Store samples):
+#
+#   SteamFix REQUIRED  ← any of:
+#       36 Online PvP, 38 Online Co-op, 20 MMO, 27 Cross-Platform Multiplayer
+#       (every FreeTP online pack we checked had 36 and/or 38)
+#
+#   SteamFix NONE      ← no strong tags above. Typical cases:
+#       - Single-player only (Portal, Hollow Knight, Hades)
+#       - Local / LAN / split-screen only (Isaac: Multi-player + Shared Screen,
+#         but NO Online PvP/Co-op → no Steam online-fix)
+#
+#   SteamFix OPTIONAL  ← weak parents only (1 Multi-player / 9 Co-op / 49 PvP)
+#       without strong Online-* tags. Default: do NOT embed
+#       (enable onlineFixOnWeakMultiplayer to force).
+#
+#   EpicFix            ← NOT a Store signal. Meccha has Online PvP but NOT
+#       Cross-Platform; EOS is only known after install via EOSSDK*/RedpointEOS.
+#       Policy: probe on disk after depot download; if present → require EpicFix.
+STRONG_ONLINE_CATEGORY_IDS = frozenset({36, 38, 27, 20})  # Online PvP/Co-op, Cross-Platform, MMO
+WEAK_MP_CATEGORY_IDS = frozenset({1, 9, 49})  # Multi-player / Co-op / PvP parents
+LOCAL_OR_LAN_CATEGORY_IDS = frozenset({24, 37, 39, 47, 48})  # Local / split / LAN
+WORKSHOP_CATEGORY_ID = 30
+
+KIT_REQUIRED = ("SteamFix64.dll", "winmm.dll")
+KIT_OPTIONAL = ("SteamFix32.dll", "EpicFix64.dll", "EpicFix.ini")
+
+
+def analyze_store_categories(store_data: dict[str, Any]) -> dict[str, Any]:
+    """Parse appdetails `data` → SteamFix need class (EpicFix is install-time only)."""
+    cats = store_data.get("categories") or []
+    ids: set[int] = set()
+    labels: list[str] = []
+    for cat in cats:
+        if not isinstance(cat, dict):
+            continue
+        try:
+            cid = int(cat.get("id"))
+        except (TypeError, ValueError):
+            continue
+        ids.add(cid)
+        desc = str(cat.get("description") or "").strip()
+        if desc and desc not in labels:
+            labels.append(desc)
+
+    strong_hits = sorted(ids & STRONG_ONLINE_CATEGORY_IDS)
+    weak_hits = sorted(ids & WEAK_MP_CATEGORY_IDS)
+    local_hits = sorted(ids & LOCAL_OR_LAN_CATEGORY_IDS)
+    strong = bool(strong_hits)
+    weak = bool(weak_hits)
+    local_only = bool(local_hits) and not strong
+
+    genres = store_data.get("genres") or []
+    genre_names = [
+        str(g.get("description") or "").strip()
+        for g in genres
+        if isinstance(g, dict) and g.get("description")
+    ]
+    if any("massively multiplayer" in g.lower() for g in genre_names):
+        strong = True
+        if 20 not in strong_hits:
+            strong_hits = sorted(set(strong_hits) | {20})
+
+    # steamFix: required | optional | none
+    if strong:
+        steam_fix = "required"
+        reason = "store has Online PvP/Co-op, Cross-Platform, or MMO"
+    elif weak and not local_only:
+        steam_fix = "optional"
+        reason = "only weak Multi-player/Co-op/PvP tags (no Online-*); skip by default"
+    elif local_only:
+        steam_fix = "none"
+        reason = "local/LAN/split-screen only — no Steam online-fix"
+    else:
+        steam_fix = "none"
+        reason = "no multiplayer store tags — single-player / offline"
+
+    # EpicFix cannot be decided from Store (Meccha has no Cross-Platform tag).
+    epic_fix = "probe_after_install" if steam_fix == "required" else "none"
+
+    return {
+        "categoryIds": sorted(ids),
+        "categoryLabels": labels,
+        "genreLabels": genre_names,
+        "hasStrongOnline": strong,
+        "hasWeakMultiplayer": weak,
+        "localOrLanOnly": local_only,
+        "hasWorkshop": WORKSHOP_CATEGORY_ID in ids,
+        "strongCategoryIds": strong_hits,
+        "weakCategoryIds": weak_hits,
+        "localCategoryIds": local_hits,
+        "steamFix": steam_fix,
+        "epicFix": epic_fix,
+        "reason": reason,
+        # Back-compat for embed / catalog installKind
+        "needsOnlineFix": steam_fix == "required",
+    }
+
+
+def merge_genre_string(existing: str, analysis: dict[str, Any]) -> str:
+    parts = [p.strip() for p in (existing or "").split(",") if p.strip()]
+    for label in analysis.get("categoryLabels") or []:
+        if label not in parts:
+            parts.append(label)
+    for label in analysis.get("genreLabels") or []:
+        if label not in parts:
+            parts.append(label)
+    if analysis.get("needsOnlineFix") and "Online Fix" not in parts:
+        parts.append("Online Fix")
+    return ", ".join(parts)
+
+
+def kit_dir(plugin_root: Path, settings: dict[str, Any]) -> Path:
+    configured = (settings.get("onlineFixSourceDir") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    settings_path = (settings.get("_settingsPath") or "").strip()
+    if settings_path:
+        return Path(settings_path).expanduser().resolve().parent / "online_fix_kit"
+    return (plugin_root / "online_fix_kit").resolve()
+
+
+def _candidate_harvest_roots(settings: dict[str, Any]) -> list[Path]:
+    roots: list[Path] = []
+    for key in ("onlineFixSourceDir", "libraryFolder"):
+        raw = (settings.get(key) or "").strip()
+        if raw:
+            roots.append(Path(raw).expanduser())
+    appdata = os.environ.get("APPDATA") or ""
+    if appdata:
+        roots.append(Path(appdata) / "Arachnel")
+    for extra in (
+        Path(r"D:\HydraGames"),
+        Path(r"D:\ArachnelGame"),
+        Path(r"C:\Games\Arachnel"),
+        Path(r"D:\Games\Arachnel"),
+        Path.home() / "Games",
+    ):
+        roots.append(extra)
+    out: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            key = str(root.resolve()) if root.exists() else str(root)
+        except OSError:
+            key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(root)
+    return out
+
+
+def _harvest_named_files(
+    settings: dict[str, Any], names: tuple[str, ...], *, prefer_with: str | None = None
+) -> dict[str, Path]:
+    """Find kit files under library roots. Prefer a parent that also has prefer_with."""
+    found: dict[str, Path] = {}
+    preferred: dict[str, Path] = {}
+    for root in _candidate_harvest_roots(settings):
+        if not root.is_dir():
+            continue
+        try:
+            for path in root.rglob(names[0]):
+                parent = path.parent
+                if _skip_overlay_path(parent):
+                    continue
+                batch: dict[str, Path] = {}
+                for name in names:
+                    src = parent / name
+                    if src.is_file():
+                        batch[name] = src
+                if names[0] not in batch:
+                    continue
+                if prefer_with and (parent / prefer_with).is_file():
+                    for k, v in batch.items():
+                        preferred.setdefault(k, v)
+                for k, v in batch.items():
+                    found.setdefault(k, v)
+                if prefer_with and prefer_with in preferred:
+                    return preferred
+        except OSError:
+            continue
+    return preferred or found
+
+
+def harvest_online_fix_kit(plugin_root: Path, settings: dict[str, Any]) -> Path | None:
+    """Copy SteamFix (+ EpicFix when found) from an existing FreeTP-style install."""
+    dest = kit_dir(plugin_root, settings)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    steam = _harvest_named_files(
+        settings, ("SteamFix64.dll", "winmm.dll", "SteamFix32.dll", "winmm.txt")
+    )
+    if "SteamFix64.dll" not in steam or "winmm.dll" not in steam:
+        return None if not ((dest / "SteamFix64.dll").is_file() and (dest / "winmm.dll").is_file()) else dest
+
+    for name, src in steam.items():
+        try:
+            shutil.copy2(src, dest / name)
+        except OSError as exc:
+            sys.stderr.write(f"online_fix: failed to copy {src}: {exc}\n")
+            return None
+
+    # Prefer a FreeTP pack that already bundles EpicFix (Meccha-style).
+    epic = _harvest_named_files(
+        settings, ("EpicFix64.dll", "EpicFix.ini"), prefer_with="SteamFix64.dll"
+    )
+    for name, src in epic.items():
+        try:
+            shutil.copy2(src, dest / name)
+        except OSError as exc:
+            sys.stderr.write(f"online_fix: failed to copy {src}: {exc}\n")
+
+    if not (dest / "winmm.txt").is_file():
+        (dest / "winmm.txt").write_text("SteamFix64.dll\n", encoding="utf-8")
+    if (dest / "EpicFix64.dll").is_file() and not (dest / "EpicFix.ini").is_file():
+        write_epic_fix_ini(dest / "EpicFix.ini")
+    return dest
+
+
+def ensure_online_fix_kit(plugin_root: Path, settings: dict[str, Any]) -> Path | None:
+    dest = kit_dir(plugin_root, settings)
+    dest.mkdir(parents=True, exist_ok=True)
+    have_steam = (dest / "SteamFix64.dll").is_file() and (dest / "winmm.dll").is_file()
+    have_epic = (dest / "EpicFix64.dll").is_file()
+    if have_steam and have_epic:
+        return dest
+    # Refresh / fill missing pieces (especially EpicFix) from FreeTP installs.
+    harvested = harvest_online_fix_kit(plugin_root, settings)
+    if harvested is not None:
+        return harvested
+    return dest if have_steam else None
+
+
+def _is_ue_shipping_exe(path: Path) -> bool:
+    name = path.name.lower()
+    if not name.endswith(".exe"):
+        return False
+    skip = (
+        "crashreport",
+        "crashpad",
+        "ue4prereq",
+        "ue5prereq",
+        "bootstrap",
+        "redist",
+        "unrealversionselector",
+        "dotnet",
+    )
+    return not any(s in name for s in skip)
+
+
+def _skip_overlay_path(path: Path) -> bool:
+    """Ignore DepotDownloader staging / engine tooling trees."""
+    parts_l = [p.lower() for p in path.parts]
+    skip = {
+        ".depotdownloader",
+        "staging",
+        "intermediate",
+        "saved",
+        "deriveddatacache",
+        "thirdparty",
+        "downloads",
+    }
+    if any(p in skip for p in parts_l):
+        return True
+    try:
+        idx = parts_l.index("engine")
+        if path.parts[idx] == "Engine":
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def find_ue_shipping_dirs(install_root: Path) -> list[Path]:
+    root = install_root.resolve()
+    out: list[Path] = []
+    seen: set[str] = set()
+    for win_name in ("Win64", "Win32"):
+        for win_dir in root.rglob(win_name):
+            if not win_dir.is_dir() or win_dir.name != win_name:
+                continue
+            if win_dir.parent.name != "Binaries":
+                continue
+            if _skip_overlay_path(win_dir):
+                continue
+            if "Engine" in win_dir.parts or "ThirdParty" in win_dir.parts:
+                continue
+            exes = [p for p in win_dir.glob("*.exe") if _is_ue_shipping_exe(p)]
+            if not exes:
+                continue
+            key = str(win_dir.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(win_dir)
+    return out
+
+
+def find_unity_roots(install_root: Path) -> list[Path]:
+    root = install_root.resolve()
+    out: list[Path] = []
+    seen: set[str] = set()
+    for data_dir in root.rglob("*_Data"):
+        if not data_dir.is_dir() or _skip_overlay_path(data_dir):
+            continue
+        parent = data_dir.parent
+        stem = data_dir.name[: -len("_Data")]
+        if not (parent / f"{stem}.exe").is_file():
+            continue
+        key = str(parent.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(parent)
+    return out
+
+
+def find_overlay_targets(install_root: Path) -> list[Path]:
+    """Return the single FreeTP-style overlay directory (UE shipping > Unity > root)."""
+    root = install_root.resolve()
+    if not root.is_dir():
+        return []
+
+    ue = find_ue_shipping_dirs(root)
+    if ue:
+        # Prefer dirs that already contain EOSSDK / shipping with Redpoint (Meccha).
+        def score(p: Path) -> tuple[int, int]:
+            eos = 1 if game_has_eos(p) or (p / "RedpointEOS").is_dir() else 0
+            shipping = 1 if list(p.glob("*Shipping*.exe")) else 0
+            return (eos, shipping)
+
+        ue.sort(key=score, reverse=True)
+        return [ue[0]]
+
+    unity = find_unity_roots(root)
+    if unity:
+        return [unity[0]]
+
+    return [root]
+
+
+def game_has_eos(install_root: Path) -> bool:
+    """True if EOSSDK / Redpoint bits exist (may still not need EpicFix)."""
+    try:
+        if (install_root / "RedpointEOS").is_dir():
+            return True
+        for pattern in (
+            "EOSSDK*.dll",
+            "*EOSSDK*.dll",
+            "EpicFix64.dll",
+            "RedpointEOS",
+        ):
+            for path in install_root.rglob(pattern):
+                if _skip_overlay_path(path):
+                    continue
+                if path.is_dir() and path.name.lower().startswith("redpointeos"):
+                    return True
+                if path.is_file():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _pe_mentions_dll(exe: Path, dll_name: str) -> bool:
+    """Cheap PE scan: true if the binary likely imports/loads dll_name."""
+    try:
+        data = exe.read_bytes()
+    except OSError:
+        return False
+    needle = dll_name.encode("ascii", errors="ignore").lower()
+    return needle in data.lower()
+
+
+def _steamfix_bootstrap_src(plugin_root: Path) -> Path | None:
+    here = Path(__file__).resolve().parent
+    for cand in (
+        here / "assets" / "steamfix_bootstrap.exe",
+        plugin_root / "worker" / "assets" / "steamfix_bootstrap.exe",
+        plugin_root / "assets" / "steamfix_bootstrap.exe",
+    ):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _write_fake_steam_appid(target: Path, fake_appid: str = "480") -> None:
+    """Point Steamworks at an owned app (Spacewar) when winmm/SteamFix cannot load."""
+    path = target / "steam_appid.txt"
+    try:
+        path.write_text(str(fake_appid).strip() + "\n", encoding="ascii")
+    except OSError as exc:
+        sys.stderr.write(f"online_fix: steam_appid.txt: {exc}\n")
+
+
+def _install_steamfix_bootstrap(
+    target: Path, plugin_root: Path, game_exe: Path | None = None
+) -> Path | None:
+    """Ensure non-winmm Steamworks titles get steam_appid.txt=480; no exe bootstrap."""
+    del plugin_root  # reserved for future injector asset
+    exe = game_exe or _find_launch_exe_for_overlay(target)
+    if exe is None:
+        return None
+    if (target / f"{exe.stem}_Data").is_dir():
+        return None
+    if list(target.glob("*Shipping*.exe")):
+        return None
+    if _pe_mentions_dll(exe, "winmm.dll"):
+        return None
+    if not (
+        game_has_steam_api(target)
+        or (target / "steam_api64.dll").is_file()
+        or (target / "steam_api.dll").is_file()
+    ):
+        return None
+    _write_fake_steam_appid(target, "480")
+    sys.stderr.write(
+        f"online_fix: wrote steam_appid.txt=480 for non-winmm Steamworks exe {exe.name}\n"
+    )
+    return None
+
+
+def game_has_steam_api(install_root: Path) -> bool:
+    """True when the install ships Valve Steamworks (needs SteamFix without a license)."""
+    try:
+        for name in ("steam_api64.dll", "steam_api.dll", "libsteam_api.so"):
+            for path in install_root.rglob(name):
+                if _skip_overlay_path(path):
+                    continue
+                if path.is_file():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def game_needs_epic_fix(install_root: Path) -> bool:
+    """EpicFix only for RedpointEOS-style titles (MECCHA).
+
+    FreeTP Pratfall ships EOSSDK but uses SteamFix alone — embedding EpicFix
+    there opens freetp.org (browser auth) and black-screens the game.
+    """
+    try:
+        for path in install_root.rglob("RedpointEOS"):
+            if path.is_dir() and not _skip_overlay_path(path):
+                return True
+        # Explicit Redpoint plugin DLLs
+        for path in install_root.rglob("RedpointEOS*.dll"):
+            if path.is_file() and not _skip_overlay_path(path):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def write_steam_fix_ini(path: Path, appid: str, *, workshop: bool = False,
+                         freetp_id: str | None = None,
+                         dlc_lines: list[str] | None = None) -> None:
+    """Match FreeTP SteamFix.ini layout (HydraGames Pratfall / Cat Mail)."""
+    workshop_flag = "true" if workshop else "false"
+    # FreeTP online packs rarely set FakeWorkshop; keep ini close to theirs.
+    fake_ws = ""
+    if dlc_lines:
+        dlc = "".join(f"{line}\n" for line in dlc_lines)
+    elif workshop:
+        dlc = "0=dlc\n"
+    else:
+        dlc = ""
+    freetp = ""
+    if freetp_id:
+        freetp = f"\n[FreeTP]\nId={freetp_id}"
+    text = (
+        "[Main]\r\n"
+        f"RealAppId={appid}\r\n"
+        "FakeAppId=480\r\n"
+        "#Language=english\r\n"
+        "BuildId=0\r\n"
+        "\r\n"
+        "[Misc]\r\n"
+        # Overlay=true enables friends/invite UI. Promo site is suppressed by FreeTP/.hash.
+        "Overlay=true\r\n"
+        "FilterLobby=false\r\n"
+        f"{fake_ws}"
+        "\r\n"
+        "[Interfaces]\r\n"
+        "Apps=true\r\n"
+        "Friends=true\r\n"
+        "User=true\r\n"
+        "Inventory=true\r\n"
+        "Stats=true\r\n"
+        "Storage=true\r\n"
+        "Utils=true\r\n"
+        f"Workshop={workshop_flag}\r\n"
+        "\r\n"
+        "[DLC]\r\n"
+        f"{dlc.replace(chr(10), chr(13)+chr(10)) if dlc else ''}"
+        f"{freetp.replace(chr(10), chr(13)+chr(10)) if freetp else ''}"
+    )
+    # Normalize: prefer CRLF FreeTP style without trailing junk.
+    path.write_bytes(text.encode("ascii", errors="replace"))
+
+
+def _find_freetp_overlay_dir_for_appid(appid: str, settings: dict[str, Any]) -> Path | None:
+    """Directory that contains SteamFix.ini + winmm for this RealAppId (FreeTP pack)."""
+    appid = str(appid).strip()
+    if not appid:
+        return None
+    for root in _candidate_harvest_roots(settings):
+        if not root.is_dir():
+            continue
+        try:
+            for ini in root.rglob("SteamFix.ini"):
+                if _skip_overlay_path(ini):
+                    continue
+                try:
+                    text = ini.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                real = ""
+                for line in text.splitlines():
+                    if line.startswith("RealAppId="):
+                        real = line.split("=", 1)[1].strip()
+                        break
+                if real != appid:
+                    continue
+                parent = ini.parent
+                if (parent / "SteamFix64.dll").is_file() and (parent / "winmm.dll").is_file():
+                    return parent
+        except OSError:
+            continue
+    return None
+
+
+def _find_launch_exe_for_overlay(target: Path) -> Path | None:
+    """Pick the game exe that loads winmm/SteamFix from this overlay directory."""
+    if not target.is_dir():
+        return None
+    best: Path | None = None
+    best_score = -1
+    try:
+        exes = [p for p in target.iterdir() if p.is_file() and p.suffix.lower() == ".exe"]
+    except OSError:
+        return None
+    for exe in exes:
+        lower = exe.name.lower()
+        if lower == "cmd.exe":
+            continue
+        if any(s in lower for s in ("crash", "unins", "redist", "prereq", "crashpad")):
+            continue
+        score = exe.stat().st_size
+        if "launcher" in lower or "bootstrap" in lower:
+            score -= 50 * 1024 * 1024
+        stem = exe.stem
+        if (target / f"{stem}.pck").is_file():
+            score += 200 * 1024 * 1024
+        if (target / f"{stem}_Data").is_dir():
+            score += 200 * 1024 * 1024
+        if "shipping" in lower or "win64" in lower:
+            score += 100 * 1024 * 1024
+        if score > best_score:
+            best_score = score
+            best = exe
+    return best
+
+
+def _freetp_hash_is_foreign(
+    target: Path, appid: str, settings: dict[str, Any]
+) -> bool:
+    """True when FreeTP/.hash was copied from another install path (invalid ack)."""
+    hash_path = target / "FreeTP" / ".hash"
+    if not hash_path.is_file() or hash_path.stat().st_size != 4:
+        return False
+    donor = _find_freetp_overlay_dir_for_appid(appid, settings)
+    if donor is None:
+        return False
+    try:
+        if donor.resolve() == target.resolve():
+            return False
+    except OSError:
+        return False
+    donor_hash = donor / "FreeTP" / ".hash"
+    if not donor_hash.is_file() or donor_hash.stat().st_size != 4:
+        return False
+    try:
+        return hash_path.read_bytes() == donor_hash.read_bytes()
+    except OSError:
+        return False
+
+
+def _cmd_stub_path(plugin_root: Path) -> Path | None:
+    here = Path(__file__).resolve().parent
+    for cand in (
+        here / "assets" / "cmd_stub.exe",
+        plugin_root / "worker" / "assets" / "cmd_stub.exe",
+        plugin_root / "assets" / "cmd_stub.exe",
+    ):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _prime_freetp_hash(target: Path, plugin_root: Path) -> bool:
+    """Generate path-local FreeTP/.hash without opening the promo browser.
+
+    SteamFix writes FreeTP/.hash from the install path. A hash copied from another
+    folder is rejected: it opens freetp.org via `cmd.exe /c start \"link\" ...` and
+    rewrites the file. Dropping a no-op cmd.exe next to the game intercepts that
+    CreateProcess search (app dir before System32) so the ack is written silently.
+    """
+    if sys.platform != "win32":
+        return False
+    hash_path = target / "FreeTP" / ".hash"
+    if hash_path.is_file() and hash_path.stat().st_size == 4:
+        return True
+    stub_src = _cmd_stub_path(plugin_root)
+    exe = _find_launch_exe_for_overlay(target)
+    if stub_src is None or exe is None:
+        sys.stderr.write(
+            "online_fix: cannot prime FreeTP/.hash "
+            f"(stub={'ok' if stub_src else 'missing'}, exe={'ok' if exe else 'missing'})\n"
+        )
+        return False
+
+    (target / "FreeTP").mkdir(exist_ok=True)
+    (target / "FreeTP" / "UserData").mkdir(exist_ok=True)
+    anon = target / "FreeTP" / "UserData" / "AnonFolderSave.txt"
+    if not anon.is_file():
+        try:
+            anon.write_text("", encoding="utf-8")
+        except OSError:
+            pass
+
+    stub_dst = target / "cmd.exe"
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        shutil.copy2(stub_src, stub_dst)
+        args = [str(exe)]
+        if (target / f"{exe.stem}.pck").is_file():
+            args.append("--steam")
+        proc = subprocess.Popen(
+            args,
+            cwd=str(target),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            if hash_path.is_file() and hash_path.stat().st_size == 4:
+                return True
+            if proc.poll() is not None:
+                break
+            time.sleep(0.25)
+        return hash_path.is_file() and hash_path.stat().st_size == 4
+    except OSError as exc:
+        sys.stderr.write(f"online_fix: FreeTP hash prime failed: {exc}\n")
+        return False
+    finally:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        # Also kill by image name in case the game respawned.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", exe.name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            pass
+        if stub_dst.is_file():
+            try:
+                stub_dst.unlink()
+            except OSError:
+                sys.stderr.write(f"online_fix: failed to remove temp {stub_dst}\n")
+
+
+def _ensure_freetp_ack_folder(
+    target: Path, appid: str, settings: dict[str, Any], plugin_root: Path
+) -> None:
+    """Create FreeTP/UserData and a path-local .hash so promo site is not opened.
+
+    Never copy .hash from another FreeTP install — it is path-bound. Doing so makes
+    SteamFix open freetp.org on every launch until the file is rewritten locally.
+    """
+    (target / "FreeTP").mkdir(exist_ok=True)
+    userdata = target / "FreeTP" / "UserData"
+    userdata.mkdir(exist_ok=True)
+    anon = userdata / "AnonFolderSave.txt"
+    if not anon.is_file():
+        anon.write_text("", encoding="utf-8")
+    hash_path = target / "FreeTP" / ".hash"
+    if _freetp_hash_is_foreign(target, appid, settings):
+        try:
+            hash_path.unlink()
+        except OSError:
+            pass
+    if hash_path.is_file() and hash_path.stat().st_size == 4:
+        return
+    _prime_freetp_hash(target, plugin_root)
+
+
+def write_epic_fix_ini(path: Path) -> None:
+    # FreeTP EpicFix: NoAuth=0 → ShellExecute browser auth (often freetp.org).
+    # Use numeric 1 — some builds parse true/false poorly.
+    path.write_text("[EOS]\nNoAuth=1\nDeviceAuth=true\n", encoding="utf-8")
+
+
+def write_winmm_txt(path: Path, *, include_epic: bool) -> None:
+    # FreeTP packs often omit the trailing newline.
+    lines = ["SteamFix64.dll"]
+    if include_epic:
+        lines.append("EpicFix64.dll")
+    path.write_bytes("\r\n".join(lines).encode("ascii"))
+
+
+def _cleanup_stray_root_overlay(install_root: Path, primary: Path) -> None:
+    """Remove mistaken SteamFix copies at install root when UE shipping is the real target."""
+    try:
+        root = install_root.resolve()
+        primary = primary.resolve()
+    except OSError:
+        return
+    if root == primary:
+        return
+    # Only strip root leftovers if root is not a Unity/exe overlay target itself.
+    if any(p.is_dir() and p.name.endswith("_Data") for p in root.iterdir()):
+        return
+    for name in (
+        "SteamFix64.dll",
+        "SteamFix32.dll",
+        "SteamFix.ini",
+        "winmm.dll",
+        "winmm.txt",
+        "steam_appid.txt",
+        "EpicFix64.dll",
+        "EpicFix.ini",
+    ):
+        path = root / name
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def overlay_complete(target: Path, *, need_epic: bool) -> bool:
+    if not (target / "SteamFix.ini").is_file():
+        return False
+    if not (target / "SteamFix64.dll").is_file():
+        return False
+    if not (target / "winmm.dll").is_file():
+        return False
+    if not (target / "winmm.txt").is_file():
+        return False
+    txt = (target / "winmm.txt").read_text(encoding="utf-8", errors="replace")
+    if "SteamFix64.dll" not in txt:
+        return False
+    if need_epic and not (target / "EpicFix64.dll").is_file():
+        return False
+    if need_epic:
+        if "EpicFix64.dll" not in txt:
+            return False
+        if not (target / "EpicFix.ini").is_file():
+            return False
+    return True
+
+
+def _copy_file_best_effort(src: Path, dst: Path) -> None:
+    """Copy binary; if destination is locked (game running), keep existing file."""
+    try:
+        shutil.copy2(src, dst)
+    except OSError as exc:
+        if dst.is_file() and dst.stat().st_size > 0:
+            sys.stderr.write(f"online_fix: keep existing {dst.name} ({exc})\n")
+            return
+        raise
+
+
+def embed_online_fix(
+    install_path: str | Path,
+    appid: str,
+    plugin_root: Path,
+    settings: dict[str, Any],
+    *,
+    analysis: dict[str, Any] | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Embed SteamFix (+ EpicFix when EOS) the way FreeTP packs do."""
+    auto = settings.get("autoEmbedOnlineFix")
+    if auto is None:
+        auto = True
+    if not auto and not force:
+        return {"ok": True, "skipped": True, "reason": "disabled"}
+
+    if analysis is None:
+        analysis = {"needsOnlineFix": force}
+    weak_ok = bool(settings.get("onlineFixOnWeakMultiplayer"))
+    steam_class = str(analysis.get("steamFix") or "")
+    if not steam_class:
+        steam_class = "required" if analysis.get("needsOnlineFix") else (
+            "optional" if analysis.get("hasWeakMultiplayer") else "none"
+        )
+    needs = steam_class == "required" or (weak_ok and steam_class == "optional") or (
+        bool(analysis.get("needsOnlineFix")) and steam_class != "none"
+    )
+    root = Path(install_path)
+    # Depot installs of Steamworks titles (even single-player) fail SteamAPI_Init
+    # with "No licenses" unless FakeAppId overlay is present — store tags alone miss this.
+    if not needs and not force and root.is_dir() and game_has_steam_api(root):
+        needs = True
+        steam_class = "required"
+        analysis = {
+            **analysis,
+            "steamFix": "required",
+            "needsOnlineFix": True,
+            "reason": "steam_api present — SteamFix required without Steam license",
+            "hasSteamApi": True,
+        }
+    if force:
+        needs = True
+    if not needs and not force:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": analysis.get("reason") or "no-online-categories",
+            "steamFix": steam_class,
+            "epicFix": analysis.get("epicFix") or "none",
+            "analysis": analysis,
+        }
+
+    if not root.is_dir():
+        return {"ok": False, "error": f"install path missing: {root}"}
+
+    kit = ensure_online_fix_kit(plugin_root, settings)
+    if kit is None:
+        return {
+            "ok": False,
+            "error": (
+                "Online-fix kit missing (SteamFix64.dll / winmm.dll). "
+                "Install any FreeTP online game once, or set onlineFixSourceDir "
+                "to a folder that contains those files."
+            ),
+            "analysis": analysis,
+        }
+
+    targets = find_overlay_targets(root)
+    if not targets:
+        return {"ok": False, "error": "no overlay target directories found", "analysis": analysis}
+    primary = targets[0]
+
+    need_epic = game_needs_epic_fix(root) or game_needs_epic_fix(primary)
+    if need_epic and not (kit / "EpicFix64.dll").is_file():
+        # One more harvest pass focused on EpicFix (e.g. HydraGames Meccha).
+        ensure_online_fix_kit(plugin_root, settings)
+        kit = kit_dir(plugin_root, settings)
+    use_epic = need_epic and (kit / "EpicFix64.dll").is_file()
+    if need_epic and not use_epic:
+        return {
+            "ok": False,
+            "error": (
+                "Game uses RedpointEOS but EpicFix64.dll is not in online_fix_kit. "
+                "Point onlineFixSourceDir at a FreeTP EOS fix folder "
+                "(e.g. HydraGames\\MECCHA CHAMELEON\\Chameleon\\Binaries\\Win64)."
+            ),
+            "analysis": analysis,
+            "target": str(primary),
+        }
+
+    workshop = bool(analysis.get("hasWorkshop"))
+    applied: list[str] = []
+    for target in targets:
+        try:
+            if not (overlay_complete(target, need_epic=use_epic) and not force):
+                # Prefer byte-exact FreeTP overlay for this AppId (ini + dlls).
+                # Do NOT copy FreeTP/.hash — it is path-bound and causes promo opens.
+                donor = _find_freetp_overlay_dir_for_appid(str(appid), settings)
+                if donor is not None and donor.resolve() != target.resolve():
+                    for name in ("SteamFix.ini", "winmm.txt", "SteamFix64.dll", "winmm.dll", "SteamFix32.dll"):
+                        src = donor / name
+                        if src.is_file():
+                            _copy_file_best_effort(src, target / name)
+                else:
+                    write_steam_fix_ini(target / "SteamFix.ini", str(appid), workshop=workshop)
+                    write_winmm_txt(target / "winmm.txt", include_epic=use_epic)
+                    _copy_file_best_effort(kit / "SteamFix64.dll", target / "SteamFix64.dll")
+                    _copy_file_best_effort(kit / "winmm.dll", target / "winmm.dll")
+                    if (kit / "SteamFix32.dll").is_file():
+                        _copy_file_best_effort(kit / "SteamFix32.dll", target / "SteamFix32.dll")
+
+                if use_epic:
+                    write_epic_fix_ini(target / "EpicFix.ini")
+                # FreeTP + winmm/SteamFix: no steam_appid.txt.
+                # Non-winmm Steamworks (.NET tools): keep steam_appid.txt=480 (written below).
+                game_exe = _find_launch_exe_for_overlay(target)
+                needs_appid_file = bool(
+                    game_exe
+                    and not (target / f"{game_exe.stem}_Data").is_dir()
+                    and not list(target.glob("*Shipping*.exe"))
+                    and not _pe_mentions_dll(game_exe, "winmm.dll")
+                    and (
+                        game_has_steam_api(target)
+                        or (target / "steam_api64.dll").is_file()
+                        or (target / "steam_api.dll").is_file()
+                    )
+                )
+                stray_appid = target / "steam_appid.txt"
+                if stray_appid.is_file() and not needs_appid_file:
+                    try:
+                        stray_appid.unlink()
+                    except OSError:
+                        pass
+                elif needs_appid_file:
+                    _write_fake_steam_appid(target, "480")
+
+                if use_epic:
+                    _copy_file_best_effort(kit / "EpicFix64.dll", target / "EpicFix64.dll")
+                    write_epic_fix_ini(target / "EpicFix.ini")
+                    for eos_dll in root.rglob("EOSSDK*.dll"):
+                        if _skip_overlay_path(eos_dll):
+                            continue
+                        eos_dir = eos_dll.parent
+                        try:
+                            _copy_file_best_effort(kit / "EpicFix64.dll", eos_dir / "EpicFix64.dll")
+                            write_epic_fix_ini(eos_dir / "EpicFix.ini")
+                        except OSError:
+                            pass
+
+            _ensure_freetp_ack_folder(target, str(appid), settings, plugin_root)
+            applied.append(str(target))
+        except OSError as exc:
+            return {"ok": False, "error": str(exc), "applied": applied, "analysis": analysis}
+
+    _cleanup_stray_root_overlay(root, primary)
+
+    bootstrap: Path | None = None
+    try:
+        bootstrap = _install_steamfix_bootstrap(primary, plugin_root)
+    except Exception as exc:
+        sys.stderr.write(f"online_fix: bootstrap: {exc}\n")
+
+    marker = root / ".arachnel-steamidra"
+    try:
+        payload: dict[str, Any] = {}
+        if marker.is_file():
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        # Prefer real game exe; steam_appid.txt handles non-winmm Steamworks.
+        launch_exe = _find_launch_exe_for_overlay(primary)
+        if launch_exe is not None:
+            payload["launch"] = {"type": "exe", "path": str(launch_exe)}
+        payload["onlineFix"] = {
+            "embedded": True,
+            "targets": applied,
+            "epic": use_epic,
+            "steamAppIdFile": (primary / "steam_appid.txt").is_file(),
+            "layout": "ue-shipping" if primary.name in ("Win64", "Win32") else "unity-or-root",
+            "analysis": {
+                "needsOnlineFix": analysis.get("needsOnlineFix"),
+                "hasWorkshop": analysis.get("hasWorkshop"),
+                "categoryIds": analysis.get("categoryIds"),
+                "categoryLabels": analysis.get("categoryLabels"),
+                "hasSteamApi": analysis.get("hasSteamApi"),
+            },
+        }
+        marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "embedded": True,
+        "targets": applied,
+        "epic": use_epic,
+        "steamAppIdFile": (primary / "steam_appid.txt").is_file(),
+        "kit": str(kit),
+        "analysis": analysis,
+    }

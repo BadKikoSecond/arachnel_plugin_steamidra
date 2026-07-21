@@ -6,5 +6,8 @@
   "libraryFolder": "",
   "includeDlc": false,
   "manifestCatalogUrl": "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json",
-  "manifestCatalogTtlHours": 24
+  "manifestCatalogTtlHours": 24,
+  "autoEmbedOnlineFix": true,
+  "onlineFixOnWeakMultiplayer": false,
+  "onlineFixSourceDir": ""
 }

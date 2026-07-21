@@ -6,6 +6,10 @@ __pycache__/
 *.pyc
 catalog/.cache/
 
+# Harvested FreeTP SteamFix binaries (not redistributed in git)
+online_fix_kit/
+**/online_fix_kit/
+
 # Vendored large/binary trees (fetch via tools/fetch_third_party.*)
 third_party/linux/dotnet/
 third_party/windows/dotnet/

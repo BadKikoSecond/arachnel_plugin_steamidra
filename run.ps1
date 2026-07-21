@@ -92,6 +92,10 @@ if (Test-Path (Join-Path $bundle "steamidra_plugin.dll")) {
             Copy-Item -Force $srcKeep (Join-Path $keepDir $name)
         }
     }
+    $kitSrc = Join-Path $dest "online_fix_kit"
+    if (Test-Path $kitSrc) {
+        Copy-Item -Recurse -Force $kitSrc (Join-Path $keepDir "online_fix_kit")
+    }
     $replaced = $false
     if (Test-Path $dest) {
         try {
@@ -108,6 +112,10 @@ if (Test-Path (Join-Path $bundle "steamidra_plugin.dll")) {
         if (Test-Path $kept) {
             Copy-Item -Force $kept (Join-Path $dest $name)
         }
+    }
+    $kitKept = Join-Path $keepDir "online_fix_kit"
+    if (Test-Path $kitKept) {
+        Copy-Item -Recurse -Force $kitKept (Join-Path $dest "online_fix_kit")
     }
     Remove-Item -Recurse -Force $keepDir -ErrorAction SilentlyContinue
     $ver = (Get-Content (Join-Path $dest "plugin.json") -Raw | ConvertFrom-Json).version

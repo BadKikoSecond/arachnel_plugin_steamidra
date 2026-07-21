@@ -1,7 +1,7 @@
 {
   "id": "steamidra",
   "name": "Steam",
-  "version": "0.3.12",
+  "version": "0.3.25",
   "apiVersion": 3,
   "library": "steamidra_plugin",
   "iconName": "stadia_controller",

@@ -85,6 +85,26 @@ export ARACHNEL_SDK_DIR=~/path/to/Arachnel   # or D:\Work\Arachnel
 | `manifestCatalogUrl` | Override catalog JSON URL |
 | `manifestCatalogTtlHours` | Refresh interval (default `24`) |
 | `steamPath` | Override Steam root |
+| `autoEmbedOnlineFix` | After install, embed SteamFix when Steam Store has Online PvP/Co-op/MMO (default `true`) |
+| `onlineFixOnWeakMultiplayer` | Also embed on weak Multi-player/Co-op tags (default `false`) |
+| `onlineFixSourceDir` | Folder with `SteamFix64.dll` + `winmm.dll` (else harvest from FreeTP installs into `online_fix_kit/`) |
+
+## When is an online fix needed?
+
+| Class | Steam Store anchors | Action |
+|-------|---------------------|--------|
+| **none** | No Online PvP/Co-op/MMO/Cross-Platform (SP only, or local/LAN/split only) | Do not embed |
+| **steam** | Category **36** Online PvP, **38** Online Co-op, **20** MMO, and/or **27** Cross-Platform | Embed SteamFix (+ winmm) |
+| **steam + eos** | Same as steam, **and** install has **RedpointEOS** (not plain EOSSDK alone) | Also embed EpicFix (`NoAuth=1`) |
+
+EpicFix is **never** decided from the Store alone. Plain `EOSSDK*.dll` (e.g. Pratfall) often needs **SteamFix only** — FreeTP does not ship EpicFix there; forcing EpicFix opens freetp.org and can black-screen the game.
+
+## Online fix layout
+
+Binaries are harvested into `online_fix_kit/` (not shipped in git):
+- **Unity** — next to `<Game>.exe` + `*_Data`
+- **Unreal** — only `<Game>/Binaries/Win64` (never `Engine/`, never install root)
+- **EOS** — `EpicFix64.dll` + `EpicFix.ini` `[EOS] NoAuth=true`; `winmm.txt` loads both DLLs
 
 ## Modes
 

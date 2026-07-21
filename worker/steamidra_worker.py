@@ -29,6 +29,12 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from online_fix_embed import (
+    analyze_store_categories,
+    embed_online_fix,
+    merge_genre_string,
+)
+
 # Windows consoles often default to cp1251/cp1252 — force UTF-8 for JSON IPC.
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -377,6 +383,10 @@ def load_settings(path: str | None) -> dict[str, Any]:
         "preferMode": "ddmod",  # ddmod | native | auto
         "libraryFolder": "",
         "includeDlc": False,
+        # Auto-embed FreeTP-style SteamFix when Store categories say Online PvP/Co-op/MMO.
+        "autoEmbedOnlineFix": True,
+        "onlineFixOnWeakMultiplayer": False,
+        "onlineFixSourceDir": "",
     }
     if path:
         defaults["_settingsPath"] = path
@@ -398,6 +408,41 @@ def load_settings(path: str | None) -> dict[str, Any]:
 
 
 
+def _steam_path_looks_valid(path: Path) -> bool:
+    return (path / "steam.sh").exists() or (path / "steam.exe").exists() or (path / "steamapps").is_dir()
+
+
+def _steam_paths_from_windows_registry() -> list[Path]:
+    """Resolve custom Steam installs (e.g. D:\\Media\\Steam) via Valve registry keys."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    found: list[Path] = []
+    keys = (
+        (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", ("SteamPath", "InstallPath")),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", ("InstallPath", "SteamPath")),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", ("InstallPath", "SteamPath")),
+    )
+    for hive, subkey, names in keys:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                for name in names:
+                    try:
+                        raw, _ = winreg.QueryValueEx(key, name)
+                    except OSError:
+                        continue
+                    text = str(raw or "").strip()
+                    if not text:
+                        continue
+                    path = Path(text)
+                    if path not in found:
+                        found.append(path)
+        except OSError:
+            continue
+    return found
+
+
 def find_steam_path(settings: dict[str, Any]) -> Path | None:
     configured = (settings.get("steamPath") or "").strip()
     if configured and Path(configured).is_dir():
@@ -406,6 +451,7 @@ def find_steam_path(settings: dict[str, Any]) -> Path | None:
     home = Path.home()
     candidates: list[Path] = []
     if platform.system() == "Windows":
+        candidates.extend(_steam_paths_from_windows_registry())
         for env in ("PROGRAMFILES(X86)", "PROGRAMFILES"):
             root = os.environ.get(env)
             if root:
@@ -415,6 +461,7 @@ def find_steam_path(settings: dict[str, Any]) -> Path | None:
         for drive in ("C:", "D:", "E:"):
             candidates.append(Path(f"{drive}/Steam"))
             candidates.append(Path(f"{drive}/Program Files (x86)/Steam"))
+            candidates.append(Path(f"{drive}/Media/Steam"))
     else:
         candidates.extend(
             [
@@ -424,8 +471,16 @@ def find_steam_path(settings: dict[str, Any]) -> Path | None:
                 home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
             ]
         )
+    seen: set[Path] = set()
     for c in candidates:
-        if (c / "steam.sh").exists() or (c / "steam.exe").exists() or (c / "steamapps").is_dir():
+        try:
+            key = c.resolve()
+        except OSError:
+            key = c
+        if key in seen:
+            continue
+        seen.add(key)
+        if _steam_path_looks_valid(c):
             return c
     return None
 
@@ -508,6 +563,10 @@ def steam_app_details(appid: str) -> dict[str, Any] | None:
     if not block or not block.get("success"):
         return None
     d = block.get("data") or {}
+    analysis = analyze_store_categories(d)
+    genres = merge_genre_string("", analysis)
+    # BundledFix (2) when we will auto-embed SteamFix; else PortableArchive (0).
+    install_kind = 2 if analysis.get("needsOnlineFix") else 0
     return {
         "id": f"steam-{appid}",
         "title": d.get("name") or f"App {appid}",
@@ -516,6 +575,14 @@ def steam_app_details(appid: str) -> dict[str, Any] | None:
         "description": (d.get("short_description") or "")[:2000],
         "sizeLabel": "",
         "version": str(d.get("steam_appid") or appid),
+        "genres": genres,
+        "needsOnlineFix": bool(analysis.get("needsOnlineFix")),
+        "steamFix": analysis.get("steamFix") or "none",
+        "epicFix": analysis.get("epicFix") or "none",
+        "onlineFixReason": analysis.get("reason") or "",
+        "installKind": install_kind,
+        "onlineAnalysis": analysis,
+        "categoryLabels": list(analysis.get("categoryLabels") or []),
     }
 
 
@@ -700,6 +767,15 @@ def normalize_catalog_game(raw: dict[str, Any]) -> dict[str, Any] | None:
         "sourceId": source_id or "steamidra",
         "genres": str(raw.get("genres") or ""),
     }
+    needs_fix = raw.get("needsOnlineFix")
+    if needs_fix is None:
+        genres_l = entry["genres"].lower()
+        needs_fix = "online fix" in genres_l or "online co-op" in genres_l or "online pvp" in genres_l
+    entry["needsOnlineFix"] = bool(needs_fix)
+    try:
+        entry["installKind"] = int(raw.get("installKind"))
+    except (TypeError, ValueError):
+        entry["installKind"] = 2 if entry["needsOnlineFix"] else 0
     addons_in = raw.get("addons")
     if isinstance(addons_in, list) and addons_in:
         addons_out: list[dict[str, Any]] = []
@@ -1732,8 +1808,10 @@ def write_acf(
     installdir: str,
     size: int = 0,
     manifests: dict[str, str] | None = None,
+    *,
+    state_flags: str = "4",
 ) -> Path:
-    """Write a usable appmanifest (Fully Installed) after ddmod download."""
+    """Write appmanifest. Default StateFlags 4 = Fully Installed (post-ddmod)."""
     import time
 
     lib = steam / "steamapps"
@@ -1756,7 +1834,7 @@ def write_acf(
 \t"appid"\t\t"{appid}"
 \t"Universe"\t\t"1"
 \t"name"\t\t"{safe_title}"
-\t"StateFlags"\t\t"4"
+\t"StateFlags"\t\t"{state_flags}"
 \t"installdir"\t\t"{installdir}"
 \t"LastUpdated"\t\t"{int(time.time())}"
 \t"SizeOnDisk"\t\t"{size}"
@@ -1776,7 +1854,184 @@ def write_acf(
 
 
 def write_acf_stub(steam: Path, appid: str, title: str, installdir: str, size: int = 0) -> Path:
-    return write_acf(steam, appid, title, installdir, size=size, manifests=None)
+    # 6 = Fully Installed (4) + Update Required (2) so Steam client will fetch content.
+    # StateFlags 4 alone with empty depots makes Steam treat the game as already installed.
+    return write_acf(
+        steam, appid, title, installdir, size=size, manifests=None, state_flags="6"
+    )
+
+
+def parse_steam_acf(acf_path: Path) -> dict[str, Any]:
+    """Parse a minimal subset of Steam appmanifest_*.acf (KeyValues)."""
+    out: dict[str, Any] = {
+        "stateFlags": 0,
+        "bytesDownloaded": 0,
+        "bytesToDownload": 0,
+        "sizeOnDisk": 0,
+        "installdir": "",
+    }
+    if not acf_path.is_file():
+        return out
+    try:
+        text = acf_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+
+    def grab_int(key: str) -> int:
+        m = re.search(rf'"{re.escape(key)}"\s+"(\d+)"', text, re.I)
+        return int(m.group(1)) if m else 0
+
+    def grab_str(key: str) -> str:
+        m = re.search(rf'"{re.escape(key)}"\s+"([^"]*)"', text, re.I)
+        return m.group(1) if m else ""
+
+    out["stateFlags"] = grab_int("StateFlags")
+    out["bytesDownloaded"] = grab_int("BytesDownloaded")
+    out["bytesToDownload"] = grab_int("BytesToDownload")
+    out["sizeOnDisk"] = grab_int("SizeOnDisk")
+    out["installdir"] = grab_str("installdir")
+    return out
+
+
+def steam_acf_fully_installed(info: dict[str, Any]) -> bool:
+    """True when Steam reports the app fully installed and not still updating."""
+    flags = int(info.get("stateFlags") or 0)
+    size = int(info.get("sizeOnDisk") or 0)
+    downloaded = int(info.get("bytesDownloaded") or 0)
+    to_download = int(info.get("bytesToDownload") or 0)
+    fully = bool(flags & 4)
+    update_required = bool(flags & 2)
+    update_running = bool(flags & 1024) or bool(flags & 512)
+    if not fully or size <= 0:
+        return False
+    if update_required or update_running:
+        return False
+    if to_download > 0 and downloaded < to_download:
+        return False
+    return True
+
+
+def launch_steam_uri(steam: Path, uri: str) -> None:
+    try:
+        if platform.system() == "Windows":
+            steam_exe = steam / "steam.exe"
+            if steam_exe.is_file():
+                subprocess.Popen(
+                    [str(steam_exe), uri],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", uri],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        else:
+            subprocess.Popen(
+                ["steam", uri],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
+
+
+def watch_native_steam_download(
+    steam: Path,
+    appid: str,
+    install_path: Path,
+    progress: bool,
+    *,
+    poll_s: float = 1.5,
+    stall_nudge_s: float = 45.0,
+) -> dict[str, Any]:
+    """Poll appmanifest until Steam finishes; emit OwnedDownload-style progress."""
+    acf = steam / "steamapps" / f"appmanifest_{appid}.acf"
+    started = time.monotonic()
+    last_bytes = 0
+    last_t = started
+    last_nudge = started
+    last_emit = 0.0
+    stalled_hint_shown = False
+
+    launch_steam_uri(steam, f"steam://install/{appid}")
+    launch_steam_uri(steam, "steam://open/downloads")
+
+    while True:
+        info = parse_steam_acf(acf)
+        downloaded = int(info["bytesDownloaded"])
+        total = int(info["bytesToDownload"])
+        size = int(info["sizeOnDisk"])
+        flags = int(info["stateFlags"])
+        now = time.monotonic()
+
+        if steam_acf_fully_installed(info):
+            _emit_progress(
+                progress,
+                **progress_kwargs(
+                    percent=100,
+                    detail="Installed",
+                    status="completed",
+                    downloaded=max(downloaded, size),
+                    total=max(total, size, downloaded),
+                ),
+            )
+            return {
+                "ok": True,
+                "installPath": str(install_path),
+                "bytesDownloaded": downloaded,
+                "sizeOnDisk": size,
+                "stateFlags": flags,
+            }
+
+        bps = 0.0
+        if downloaded > last_bytes and now > last_t:
+            bps = (downloaded - last_bytes) / (now - last_t)
+        if downloaded != last_bytes:
+            last_bytes = downloaded
+            last_t = now
+            last_nudge = now
+            stalled_hint_shown = False
+
+        if total > 0:
+            pct = min(99, int(downloaded * 100 / total)) if downloaded > 0 else 0
+        elif size > 0 and downloaded > 0:
+            pct = min(99, 50)
+        else:
+            pct = 0
+
+        if downloaded > 0 or (flags & 1024) or (flags & 512):
+            detail = transfer_detail(downloaded, total, bps, percent=pct)
+            if detail == "Downloading...":
+                detail = "Downloading in Steam…"
+        elif total > 0:
+            detail = "Queued in Steam…"
+            if now - last_nudge >= stall_nudge_s:
+                detail = "Waiting in Steam — click Update if needed"
+                stalled_hint_shown = True
+        else:
+            detail = "Queued in Steam…"
+
+        if now - last_emit >= 0.9 or stalled_hint_shown:
+            last_emit = now
+            _emit_progress(
+                progress,
+                **progress_kwargs(
+                    percent=pct,
+                    detail=detail,
+                    status="downloading",
+                    downloaded=downloaded,
+                    total=total,
+                    bps=bps,
+                ),
+            )
+
+        if now - last_nudge >= stall_nudge_s:
+            launch_steam_uri(steam, f"steam://install/{appid}")
+            last_nudge = now
+
+        time.sleep(poll_s)
 
 
 def find_ddmod(plugin_root: Path) -> Path | None:
@@ -1877,26 +2132,42 @@ def is_steamworks_redistributable(depot_id: str) -> bool:
     return 228980 <= n <= 229099
 
 
+def _depot_oslist(depot_info: dict[str, Any]) -> str:
+    cfg = depot_info.get("config") if isinstance(depot_info, dict) else None
+    if isinstance(cfg, dict):
+        return str(cfg.get("oslist") or "").lower()
+    return ""
+
+
 def filter_primary_depots(
     appid: str,
     depots: dict[str, str],
     manifests: dict[str, str],
     include_dlc: bool,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Keep game depots only: drop the app id itself, redistributables, and DLC unless asked."""
+    """Keep game depots only: drop the app id itself, redistributables, and DLC unless asked.
+
+    Also drop depots whose Steam oslist does not match this host (e.g. Linux IoStore
+    next to Windows paks crashes UE5 with null GTSM / missing shader maps).
+    """
     if not depots:
         return depots, manifests
     dlc_ids: set[str] = set()
-    if not include_dlc:
-        try:
-            info = steamcmd_app_info(appid) or {}
+    depot_meta: dict[str, Any] = {}
+    host_os = "windows" if platform.system() == "Windows" else "linux"
+    try:
+        info = steamcmd_app_info(appid) or {}
+        if not include_dlc:
             ext = info.get("extended") or {}
             for part in str(ext.get("listofdlc") or "").split(","):
                 part = part.strip()
                 if part.isdigit():
                     dlc_ids.add(part)
-        except Exception:
-            pass
+        raw_depots = info.get("depots") or {}
+        if isinstance(raw_depots, dict):
+            depot_meta = {str(k): v for k, v in raw_depots.items() if isinstance(v, dict)}
+    except Exception:
+        pass
     out_d: dict[str, str] = {}
     for k, v in depots.items():
         if k == appid:
@@ -1905,6 +2176,11 @@ def filter_primary_depots(
             continue
         if k in dlc_ids:
             continue
+        oslist = _depot_oslist(depot_meta.get(k) or {})
+        if oslist:
+            # Shared / unmarked depots have empty oslist — keep them.
+            if host_os not in oslist.split(","):
+                continue
         out_d[k] = v
     out_m = {k: v for k, v in manifests.items() if k in out_d}
     if not out_d:
@@ -1920,6 +2196,58 @@ def filter_primary_depots(
     return out_d, out_m or {k: v for k, v in manifests.items() if k in out_d}
 
 
+def strip_foreign_platform_content(install_path: Path) -> list[str]:
+    """Remove other-OS UE IoStore/paks that break shipping builds on this host.
+
+    Repro: Chopping Trees (4512570) with ChoppingTrees-Linux.{pak,ucas,utoc} beside
+    Windows IoStore → LowLevelFatalError null GTSM / DefaultPostProcessMaterial.
+    """
+    root = Path(install_path)
+    if not root.is_dir():
+        return []
+    host = platform.system()
+    if host == "Windows":
+        foreign = ("-linux.", "_linux.", "-mac.", "_mac.", "-macos.", "_macos.")
+    elif host == "Linux":
+        foreign = ("-windows.", "_windows.", "-win64.", "_win64.", "-mac.", "_mac.")
+    else:
+        return []
+
+    removed: list[str] = []
+    try:
+        pak_dirs = list(root.rglob("Content"))
+    except OSError:
+        return []
+    for content in pak_dirs:
+        paks = content / "Paks"
+        if not paks.is_dir():
+            continue
+        if "Engine" in content.parts and content.name == "Content":
+            # Skip Engine/Content noise; game Content/Paks is what mounts at runtime.
+            pass
+        try:
+            files = list(paks.iterdir())
+        except OSError:
+            continue
+        for path in files:
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in (".pak", ".ucas", ".utoc"):
+                continue
+            low = path.name.lower()
+            if any(token in low for token in foreign):
+                try:
+                    path.unlink()
+                    removed.append(str(path.relative_to(root)))
+                except OSError as exc:
+                    sys.stderr.write(f"strip_platform: keep {path.name} ({exc})\n")
+    if removed:
+        sys.stderr.write(
+            "strip_platform: removed foreign IoStore/pak: " + ", ".join(removed) + "\n"
+        )
+    return removed
+
+
 def default_library_root(settings: dict[str, Any]) -> Path:
     lib = (settings.get("libraryFolder") or "").strip()
     if lib:
@@ -1928,20 +2256,70 @@ def default_library_root(settings: dict[str, Any]) -> Path:
 
 
 def find_game_exe(install_path: Path) -> Path | None:
-    exes = sorted(install_path.rglob("*.exe"))
+    """Pick the real game binary (not GameLauncher / crash helpers)."""
+    root = install_path.resolve()
+    exes = [e for e in root.rglob("*.exe") if e.is_file()]
     if not exes:
         return None
-    # Prefer top-level / non-UnityCrashHandler
-    preferred = [
-        e
-        for e in exes
-        if e.parent == install_path and "crash" not in e.name.lower() and "unity" not in e.name.lower()
-    ]
-    if preferred:
-        return preferred[0]
+
+    skip_sub = (
+        "crash",
+        "crashpad",
+        "unitycrash",
+        "redist",
+        "prereq",
+        "unins",
+        "setup",
+        "dotnet",
+        "vcredist",
+        "easyanticheat",
+        "beclient",
+        "uninstall",
+        "arachnel",
+        "createdump",
+        "steamfix_bootstrap",
+    )
+    deprioritize = ("gamelauncher", "launcher", "bootstrap", "start", "play")
+
+    def score(path: Path) -> tuple:
+        name = path.name.lower()
+        stem = path.stem.lower()
+        if any(s in name for s in skip_sub):
+            return (99, 0, 0, name)
+        depth = len(path.relative_to(root).parts)
+        # Prefer top-level game exe that matches folder / .pck / *_Data name.
+        name_bonus = 0
+        folder = root.name.lower().replace("steam-", "")
+        if folder.isdigit():
+            folder = ""
+        if folder and (folder in stem or stem in folder):
+            name_bonus += 50
+        # Pratfall.pck / Sex With Friends_Data style anchors
+        if (root / f"{path.stem}.pck").is_file():
+            name_bonus += 80
+        if (root / f"{path.stem}_Data").is_dir():
+            name_bonus += 80
+        if path.parent == root and list(path.parent.glob("*_Data")):
+            # Unity root: prefer exe whose _Data exists
+            if (root / f"{path.stem}_Data").is_dir():
+                name_bonus += 40
+        if any(s in stem for s in deprioritize):
+            name_bonus -= 60
+        if "shipping" in stem:
+            name_bonus += 30
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        # Lower is better for depth; higher size/name_bonus wins via negatives.
+        return (0 if path.parent == root else 1, depth, -name_bonus, -size, name)
+
+    exes.sort(key=score)
     for e in exes:
-        if "crash" not in e.name.lower():
-            return e
+        name = e.name.lower()
+        if any(s in name for s in skip_sub):
+            continue
+        return e
     return exes[0]
 
 
@@ -1981,12 +2359,73 @@ def already_installed_hint(install_path: Path, appid: str) -> dict[str, Any] | N
 
 
 def launch_hint(steam: Path | None, appid: str, install_path: Path) -> dict[str, Any]:
-    if steam is not None and (steam / "steamapps" / f"appmanifest_{appid}.acf").is_file():
-        return {"type": "steam", "uri": f"steam://rungameid/{appid}"}
+    # Prefer local exe for depot/online-fix installs (steam:// skips winmm).
     exe = find_game_exe(install_path)
     if exe:
-        return {"type": "exe", "path": str(exe)}
+        args: list[str] = []
+        # FreeTP Godot packs (Pratfall): "Pratfall.exe --steam"
+        if (exe.parent / f"{exe.stem}.pck").is_file():
+            args.append("--steam")
+        hint: dict[str, Any] = {"type": "exe", "path": str(exe)}
+        if args:
+            hint["args"] = args
+        return hint
+    if steam is not None and (steam / "steamapps" / f"appmanifest_{appid}.acf").is_file():
+        return {"type": "steam", "uri": f"steam://rungameid/{appid}"}
     return {"type": "folder", "path": str(install_path)}
+
+
+def try_embed_online_fix(
+    plugin_root: Path,
+    install_path: Path,
+    appid: str,
+    settings: dict[str, Any],
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Best-effort SteamFix overlay after depot install (UE Binaries/Win64 or Unity root)."""
+    try:
+        strip_foreign_platform_content(Path(install_path))
+    except Exception as exc:
+        sys.stderr.write(f"strip_platform: {exc}\n")
+    analysis: dict[str, Any] | None = None
+    try:
+        details = steam_app_details(str(appid))
+        if details:
+            analysis = details.get("onlineAnalysis")
+    except Exception as exc:
+        sys.stderr.write(f"online_fix: store lookup failed: {exc}\n")
+    try:
+        result = embed_online_fix(
+            install_path,
+            str(appid),
+            plugin_root,
+            settings,
+            analysis=analysis,
+            force=force,
+        )
+    except Exception as exc:
+        sys.stderr.write(f"online_fix: embed failed: {exc}\n")
+        return {"ok": False, "error": str(exc)}
+    if result.get("error"):
+        sys.stderr.write(f"online_fix: {result['error']}\n")
+        # Persist failure on marker so UI/logs can show why fix is missing.
+        try:
+            marker = Path(install_path) / ".arachnel-steamidra"
+            payload: dict[str, Any] = {}
+            if marker.is_file():
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+            payload["onlineFix"] = {"embedded": False, "error": result.get("error")}
+            marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    elif result.get("embedded"):
+        n = len(result.get("targets") or [])
+        epic = " + EpicFix" if result.get("epic") else ""
+        sys.stderr.write(f"online_fix: embedded SteamFix{epic} into {n} path(s)\n")
+    elif result.get("skipped"):
+        sys.stderr.write(f"online_fix: skipped ({result.get('reason')})\n")
+    return result
 
 
 def run_ddmod(
@@ -2349,7 +2788,8 @@ def install_game(
                 totalBytes=size,
                 downloadRateBps=0,
             )
-            return {
+            fix = try_embed_online_fix(plugin_root, install_path_early, appid, settings)
+            out = {
                 "ok": True,
                 "installPath": str(install_path_early),
                 "mode": "already-installed",
@@ -2357,6 +2797,9 @@ def install_game(
                 "steamPath": str(steam) if steam else "",
                 "skippedDownload": True,
             }
+            if fix:
+                out["onlineFix"] = fix
+            return out
 
     ensure_inject(steam, progress, plugin_root=plugin_root)
 
@@ -2438,6 +2881,10 @@ def install_game(
                 progress,
                 steam=steam,
             )
+            try:
+                strip_foreign_platform_content(install_path)
+            except Exception as exc:
+                sys.stderr.write(f"strip_platform: {exc}\n")
             size = sum(f.stat().st_size for f in install_path.rglob("*") if f.is_file())
             if steam:
                 # Prefer Steam common path for ACF installdir
@@ -2465,14 +2912,18 @@ def install_game(
                 json.dumps({"appid": appid, "mode": "ddmod", "launch": hint}, indent=2),
                 encoding="utf-8",
             )
+            fix = try_embed_online_fix(plugin_root, install_final, appid, settings)
             _emit_progress(progress, percent=100, detail="Installed", status="completed")
-            return {
+            out = {
                 "ok": True,
                 "installPath": str(install_final),
                 "mode": "ddmod",
                 "launch": hint,
                 "steamPath": str(steam) if steam else "",
             }
+            if fix:
+                out["onlineFix"] = fix
+            return out
 
         def do_native() -> dict[str, Any]:
             if not steam:
@@ -2481,23 +2932,6 @@ def install_game(
                     "error": "native mode requires Steam — use preferMode ddmod or install Steam",
                 }
             common = write_acf_stub(steam, appid, title, installdir, size=0)
-            detail = "Queued in Steam — restart Steam, then open the game there"
-            try:
-                if platform.system() != "Windows":
-                    subprocess.Popen(
-                        ["steam", f"steam://install/{appid}"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                else:
-                    subprocess.Popen(
-                        ["cmd", "/c", "start", "", f"steam://install/{appid}"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-            except Exception:
-                pass
-            _emit_progress(progress, percent=90, detail=detail, status="downloading")
             path = common if common.exists() else install_path
             path.mkdir(parents=True, exist_ok=True)
             hint = launch_hint(steam, appid, path)
@@ -2507,15 +2941,47 @@ def install_game(
                 encoding="utf-8",
             )
             _emit_progress(
-                progress, percent=100, detail="Prepared — Steam is downloading", status="completed"
+                progress,
+                percent=0,
+                detail="Queued in Steam…",
+                status="downloading",
             )
-            return {
+            watched = watch_native_steam_download(steam, appid, path, progress)
+            if not watched.get("ok"):
+                return {
+                    "ok": False,
+                    "error": watched.get("error") or "Steam download did not finish",
+                    "steamPath": str(steam),
+                }
+            # Refresh installdir from ACF if Steam renamed it.
+            acf_info = parse_steam_acf(steam / "steamapps" / f"appmanifest_{appid}.acf")
+            final_dir = path
+            acf_installdir = str(acf_info.get("installdir") or "").strip()
+            if acf_installdir:
+                candidate = steam / "steamapps" / "common" / acf_installdir
+                if candidate.is_dir():
+                    final_dir = candidate
+            hint = launch_hint(steam, appid, final_dir)
+            marker = final_dir / ".arachnel-steamidra"
+            try:
+                marker.write_text(
+                    json.dumps({"appid": appid, "mode": "native", "launch": hint}, indent=2),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            fix = try_embed_online_fix(plugin_root, final_dir, appid, settings)
+            _emit_progress(progress, percent=100, detail="Installed", status="completed")
+            out = {
                 "ok": True,
-                "installPath": str(path),
+                "installPath": str(final_dir),
                 "mode": "native",
                 "steamPath": str(steam),
                 "launch": hint,
             }
+            if fix:
+                out["onlineFix"] = fix
+            return out
 
         if force_ddmod or (prefer == "auto" and can_ddmod):
             if force_native:
@@ -2588,6 +3054,16 @@ def main() -> int:
     p_addon.add_argument("--zip", required=True)
     p_addon.add_argument("--dest", required=True)
 
+    p_embed = sub.add_parser("embed-online-fix")
+    p_embed.add_argument("--appid", required=True)
+    p_embed.add_argument("--path", required=True, help="Game install directory")
+    p_embed.add_argument("--settings", default="")
+    p_embed.add_argument(
+        "--force",
+        action="store_true",
+        help="Embed even without strong online categories / overwrite existing overlay",
+    )
+
     p_setup = sub.add_parser("setup-inject")
     p_setup.add_argument("--settings", default="")
 
@@ -2634,6 +3110,16 @@ def main() -> int:
             result = {"ok": True, "steamPath": str(steam) if steam else "", "os": platform.system()}
         elif args.cmd == "install-addon":
             result = cmd_install_addon(args.zip, args.dest)
+        elif args.cmd == "embed-online-fix":
+            result = try_embed_online_fix(
+                plugin_root,
+                Path(args.path),
+                args.appid,
+                settings,
+                force=bool(args.force),
+            )
+            if result.get("ok") is None and not result.get("error"):
+                result["ok"] = True
         elif args.cmd == "install":
             result = install_game(
                 plugin_root,
