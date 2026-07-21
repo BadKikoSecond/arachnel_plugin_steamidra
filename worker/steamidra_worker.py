@@ -445,8 +445,11 @@ def _steam_paths_from_windows_registry() -> list[Path]:
 
 def find_steam_path(settings: dict[str, Any]) -> Path | None:
     configured = (settings.get("steamPath") or "").strip()
-    if configured and Path(configured).is_dir():
-        return Path(configured)
+    if configured:
+        cfg = Path(configured)
+        if _steam_path_looks_valid(cfg):
+            return cfg
+        # Wrong manual path — keep searching (empty/unknown is fine).
 
     home = Path.home()
     candidates: list[Path] = []
@@ -1339,17 +1342,51 @@ def _copy_lumacore_dlls(src_root: Path, steam: Path) -> int:
     return found
 
 
+def _lumacore_bundle_dir(plugin_root: Path | None) -> Path | None:
+    """Return a bundled LumaCore dir that actually contains DLLs (not just README)."""
+    if not plugin_root:
+        return None
+    wanted = {"dwmapi.dll", "xinput1_4.dll", "lumacore.dll", "lumacorepayload.dll"}
+    for cand in (
+        plugin_root / "third_party" / "LumaCore",
+        plugin_root / "third_party" / "windows" / "LumaCore",
+    ):
+        if not cand.is_dir():
+            continue
+        names = {p.name.lower() for p in cand.rglob("*") if p.is_file()}
+        if names & wanted:
+            return cand
+    return None
+
+
+def _pick_lumacore_asset_url(assets: list[Any]) -> str | None:
+    """Prefer Release.zip; never grab Debug.zip first just because it is listed earlier."""
+    zips: list[tuple[int, str]] = []
+    for a in assets or []:
+        name = (a.get("name") or "").lower()
+        url = a.get("browser_download_url")
+        if not url:
+            continue
+        if not (name.endswith(".zip") or "lumacore" in name):
+            continue
+        if "debug" in name:
+            rank = 3
+        elif "release" in name:
+            rank = 0
+        elif "lumacore" in name:
+            rank = 1
+        else:
+            rank = 2
+        zips.append((rank, str(url)))
+    if not zips:
+        return None
+    zips.sort(key=lambda t: t[0])
+    return zips[0][1]
+
+
 def setup_lumacore(steam: Path, progress: bool, plugin_root: Path | None = None) -> None:
     (steam / "config" / "stplug-in").mkdir(parents=True, exist_ok=True)
-    bundled = None
-    if plugin_root:
-        for cand in (
-            plugin_root / "third_party" / "LumaCore",
-            plugin_root / "third_party" / "windows" / "LumaCore",
-        ):
-            if cand.is_dir():
-                bundled = cand
-                break
+    bundled = _lumacore_bundle_dir(plugin_root)
     if bundled and _copy_lumacore_dlls(bundled, steam) > 0:
         (steam / "config" / "arachnel_lumacore.json").write_text(
             json.dumps({"source": "bundled", "installed": True}, indent=2), encoding="utf-8"
@@ -1365,13 +1402,7 @@ def setup_lumacore(steam: Path, progress: bool, plugin_root: Path | None = None)
         )
     except Exception as exc:
         raise RuntimeError(f"LumaCore release fetch failed: {exc}") from exc
-    asset_url = None
-    for a in rel.get("assets") or []:
-        name = (a.get("name") or "").lower()
-        if name.endswith(".zip") or "lumacore" in name:
-            asset_url = a.get("browser_download_url")
-            if asset_url:
-                break
+    asset_url = _pick_lumacore_asset_url(list(rel.get("assets") or []))
     if not asset_url:
         raise RuntimeError("No LumaCore asset on latest release")
     raw = http_get_bytes(asset_url)
@@ -1385,7 +1416,16 @@ def setup_lumacore(steam: Path, progress: bool, plugin_root: Path | None = None)
             raise RuntimeError("LumaCore zip had no expected DLLs")
         marker = steam / "config" / "arachnel_lumacore.json"
         marker.write_text(
-            json.dumps({"tag": rel.get("tag_name"), "installed": True}, indent=2), encoding="utf-8"
+            json.dumps(
+                {
+                    "tag": rel.get("tag_name"),
+                    "installed": True,
+                    "source": "github",
+                    "asset": asset_url.rsplit("/", 1)[-1],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1766,17 +1806,24 @@ def setup_slssteam(steam: Path, progress: bool, plugin_root: Path | None = None)
     _emit_progress(progress, percent=0, detail="Preparing Steam…", status="downloading")
 
 
-def ensure_inject(steam: Path | None, progress: bool, plugin_root: Path | None = None) -> None:
-    """Install SLS/Luma when Steam is present; no-op if Steam absent (ddmod-only)."""
+def ensure_inject(steam: Path | None, progress: bool, plugin_root: Path | None = None) -> bool:
+    """Install SLS/Luma when Steam is present; no-op if Steam absent (ddmod-only).
+
+    Returns True if LumaCore DLLs were freshly installed (Steam must be restarted
+    before native install can fake ownership).
+    """
     if steam is None:
         _emit_progress(progress, percent=0, detail="Preparing…", status="downloading")
-        return
+        return False
     if platform.system() == "Windows":
+        freshly_installed = False
         if not (steam / "LumaCore.dll").exists() and not (steam / "dwmapi.dll").exists():
             setup_lumacore(steam, progress, plugin_root=plugin_root)
+            freshly_installed = True
         else:
             _emit_progress(progress, percent=0, detail="Preparing Steam…", status="downloading")
         (steam / "config" / "stplug-in").mkdir(parents=True, exist_ok=True)
+        return freshly_installed
     else:
         share, _ = slssteam_paths()
         if not (share / "SLSsteam.so").exists():
@@ -1799,6 +1846,7 @@ def ensure_inject(steam: Path | None, progress: bool, plugin_root: Path | None =
             if inject_so.exists() and sls_so.exists():
                 _patch_steam_sh_ld_audit(steam, inject_so, sls_so)
             _emit_progress(progress, percent=0, detail="Preparing Steam…", status="downloading")
+        return False
 
 
 def write_acf(
@@ -1937,6 +1985,102 @@ def launch_steam_uri(steam: Path, uri: str) -> None:
         pass
 
 
+def lumacore_present(steam: Path) -> bool:
+    return (steam / "LumaCore.dll").is_file() or (steam / "dwmapi.dll").is_file()
+
+
+def stplugin_lua_present(steam: Path, appid: str) -> bool:
+    path = steam / "config" / "stplug-in" / f"{appid}.lua"
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "addappid" in text.lower()
+
+
+def restart_steam(steam: Path, progress: bool = False) -> None:
+    """Quit Steam and start it again so LumaCore (dwmapi proxy) is loaded."""
+    if platform.system() != "Windows":
+        return
+    steam_exe = steam / "steam.exe"
+    if not steam_exe.is_file():
+        return
+    _emit_progress(progress, percent=0, detail="Restarting Steam for LumaCore…", status="downloading")
+    try:
+        subprocess.run(
+            [str(steam_exe), "-shutdown"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        pass
+    # Wait until steam.exe exits (or timeout).
+    deadline = time.monotonic() + 45.0
+    while time.monotonic() < deadline:
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq steam.exe"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if "steam.exe" not in (r.stdout or "").lower():
+                break
+        except Exception:
+            break
+        time.sleep(1.0)
+    time.sleep(2.0)
+    try:
+        subprocess.Popen(
+            [str(steam_exe)],
+            cwd=str(steam),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+    # Give LumaCore time to inject after Steam UI comes up.
+    time.sleep(12.0)
+
+
+def steam_recent_no_license(steam: Path, appid: str, since: float) -> bool:
+    """Best-effort: Steam wrote a 'No licenses' style error for this app after *since*."""
+    markers = (
+        "no licenses",
+        "нет лицензий",
+        "does not own",
+        "not own app",
+    )
+    app_token = str(appid)
+    log_dir = steam / "logs"
+    if not log_dir.is_dir():
+        return False
+    candidates = sorted(
+        list(log_dir.glob("*.txt")) + list(log_dir.glob("*.log")),
+        key=lambda p: p.stat().st_mtime if p.is_file() else 0,
+        reverse=True,
+    )[:12]
+    for path in candidates:
+        try:
+            if path.stat().st_mtime < since - 5:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lower = text.lower()
+        if app_token not in text and f"appid {app_token}" not in lower and f"({app_token})" not in text:
+            continue
+        for marker in markers:
+            if marker in lower:
+                return True
+    return False
+
+
 def watch_native_steam_download(
     steam: Path,
     appid: str,
@@ -1945,15 +2089,24 @@ def watch_native_steam_download(
     *,
     poll_s: float = 1.5,
     stall_nudge_s: float = 45.0,
+    max_queue_s: float = 180.0,
+    allow_steam_restart: bool = True,
 ) -> dict[str, Any]:
-    """Poll appmanifest until Steam finishes; emit OwnedDownload-style progress."""
+    """Poll appmanifest until Steam finishes; emit OwnedDownload-style progress.
+
+    LumaCore fakes ownership via stplug-in lua. A 'No licenses' dialog usually means
+    Steam was running without LumaCore loaded — we restart Steam once and retry.
+    """
     acf = steam / "steamapps" / f"appmanifest_{appid}.acf"
     started = time.monotonic()
+    wall_started = time.time()
     last_bytes = 0
     last_t = started
     last_nudge = started
     last_emit = 0.0
     stalled_hint_shown = False
+    saw_transfer = False
+    did_restart = False
 
     launch_steam_uri(steam, f"steam://install/{appid}")
     launch_steam_uri(steam, "steam://open/downloads")
@@ -1993,24 +2146,73 @@ def watch_native_steam_download(
             last_t = now
             last_nudge = now
             stalled_hint_shown = False
+            saw_transfer = True
 
-        if total > 0:
-            pct = min(99, int(downloaded * 100 / total)) if downloaded > 0 else 0
-        elif size > 0 and downloaded > 0:
-            pct = min(99, 50)
-        else:
-            pct = 0
+        updating = bool(flags & 1024) or bool(flags & 512)
+        if updating or total > 0:
+            saw_transfer = True
 
-        if downloaded > 0 or (flags & 1024) or (flags & 512):
+        license_denied = steam_recent_no_license(steam, appid, wall_started) and not saw_transfer
+        queued_only = downloaded <= 0 and total <= 0 and not updating
+        stuck = queued_only and (now - started) >= max_queue_s
+
+        if (license_denied or stuck) and allow_steam_restart and not did_restart:
+            did_restart = True
+            if not lumacore_present(steam):
+                err = (
+                    "LumaCore is missing from the Steam folder. "
+                    "Reinstall the Steam plugin or use Download in Arachnel (CDN)."
+                )
+                _emit_progress(progress, percent=0, detail=err, status="failed")
+                return {"ok": False, "error": err, "stateFlags": flags}
+            if not stplugin_lua_present(steam, appid):
+                err = (
+                    f"Missing stplug-in lua for app {appid}. "
+                    "Retry install, or use Download in Arachnel (CDN)."
+                )
+                _emit_progress(progress, percent=0, detail=err, status="failed")
+                return {"ok": False, "error": err, "stateFlags": flags}
+            restart_steam(steam, progress)
+            wall_started = time.time()
+            started = time.monotonic()
+            last_nudge = started
+            launch_steam_uri(steam, f"steam://install/{appid}")
+            launch_steam_uri(steam, "steam://open/downloads")
+            _emit_progress(
+                progress,
+                percent=0,
+                detail="Queued in Steam…",
+                status="downloading",
+            )
+            continue
+
+        if license_denied or stuck:
+            err = (
+                "Steam still reports no license after LumaCore restart. "
+                "Check that LumaCore DLLs are in the Steam folder, then retry — "
+                "or use Download in Arachnel (CDN)."
+            )
+            _emit_progress(progress, percent=0, detail=err, status="failed")
+            return {"ok": False, "error": err, "stateFlags": flags, "restartedSteam": did_restart}
+
+        if downloaded > 0 or updating:
+            if total > 0:
+                pct = min(99, int(downloaded * 100 / total)) if downloaded > 0 else 0
+            elif size > 0 and downloaded > 0:
+                pct = min(99, 50)
+            else:
+                pct = 0
             detail = transfer_detail(downloaded, total, bps, percent=pct)
             if detail == "Downloading...":
                 detail = "Downloading in Steam…"
         elif total > 0:
+            pct = 0
             detail = "Queued in Steam…"
             if now - last_nudge >= stall_nudge_s:
                 detail = "Waiting in Steam — click Update if needed"
                 stalled_hint_shown = True
         else:
+            pct = 0
             detail = "Queued in Steam…"
 
         if now - last_emit >= 0.9 or stalled_hint_shown:
@@ -2801,7 +3003,27 @@ def install_game(
                 out["onlineFix"] = fix
             return out
 
-    ensure_inject(steam, progress, plugin_root=plugin_root)
+    lumacore_fresh = False
+    try:
+        lumacore_fresh = ensure_inject(steam, progress, plugin_root=plugin_root)
+    except Exception as exc:
+        # Native needs inject; ddmod/auto can continue without LumaCore.
+        if prefer == "native":
+            return {
+                "ok": False,
+                "error": f"LumaCore setup failed: {exc}",
+                "steamPath": str(steam) if steam else "",
+            }
+        sys.stderr.write(f"ensure_inject: {exc}\n")
+
+    if prefer == "native" and steam is None:
+        return {
+            "ok": False,
+            "error": (
+                "Install via Steam needs a Steam folder. "
+                "Set steamPath in plugin settings, or use Download in Arachnel (CDN)."
+            ),
+        }
 
     staging = Path(tempfile.mkdtemp(prefix=f"arachnel_sm_{appid}_"))
     try:
@@ -2930,6 +3152,28 @@ def install_game(
                 return {
                     "ok": False,
                     "error": "native mode requires Steam — use preferMode ddmod or install Steam",
+                }
+            # LumaCore loads via dwmapi.dll at Steam start. Fresh install (or Steam
+            # already running without inject) needs a restart before ownership sticks.
+            if lumacore_fresh or not lumacore_present(steam):
+                if not lumacore_present(steam):
+                    return {
+                        "ok": False,
+                        "error": (
+                            "LumaCore is missing from the Steam folder. "
+                            "Reinstall the Steam plugin or use Download in Arachnel (CDN)."
+                        ),
+                        "steamPath": str(steam),
+                    }
+                restart_steam(steam, progress)
+            elif not stplugin_lua_present(steam, appid):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Missing stplug-in lua for app {appid}. "
+                        "Retry install, or use Download in Arachnel (CDN)."
+                    ),
+                    "steamPath": str(steam),
                 }
             common = write_acf_stub(steam, appid, title, installdir, size=0)
             path = common if common.exists() else install_path
@@ -3106,8 +3350,33 @@ def main() -> int:
             result["ok"] = bool(result.get("hasNet9") and find_ddmod(plugin_root))
         elif args.cmd == "setup-inject":
             steam = find_steam_path(settings)
-            ensure_inject(steam, progress, plugin_root=plugin_root)
-            result = {"ok": True, "steamPath": str(steam) if steam else "", "os": platform.system()}
+            if steam is None:
+                result = {
+                    "ok": False,
+                    "error": (
+                        "Steam folder not found. Set steamPath in plugin settings "
+                        "(path that contains steam.exe)."
+                    ),
+                    "steamPath": "",
+                    "os": platform.system(),
+                }
+            else:
+                try:
+                    fresh = ensure_inject(steam, progress, plugin_root=plugin_root)
+                    result = {
+                        "ok": True,
+                        "steamPath": str(steam),
+                        "os": platform.system(),
+                        "lumacorePresent": lumacore_present(steam),
+                        "freshInstall": bool(fresh),
+                    }
+                except Exception as exc:
+                    result = {
+                        "ok": False,
+                        "error": str(exc),
+                        "steamPath": str(steam),
+                        "os": platform.system(),
+                    }
         elif args.cmd == "install-addon":
             result = cmd_install_addon(args.zip, args.dest)
         elif args.cmd == "embed-online-fix":
