@@ -23,3 +23,7 @@ third_party/windows/DDMod/*.exe
 !third_party/DDMod/
 !third_party/DDMod/**
 
+
+# Local GitLab Runner (must not be committed)
+/config.toml
+

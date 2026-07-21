@@ -104,13 +104,17 @@ build:linux:
 
 build:windows:
   stage: build
+  # Home PC runner (shell/powershell). Linux stays on VPS (`vps`).
   tags:
-    - saas-windows-medium-amd64
+    - windows
   timeout: 2h
   before_script:
     - if (-not (Get-Command python -ErrorAction SilentlyContinue)) { choco install python3 -y --no-progress --execution-timeout 1200 }
     - if (-not (Test-Path "C:\Program Files\7-Zip\7z.exe")) { choco install 7zip -y --no-progress --execution-timeout 1200 }
     - python --version
+    - if (-not $env:QT_INSTALL_DIR) { $env:QT_INSTALL_DIR = "D:\Qt" }
+    - if (-not $env:QT_VERSION) { $env:QT_VERSION = "6.8.2" }
+    - if (-not $env:ARACHNEL_SDK_DIR -and (Test-Path "D:\Work\Arachnel\cmake\ArachnelPluginSdk.cmake")) { $env:ARACHNEL_SDK_DIR = "D:\Work\Arachnel" }
   script:
     - pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/ci/build-plugin.ps1
   artifacts:
