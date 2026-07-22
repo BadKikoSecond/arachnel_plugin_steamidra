@@ -9,8 +9,16 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $BuildPath = Join-Path $Root $BuildDir
 $SdkDir = if ($env:ARACHNEL_SDK_DIR) { $env:ARACHNEL_SDK_DIR } else { Join-Path $Root ".ci\arachnel-sdk" }
 $QtRoot = if ($env:QT_INSTALL_DIR) { $env:QT_INSTALL_DIR } else { Join-Path $Root ".ci\qt" }
-$QtPrefix = Join-Path $QtRoot "$($env:QT_VERSION)\msvc2022_64"
+$QtVersion = $env:QT_VERSION
+$QtArch = $env:QT_WINDOWS_ARCH
+$QtKit = if ($env:QT_WINDOWS_KIT) { $env:QT_WINDOWS_KIT } else {
+    if ($QtArch -match 'mingw') { 'mingw_64' } else { 'msvc2022_64' }
+}
+$QtPrefix = Join-Path $QtRoot "$QtVersion\$QtKit"
 $DistDir = Join-Path $Root "dist\windows"
+$useMingw = $QtKit -match 'mingw'
+
+Write-Host "Toolchain: Qt $QtVersion $QtArch ($QtKit), SDK $($env:ARACHNEL_SDK_REF)"
 
 if ($env:CI_COMMIT_TAG) {
     python (Join-Path $Root "scripts\ci\set_plugin_version.py") $env:CI_COMMIT_TAG
@@ -22,25 +30,77 @@ if (-not (Test-Path (Join-Path $SdkDir "cmake\ArachnelPluginSdk.cmake"))) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
+function Find-MingwBin {
+    param([string]$Prefix, [string]$InstallRoot)
+    $candidates = @(
+        (Join-Path $InstallRoot "Tools\mingw1310_64\bin"),
+        (Join-Path $InstallRoot "Tools\mingw1120_64\bin"),
+        (Join-Path (Split-Path -Parent (Split-Path -Parent $Prefix)) "Tools\mingw1310_64\bin")
+    )
+    foreach ($bin in $candidates) {
+        if (Test-Path -LiteralPath (Join-Path $bin "g++.exe")) { return $bin }
+    }
+    $fromPath = Get-Command g++.exe -ErrorAction SilentlyContinue
+    if ($fromPath) { return (Split-Path -Parent $fromPath.Source) }
+    return $null
+}
+
 if (-not (Test-Path (Join-Path $QtPrefix "lib\cmake\Qt6\Qt6Config.cmake"))) {
     $AqtVenv = Join-Path $Root ".ci\aqt-venv"
     $AqtPython = Join-Path $AqtVenv "Scripts\python.exe"
     if (-not (Test-Path $AqtPython)) { python -m venv $AqtVenv }
-    & $AqtPython -m pip install --upgrade pip aqtinstall
+    & $AqtPython -m pip install --upgrade pip "git+https://github.com/miurahr/aqtinstall.git"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $moduleArgs = @()
     foreach ($module in ($env:QT_MODULES -split '\s+')) {
         if ($module) { $moduleArgs += @("-m", $module) }
     }
-    & $AqtPython -m aqt install-qt windows desktop $env:QT_VERSION $env:QT_WINDOWS_ARCH @moduleArgs -O $QtRoot
+    & $AqtPython -m aqt install-qt windows desktop $QtVersion $QtArch @moduleArgs -O $QtRoot
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($useMingw) {
+        & $AqtPython -m aqt install-tool windows desktop tools_mingw1310 -O $QtRoot
+    }
+}
+
+if (-not (Test-Path (Join-Path $QtPrefix "lib\cmake\Qt6\Qt6Config.cmake"))) {
+    throw "Qt kit not found at $QtPrefix"
 }
 
 & (Join-Path $Root "tools\fetch_third_party.ps1") windows
-cmake -S $Root -B $BuildPath -G "Visual Studio 17 2022" -A x64 `
-    -DCMAKE_PREFIX_PATH="$QtPrefix" `
-    -DARACHNEL_SDK_DIR="$SdkDir"
+
+$configureArgs = @(
+    "-S", $Root,
+    "-B", $BuildPath,
+    "-DCMAKE_PREFIX_PATH=$QtPrefix",
+    "-DARACHNEL_SDK_DIR=$SdkDir",
+    "-DCMAKE_BUILD_TYPE=Release"
+)
+
+if ($useMingw) {
+    $mingwBin = Find-MingwBin -Prefix $QtPrefix -InstallRoot $QtRoot
+    if (-not $mingwBin) { throw "MinGW bin not found (expected Tools\mingw1310_64\bin next to Qt)" }
+    $env:Path = "$mingwBin;D:\Qt\Tools\Ninja;$env:Path"
+    $gcc = (Join-Path $mingwBin "gcc.exe") -replace '\\', '/'
+    $gxx = (Join-Path $mingwBin "g++.exe") -replace '\\', '/'
+    Write-Host "==> Configure (MinGW/Ninja) $QtPrefix"
+    $configureArgs += @(
+        "-G", "Ninja",
+        "-DCMAKE_C_COMPILER=$gcc",
+        "-DCMAKE_CXX_COMPILER=$gxx"
+    )
+} else {
+    Write-Host "==> Configure (MSVC 2022 x64)"
+    $configureArgs += @("-G", "Visual Studio 17 2022", "-A", "x64")
+}
+
+& cmake @configureArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-cmake --build $BuildPath --config Release --target steamidra_arach -j $env:NUMBER_OF_PROCESSORS
+
+if ($useMingw) {
+    & cmake --build $BuildPath --target steamidra_arach -j $env:NUMBER_OF_PROCESSORS
+} else {
+    & cmake --build $BuildPath --config Release --target steamidra_arach -j $env:NUMBER_OF_PROCESSORS
+}
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $ArachPath = Join-Path $BuildPath "dist\steamidra.arach"

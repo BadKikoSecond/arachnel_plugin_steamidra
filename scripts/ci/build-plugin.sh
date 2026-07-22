@@ -23,7 +23,7 @@ if [[ ! -f "${QT_PATH}/lib/cmake/Qt6/Qt6Config.cmake" ]]; then
   AQT_VENV="${ROOT}/.ci/aqt-venv"
   [[ -x "${AQT_VENV}/bin/aqt" ]] || {
     python3 -m venv "${AQT_VENV}"
-    "${AQT_VENV}/bin/pip" install --upgrade pip aqtinstall
+    "${AQT_VENV}/bin/pip" install --upgrade pip "git+https://github.com/miurahr/aqtinstall.git"
   }
   # shellcheck disable=SC2206
   MODULE_ARGS=(${QT_MODULES})
