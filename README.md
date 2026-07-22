@@ -78,7 +78,8 @@ export ARACHNEL_SDK_DIR=~/path/to/Arachnel   # or D:\Work\Arachnel
 
 | Key | Meaning |
 |-----|---------|
-| `preferMode` | `ddmod` (default), `native`, or `auto` |
+| `preferMode` | Legacy; installs always use DDMod. |
+| `depotOs` | `windows` (default) or `linux`. Linux hosts use Windows depots for Proton. |
 | `libraryFolder` | Override install root when Steam is absent |
 | `includeDlc` | Also download DLC depots (default `false`) |
 | `hubcapApiKey` | Optional Hubcap `smm…` key for richer library dates |
@@ -108,8 +109,7 @@ Binaries are harvested into `online_fix_kit/` (not shipped in git):
 
 ## Modes
 
-1. **ddmod (default)** — download depots with bundled DDMod. Writes ACF + SLS/Luma unlock when Steam exists.
-2. **native** — prepare keys/lua and queue `steam://install/{appid}`.
+**ddmod** — download depots with bundled DDMod. Writes ACF + SLS/Luma unlock when Steam exists.
 
 ## Limits
 

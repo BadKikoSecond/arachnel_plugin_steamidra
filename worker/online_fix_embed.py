@@ -154,15 +154,40 @@ def kit_dir(plugin_root: Path, settings: dict[str, Any]) -> Path:
     return (plugin_root / "online_fix_kit").resolve()
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_HARVEST_SKIP_DIRS = {
+    ".depotdownloader",
+    "staging",
+    "intermediate",
+    "saved",
+    "deriveddatacache",
+    "thirdparty",
+    "downloads",
+    "cover-cache",
+    "torrent_resume",
+    "proton",
+    "node_modules",
+    ".git",
+}
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """True for Windows junctions/symlinks (pathlib.rglob follows these → RecursionError)."""
+    try:
+        st = os.lstat(path)
+        attrs = getattr(st, "st_file_attributes", 0)
+        return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        return path.is_symlink()
+
+
 def _candidate_harvest_roots(settings: dict[str, Any]) -> list[Path]:
     roots: list[Path] = []
     for key in ("onlineFixSourceDir", "libraryFolder"):
         raw = (settings.get(key) or "").strip()
         if raw:
             roots.append(Path(raw).expanduser())
-    appdata = os.environ.get("APPDATA") or ""
-    if appdata:
-        roots.append(Path(appdata) / "Arachnel")
+    # Prefer known game libraries first — they usually hold FreeTP overlays.
     for extra in (
         Path(r"D:\HydraGames"),
         Path(r"D:\ArachnelGame"),
@@ -171,6 +196,11 @@ def _candidate_harvest_roots(settings: dict[str, Any]) -> list[Path]:
         Path.home() / "Games",
     ):
         roots.append(extra)
+    appdata = os.environ.get("APPDATA") or ""
+    if appdata:
+        # Do NOT walk all of Roaming\Arachnel — junctions there break deep scans.
+        roots.append(Path(appdata) / "Arachnel" / "Arachnel" / "plugins")
+        roots.append(Path(appdata) / "Arachnel" / "plugins")
     out: list[Path] = []
     seen: set[str] = set()
     for root in roots:
@@ -185,6 +215,35 @@ def _candidate_harvest_roots(settings: dict[str, Any]) -> list[Path]:
     return out
 
 
+def _iter_files_named(root: Path, name: str, *, max_depth: int = 10):
+    """Yield files named `name` under root without following junctions/symlinks."""
+    if not root.is_dir():
+        return
+    direct = root / name
+    if direct.is_file():
+        yield direct
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            try:
+                rel = Path(dirpath).relative_to(root)
+                depth = 0 if str(rel) == "." else len(rel.parts)
+            except ValueError:
+                depth = 0
+            keep: list[str] = []
+            for d in dirnames:
+                if depth + 1 > max_depth:
+                    continue
+                child = Path(dirpath) / d
+                if d.lower() in _HARVEST_SKIP_DIRS or _is_reparse_point(child):
+                    continue
+                keep.append(d)
+            dirnames[:] = keep
+            if name in filenames:
+                yield Path(dirpath) / name
+    except OSError:
+        return
+
+
 def _harvest_named_files(
     settings: dict[str, Any], names: tuple[str, ...], *, prefer_with: str | None = None
 ) -> dict[str, Path]:
@@ -195,7 +254,7 @@ def _harvest_named_files(
         if not root.is_dir():
             continue
         try:
-            for path in root.rglob(names[0]):
+            for path in _iter_files_named(root, names[0]):
                 parent = path.parent
                 if _skip_overlay_path(parent):
                     continue
@@ -471,17 +530,24 @@ def game_has_steam_api(install_root: Path) -> bool:
 
 
 def game_needs_epic_fix(install_root: Path) -> bool:
-    """EpicFix only for RedpointEOS-style titles (MECCHA).
+    """EpicFix when the install talks to EOS (Redpoint or EOSSDK).
 
-    FreeTP Pratfall ships EOSSDK but uses SteamFix alone — embedding EpicFix
-    there opens freetp.org (browser auth) and black-screens the game.
+    SteamFix alone uses FakeAppId=480. Games that exchange a Steam session
+    ticket with EOS (Unrailed 2) then fail:
+      Expected App ID [real], got [480, …]
+    EpicFix with NoAuth=1 skips that EOS Steam auth (Meccha FreeTP layout).
+
+    Always write NoAuth=1 — NoAuth=0 opens a browser (freetp.org) and can
+    black-screen titles like Pratfall.
     """
     try:
         for path in install_root.rglob("RedpointEOS"):
             if path.is_dir() and not _skip_overlay_path(path):
                 return True
-        # Explicit Redpoint plugin DLLs
         for path in install_root.rglob("RedpointEOS*.dll"):
+            if path.is_file() and not _skip_overlay_path(path):
+                return True
+        for path in install_root.rglob("EOSSDK*.dll"):
             if path.is_file() and not _skip_overlay_path(path):
                 return True
     except OSError:
@@ -642,19 +708,19 @@ def _prime_freetp_hash(target: Path, plugin_root: Path) -> bool:
     folder is rejected: it opens freetp.org via `cmd.exe /c start \"link\" ...` and
     rewrites the file. Dropping a no-op cmd.exe next to the game intercepts that
     CreateProcess search (app dir before System32) so the ack is written silently.
+
+    On Linux/Proton we only plant the stub — the game primes .hash on first launch.
+
+    Important: keep the stub in place until .hash exists (and prefer leaving it as a
+    permanent safety net). Deleting the stub after a failed prime is what lets the
+    next real launch open freetp.org.
     """
-    if sys.platform != "win32":
-        return False
     hash_path = target / "FreeTP" / ".hash"
     if hash_path.is_file() and hash_path.stat().st_size == 4:
         return True
     stub_src = _cmd_stub_path(plugin_root)
-    exe = _find_launch_exe_for_overlay(target)
-    if stub_src is None or exe is None:
-        sys.stderr.write(
-            "online_fix: cannot prime FreeTP/.hash "
-            f"(stub={'ok' if stub_src else 'missing'}, exe={'ok' if exe else 'missing'})\n"
-        )
+    if stub_src is None:
+        sys.stderr.write("online_fix: cannot prime FreeTP/.hash (cmd stub missing)\n")
         return False
 
     (target / "FreeTP").mkdir(exist_ok=True)
@@ -667,9 +733,31 @@ def _prime_freetp_hash(target: Path, plugin_root: Path) -> bool:
             pass
 
     stub_dst = target / "cmd.exe"
-    proc: subprocess.Popen[bytes] | None = None
     try:
         shutil.copy2(stub_src, stub_dst)
+    except OSError as exc:
+        sys.stderr.write(f"online_fix: FreeTP stub plant failed: {exc}\n")
+        return False
+
+    if sys.platform != "win32":
+        sys.stderr.write(
+            "online_fix: planted cmd.exe stub for Proton "
+            "(FreeTP/.hash primes on first launch)\n"
+        )
+        return True
+
+    exe = _find_launch_exe_for_overlay(target)
+    if exe is None:
+        # Keep stub so the first real launch still cannot ShellExecute freetp.org.
+        sys.stderr.write(
+            "online_fix: cannot prime FreeTP/.hash yet (exe missing); "
+            "left cmd.exe stub to block promo\n"
+        )
+        return False
+
+    proc: subprocess.Popen[bytes] | None = None
+    primed = False
+    try:
         args = [str(exe)]
         if (target / f"{exe.stem}.pck").is_file():
             args.append("--steam")
@@ -679,14 +767,17 @@ def _prime_freetp_hash(target: Path, plugin_root: Path) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        deadline = time.time() + 25.0
+        deadline = time.time() + 35.0
         while time.time() < deadline:
             if hash_path.is_file() and hash_path.stat().st_size == 4:
-                return True
+                primed = True
+                break
             if proc.poll() is not None:
                 break
             time.sleep(0.25)
-        return hash_path.is_file() and hash_path.stat().st_size == 4
+        if not primed:
+            primed = hash_path.is_file() and hash_path.stat().st_size == 4
+        return primed
     except OSError as exc:
         sys.stderr.write(f"online_fix: FreeTP hash prime failed: {exc}\n")
         return False
@@ -700,7 +791,6 @@ def _prime_freetp_hash(target: Path, plugin_root: Path) -> bool:
                 proc.wait(timeout=5)
             except Exception:
                 pass
-        # Also kill by image name in case the game respawned.
         try:
             subprocess.run(
                 ["taskkill", "/F", "/IM", exe.name],
@@ -710,11 +800,19 @@ def _prime_freetp_hash(target: Path, plugin_root: Path) -> bool:
             )
         except OSError:
             pass
-        if stub_dst.is_file():
-            try:
-                stub_dst.unlink()
-            except OSError:
-                sys.stderr.write(f"online_fix: failed to remove temp {stub_dst}\n")
+        # Only remove the stub after a successful path-local .hash. Otherwise the
+        # next launch will ShellExecute freetp.org through System32\cmd.exe.
+        hash_ok = hash_path.is_file() and hash_path.stat().st_size == 4
+        if hash_ok and stub_dst.is_file():
+            # Keep stub permanently — cheap insurance if SteamFix re-checks ack.
+            # (Deleting it after prime was causing intermittent freetp.org opens.)
+            sys.stderr.write(
+                f"online_fix: FreeTP/.hash primed; keeping cmd.exe stub at {stub_dst}\n"
+            )
+        elif not hash_ok:
+            sys.stderr.write(
+                f"online_fix: FreeTP/.hash NOT primed; keeping cmd.exe stub at {stub_dst}\n"
+            )
 
 
 def _ensure_freetp_ack_folder(
@@ -738,8 +836,30 @@ def _ensure_freetp_ack_folder(
         except OSError:
             pass
     if hash_path.is_file() and hash_path.stat().st_size == 4:
+        # Still ensure stub exists — blocks promo if SteamFix re-validates.
+        stub_src = _cmd_stub_path(plugin_root)
+        if stub_src is not None:
+            try:
+                shutil.copy2(stub_src, target / "cmd.exe")
+            except OSError:
+                pass
         return
-    _prime_freetp_hash(target, plugin_root)
+    if not _prime_freetp_hash(target, plugin_root):
+        # Last resort: disable SteamFix overlay promo until ack exists.
+        ini = target / "SteamFix.ini"
+        if ini.is_file():
+            try:
+                text = ini.read_text(encoding="utf-8", errors="replace")
+                if "Overlay=true" in text:
+                    ini.write_text(
+                        text.replace("Overlay=true", "Overlay=false"),
+                        encoding="utf-8",
+                    )
+                    sys.stderr.write(
+                        "online_fix: set Overlay=false until FreeTP/.hash is primed\n"
+                    )
+            except OSError as exc:
+                sys.stderr.write(f"online_fix: Overlay=false fallback failed: {exc}\n")
 
 
 def write_epic_fix_ini(path: Path) -> None:

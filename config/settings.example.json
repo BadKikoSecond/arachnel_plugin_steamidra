@@ -3,6 +3,7 @@
   "ryuuApiKey": "",
   "steamPath": "",
   "preferMode": "ddmod",
+  "depotOs": "windows",
   "libraryFolder": "",
   "includeDlc": false,
   "manifestCatalogUrl": "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json",

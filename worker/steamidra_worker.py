@@ -380,7 +380,8 @@ def load_settings(path: str | None) -> dict[str, Any]:
         "manifestCatalogUrl": DEFAULT_MANIFEST_CATALOG_URL,
         "manifestCatalogTtlHours": 24,
         "steamPath": "",
-        "preferMode": "ddmod",  # ddmod | native | auto
+        "preferMode": "ddmod",  # legacy; installs always use DDMod
+        "depotOs": "windows",  # windows | linux — Linux host defaults to windows (Proton)
         "libraryFolder": "",
         "includeDlc": False,
         # Auto-embed FreeTP-style SteamFix when Store categories say Online PvP/Co-op/MMO.
@@ -1052,7 +1053,11 @@ def depotkeys_cache_path(settings: dict[str, Any]) -> Path:
     configured = (settings.get("_settingsPath") or "").strip()
     if configured:
         return Path(configured).parent / "fallback_depotkeys.json"
-    return Path.home() / ".local" / "share" / "Arachnel" / "plugins" / "steamidra" / "fallback_depotkeys.json"
+    if platform.system() == "Windows":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "Arachnel" / "Arachnel" / "plugins" / "steamidra" / "fallback_depotkeys.json"
+    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(xdg) / "Arachnel" / "plugins" / "steamidra" / "fallback_depotkeys.json"
 
 
 def ensure_depotkeys_db(
@@ -1806,25 +1811,39 @@ def setup_slssteam(steam: Path, progress: bool, plugin_root: Path | None = None)
     _emit_progress(progress, percent=0, detail="Preparing Steam…", status="downloading")
 
 
-def ensure_inject(steam: Path | None, progress: bool, plugin_root: Path | None = None) -> bool:
-    """Install SLS/Luma when Steam is present; no-op if Steam absent (ddmod-only).
+def steam_tree_writable(steam: Path) -> bool:
+    """True when Arachnel can create files under Steam (not Flatpak/read-only)."""
+    try:
+        cfg = steam / "config"
+        cfg.mkdir(parents=True, exist_ok=True)
+        probe = cfg / ".arachnel_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
 
-    Returns True if LumaCore DLLs were freshly installed (Steam must be restarted
-    before native install can fake ownership).
-    """
+
+def ensure_inject(steam: Path | None, progress: bool, plugin_root: Path | None = None) -> bool:
+    """Install SLS/Luma when Steam is present; no-op if Steam absent (ddmod-only)."""
     if steam is None:
         _emit_progress(progress, percent=0, detail="Preparing…", status="downloading")
         return False
-    if platform.system() == "Windows":
-        freshly_installed = False
-        if not (steam / "LumaCore.dll").exists() and not (steam / "dwmapi.dll").exists():
-            setup_lumacore(steam, progress, plugin_root=plugin_root)
-            freshly_installed = True
-        else:
-            _emit_progress(progress, percent=0, detail="Preparing Steam…", status="downloading")
-        (steam / "config" / "stplug-in").mkdir(parents=True, exist_ok=True)
-        return freshly_installed
-    else:
+    if not steam_tree_writable(steam):
+        sys.stderr.write(f"ensure_inject: Steam path not writable, skipping inject: {steam}\n")
+        _emit_progress(progress, percent=0, detail="Preparing…", status="downloading")
+        return False
+    try:
+        if platform.system() == "Windows":
+            freshly_installed = False
+            if not (steam / "LumaCore.dll").exists() and not (steam / "dwmapi.dll").exists():
+                setup_lumacore(steam, progress, plugin_root=plugin_root)
+                freshly_installed = True
+            else:
+                _emit_progress(progress, percent=0, detail="Preparing Steam…", status="downloading")
+            (steam / "config" / "stplug-in").mkdir(parents=True, exist_ok=True)
+            return freshly_installed
+
         share, _ = slssteam_paths()
         if not (share / "SLSsteam.so").exists():
             setup_slssteam(steam, progress, plugin_root=plugin_root)
@@ -1846,6 +1865,10 @@ def ensure_inject(steam: Path | None, progress: bool, plugin_root: Path | None =
             if inject_so.exists() and sls_so.exists():
                 _patch_steam_sh_ld_audit(steam, inject_so, sls_so)
             _emit_progress(progress, percent=0, detail="Preparing Steam…", status="downloading")
+        return False
+    except Exception as exc:
+        sys.stderr.write(f"ensure_inject: {exc}\n")
+        _emit_progress(progress, percent=0, detail="Preparing…", status="downloading")
         return False
 
 
@@ -1899,341 +1922,6 @@ def write_acf(
 """.strip()
     acf.write_text(body + "\n", encoding="utf-8")
     return common
-
-
-def write_acf_stub(steam: Path, appid: str, title: str, installdir: str, size: int = 0) -> Path:
-    # 6 = Fully Installed (4) + Update Required (2) so Steam client will fetch content.
-    # StateFlags 4 alone with empty depots makes Steam treat the game as already installed.
-    return write_acf(
-        steam, appid, title, installdir, size=size, manifests=None, state_flags="6"
-    )
-
-
-def parse_steam_acf(acf_path: Path) -> dict[str, Any]:
-    """Parse a minimal subset of Steam appmanifest_*.acf (KeyValues)."""
-    out: dict[str, Any] = {
-        "stateFlags": 0,
-        "bytesDownloaded": 0,
-        "bytesToDownload": 0,
-        "sizeOnDisk": 0,
-        "installdir": "",
-    }
-    if not acf_path.is_file():
-        return out
-    try:
-        text = acf_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return out
-
-    def grab_int(key: str) -> int:
-        m = re.search(rf'"{re.escape(key)}"\s+"(\d+)"', text, re.I)
-        return int(m.group(1)) if m else 0
-
-    def grab_str(key: str) -> str:
-        m = re.search(rf'"{re.escape(key)}"\s+"([^"]*)"', text, re.I)
-        return m.group(1) if m else ""
-
-    out["stateFlags"] = grab_int("StateFlags")
-    out["bytesDownloaded"] = grab_int("BytesDownloaded")
-    out["bytesToDownload"] = grab_int("BytesToDownload")
-    out["sizeOnDisk"] = grab_int("SizeOnDisk")
-    out["installdir"] = grab_str("installdir")
-    return out
-
-
-def steam_acf_fully_installed(info: dict[str, Any]) -> bool:
-    """True when Steam reports the app fully installed and not still updating."""
-    flags = int(info.get("stateFlags") or 0)
-    size = int(info.get("sizeOnDisk") or 0)
-    downloaded = int(info.get("bytesDownloaded") or 0)
-    to_download = int(info.get("bytesToDownload") or 0)
-    fully = bool(flags & 4)
-    update_required = bool(flags & 2)
-    update_running = bool(flags & 1024) or bool(flags & 512)
-    if not fully or size <= 0:
-        return False
-    if update_required or update_running:
-        return False
-    if to_download > 0 and downloaded < to_download:
-        return False
-    return True
-
-
-def launch_steam_uri(steam: Path, uri: str) -> None:
-    try:
-        if platform.system() == "Windows":
-            steam_exe = steam / "steam.exe"
-            if steam_exe.is_file():
-                subprocess.Popen(
-                    [str(steam_exe), uri],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                subprocess.Popen(
-                    ["cmd", "/c", "start", "", uri],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-        else:
-            subprocess.Popen(
-                ["steam", uri],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-    except Exception:
-        pass
-
-
-def lumacore_present(steam: Path) -> bool:
-    return (steam / "LumaCore.dll").is_file() or (steam / "dwmapi.dll").is_file()
-
-
-def stplugin_lua_present(steam: Path, appid: str) -> bool:
-    path = steam / "config" / "stplug-in" / f"{appid}.lua"
-    if not path.is_file():
-        return False
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    return "addappid" in text.lower()
-
-
-def restart_steam(steam: Path, progress: bool = False) -> None:
-    """Quit Steam and start it again so LumaCore (dwmapi proxy) is loaded."""
-    if platform.system() != "Windows":
-        return
-    steam_exe = steam / "steam.exe"
-    if not steam_exe.is_file():
-        return
-    _emit_progress(progress, percent=0, detail="Restarting Steam for LumaCore…", status="downloading")
-    try:
-        subprocess.run(
-            [str(steam_exe), "-shutdown"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-            check=False,
-        )
-    except Exception:
-        pass
-    # Wait until steam.exe exits (or timeout).
-    deadline = time.monotonic() + 45.0
-    while time.monotonic() < deadline:
-        try:
-            r = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq steam.exe"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            if "steam.exe" not in (r.stdout or "").lower():
-                break
-        except Exception:
-            break
-        time.sleep(1.0)
-    time.sleep(2.0)
-    try:
-        subprocess.Popen(
-            [str(steam_exe)],
-            cwd=str(steam),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
-    # Give LumaCore time to inject after Steam UI comes up.
-    time.sleep(12.0)
-
-
-def steam_recent_no_license(steam: Path, appid: str, since: float) -> bool:
-    """Best-effort: Steam wrote a 'No licenses' style error for this app after *since*."""
-    markers = (
-        "no licenses",
-        "нет лицензий",
-        "does not own",
-        "not own app",
-    )
-    app_token = str(appid)
-    log_dir = steam / "logs"
-    if not log_dir.is_dir():
-        return False
-    candidates = sorted(
-        list(log_dir.glob("*.txt")) + list(log_dir.glob("*.log")),
-        key=lambda p: p.stat().st_mtime if p.is_file() else 0,
-        reverse=True,
-    )[:12]
-    for path in candidates:
-        try:
-            if path.stat().st_mtime < since - 5:
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        lower = text.lower()
-        if app_token not in text and f"appid {app_token}" not in lower and f"({app_token})" not in text:
-            continue
-        for marker in markers:
-            if marker in lower:
-                return True
-    return False
-
-
-def watch_native_steam_download(
-    steam: Path,
-    appid: str,
-    install_path: Path,
-    progress: bool,
-    *,
-    poll_s: float = 1.5,
-    stall_nudge_s: float = 45.0,
-    max_queue_s: float = 180.0,
-    allow_steam_restart: bool = True,
-) -> dict[str, Any]:
-    """Poll appmanifest until Steam finishes; emit OwnedDownload-style progress.
-
-    LumaCore fakes ownership via stplug-in lua. A 'No licenses' dialog usually means
-    Steam was running without LumaCore loaded — we restart Steam once and retry.
-    """
-    acf = steam / "steamapps" / f"appmanifest_{appid}.acf"
-    started = time.monotonic()
-    wall_started = time.time()
-    last_bytes = 0
-    last_t = started
-    last_nudge = started
-    last_emit = 0.0
-    stalled_hint_shown = False
-    saw_transfer = False
-    did_restart = False
-
-    launch_steam_uri(steam, f"steam://install/{appid}")
-    launch_steam_uri(steam, "steam://open/downloads")
-
-    while True:
-        info = parse_steam_acf(acf)
-        downloaded = int(info["bytesDownloaded"])
-        total = int(info["bytesToDownload"])
-        size = int(info["sizeOnDisk"])
-        flags = int(info["stateFlags"])
-        now = time.monotonic()
-
-        if steam_acf_fully_installed(info):
-            _emit_progress(
-                progress,
-                **progress_kwargs(
-                    percent=100,
-                    detail="Installed",
-                    status="completed",
-                    downloaded=max(downloaded, size),
-                    total=max(total, size, downloaded),
-                ),
-            )
-            return {
-                "ok": True,
-                "installPath": str(install_path),
-                "bytesDownloaded": downloaded,
-                "sizeOnDisk": size,
-                "stateFlags": flags,
-            }
-
-        bps = 0.0
-        if downloaded > last_bytes and now > last_t:
-            bps = (downloaded - last_bytes) / (now - last_t)
-        if downloaded != last_bytes:
-            last_bytes = downloaded
-            last_t = now
-            last_nudge = now
-            stalled_hint_shown = False
-            saw_transfer = True
-
-        updating = bool(flags & 1024) or bool(flags & 512)
-        if updating or total > 0:
-            saw_transfer = True
-
-        license_denied = steam_recent_no_license(steam, appid, wall_started) and not saw_transfer
-        queued_only = downloaded <= 0 and total <= 0 and not updating
-        stuck = queued_only and (now - started) >= max_queue_s
-
-        if (license_denied or stuck) and allow_steam_restart and not did_restart:
-            did_restart = True
-            if not lumacore_present(steam):
-                err = (
-                    "LumaCore is missing from the Steam folder. "
-                    "Reinstall the Steam plugin or use Download in Arachnel (CDN)."
-                )
-                _emit_progress(progress, percent=0, detail=err, status="failed")
-                return {"ok": False, "error": err, "stateFlags": flags}
-            if not stplugin_lua_present(steam, appid):
-                err = (
-                    f"Missing stplug-in lua for app {appid}. "
-                    "Retry install, or use Download in Arachnel (CDN)."
-                )
-                _emit_progress(progress, percent=0, detail=err, status="failed")
-                return {"ok": False, "error": err, "stateFlags": flags}
-            restart_steam(steam, progress)
-            wall_started = time.time()
-            started = time.monotonic()
-            last_nudge = started
-            launch_steam_uri(steam, f"steam://install/{appid}")
-            launch_steam_uri(steam, "steam://open/downloads")
-            _emit_progress(
-                progress,
-                percent=0,
-                detail="Queued in Steam…",
-                status="downloading",
-            )
-            continue
-
-        if license_denied or stuck:
-            err = (
-                "Steam still reports no license after LumaCore restart. "
-                "Check that LumaCore DLLs are in the Steam folder, then retry — "
-                "or use Download in Arachnel (CDN)."
-            )
-            _emit_progress(progress, percent=0, detail=err, status="failed")
-            return {"ok": False, "error": err, "stateFlags": flags, "restartedSteam": did_restart}
-
-        if downloaded > 0 or updating:
-            if total > 0:
-                pct = min(99, int(downloaded * 100 / total)) if downloaded > 0 else 0
-            elif size > 0 and downloaded > 0:
-                pct = min(99, 50)
-            else:
-                pct = 0
-            detail = transfer_detail(downloaded, total, bps, percent=pct)
-            if detail == "Downloading...":
-                detail = "Downloading in Steam…"
-        elif total > 0:
-            pct = 0
-            detail = "Queued in Steam…"
-            if now - last_nudge >= stall_nudge_s:
-                detail = "Waiting in Steam — click Update if needed"
-                stalled_hint_shown = True
-        else:
-            pct = 0
-            detail = "Queued in Steam…"
-
-        if now - last_emit >= 0.9 or stalled_hint_shown:
-            last_emit = now
-            _emit_progress(
-                progress,
-                **progress_kwargs(
-                    percent=pct,
-                    detail=detail,
-                    status="downloading",
-                    downloaded=downloaded,
-                    total=total,
-                    bps=bps,
-                ),
-            )
-
-        if now - last_nudge >= stall_nudge_s:
-            launch_steam_uri(steam, f"steam://install/{appid}")
-            last_nudge = now
-
-        time.sleep(poll_s)
 
 
 def find_ddmod(plugin_root: Path) -> Path | None:
@@ -2308,20 +1996,17 @@ def check_dotnet9(plugin_root: Path | None = None) -> dict[str, Any]:
         return {"ok": False, "dotnet": dotnet, "hasNet9": False, "error": str(exc)}
 
 
-def resolve_depot_os(appid: str) -> str:
-    """Pick DepotDownloader -os from Steam appinfo (Windows-only titles need windows on Linux)."""
-    if platform.system() == "Windows":
-        return "windows"
-    try:
-        raw = http_get_bytes(f"https://api.steamcmd.net/v1/info/{appid}", timeout=20)
-        info = json.loads(raw.decode("utf-8", errors="replace"))
-        common = ((info.get("data") or {}).get(str(appid)) or {}).get("common") or {}
-        oslist = str(common.get("oslist") or "").lower()
-        if oslist and "linux" not in oslist and "windows" in oslist:
-            return "windows"
-    except Exception:
-        pass
-    return "linux"
+def resolve_depot_os(appid: str, settings: dict[str, Any] | None = None) -> str:
+    """Pick DepotDownloader -os.
+
+    Arachnel on Linux launches Windows builds via Proton, so default is always
+    ``windows`` unless settings override ``depotOs``.
+    """
+    _ = appid
+    configured = str((settings or {}).get("depotOs") or "").strip().lower()
+    if configured in ("windows", "linux", "macos"):
+        return configured
+    return "windows"
 
 
 def is_steamworks_redistributable(depot_id: str) -> bool:
@@ -2346,17 +2031,20 @@ def filter_primary_depots(
     depots: dict[str, str],
     manifests: dict[str, str],
     include_dlc: bool,
+    *,
+    depot_os: str | None = None,
+    settings: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Keep game depots only: drop the app id itself, redistributables, and DLC unless asked.
 
-    Also drop depots whose Steam oslist does not match this host (e.g. Linux IoStore
-    next to Windows paks crashes UE5 with null GTSM / missing shader maps).
+    Also drop depots whose Steam oslist does not match the chosen depot OS
+    (Proton on Linux still wants windows depots — not host OS).
     """
     if not depots:
         return depots, manifests
     dlc_ids: set[str] = set()
     depot_meta: dict[str, Any] = {}
-    host_os = "windows" if platform.system() == "Windows" else "linux"
+    target_os = (depot_os or resolve_depot_os(appid, settings)).lower()
     try:
         info = steamcmd_app_info(appid) or {}
         if not include_dlc:
@@ -2381,7 +2069,7 @@ def filter_primary_depots(
         oslist = _depot_oslist(depot_meta.get(k) or {})
         if oslist:
             # Shared / unmarked depots have empty oslist — keep them.
-            if host_os not in oslist.split(","):
+            if target_os not in oslist.split(","):
                 continue
         out_d[k] = v
     out_m = {k: v for k, v in manifests.items() if k in out_d}
@@ -2398,19 +2086,24 @@ def filter_primary_depots(
     return out_d, out_m or {k: v for k, v in manifests.items() if k in out_d}
 
 
-def strip_foreign_platform_content(install_path: Path) -> list[str]:
-    """Remove other-OS UE IoStore/paks that break shipping builds on this host.
+def strip_foreign_platform_content(
+    install_path: Path, *, content_os: str | None = None
+) -> list[str]:
+    """Remove other-OS UE IoStore/paks that break the installed content OS.
 
     Repro: Chopping Trees (4512570) with ChoppingTrees-Linux.{pak,ucas,utoc} beside
     Windows IoStore → LowLevelFatalError null GTSM / DefaultPostProcessMaterial.
+
+    ``content_os`` is the depot OS that was downloaded (usually windows under Proton),
+    not necessarily the host OS.
     """
     root = Path(install_path)
     if not root.is_dir():
         return []
-    host = platform.system()
-    if host == "Windows":
+    os_name = (content_os or "windows").strip().lower()
+    if os_name == "windows":
         foreign = ("-linux.", "_linux.", "-mac.", "_mac.", "-macos.", "_macos.")
-    elif host == "Linux":
+    elif os_name == "linux":
         foreign = ("-windows.", "_windows.", "-win64.", "_win64.", "-mac.", "_mac.")
     else:
         return []
@@ -2586,8 +2279,9 @@ def try_embed_online_fix(
     force: bool = False,
 ) -> dict[str, Any]:
     """Best-effort SteamFix overlay after depot install (UE Binaries/Win64 or Unity root)."""
+    content_os = resolve_depot_os(appid, settings)
     try:
-        strip_foreign_platform_content(Path(install_path))
+        strip_foreign_platform_content(Path(install_path), content_os=content_os)
     except Exception as exc:
         sys.stderr.write(f"strip_platform: {exc}\n")
     analysis: dict[str, Any] | None = None
@@ -2638,6 +2332,9 @@ def run_ddmod(
     dest: Path,
     progress: bool,
     steam: Path | None = None,
+    *,
+    depot_os: str | None = None,
+    settings: dict[str, Any] | None = None,
 ) -> None:
     dll = find_ddmod(plugin_root)
     if not dll:
@@ -2659,7 +2356,7 @@ def run_ddmod(
     depots = list(depot_keys.keys()) or list(manifests.keys())
     if not depots:
         raise RuntimeError("No depot IDs — cannot run DepotDownloaderMod")
-    depot_os = resolve_depot_os(appid)
+    depot_os = depot_os or resolve_depot_os(appid, settings)
     total = max(1, len(depots))
     pct_re = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*%")
     # Folder size is only a total-size hint: DDMod preallocates large files, so
@@ -2948,8 +2645,9 @@ def install_game(
     *,
     force: bool = False,
 ) -> dict[str, Any]:
+    # mode kept for CLI/ABI compatibility; installs always use DDMod (Steam CDN).
+    _ = mode
     steam = find_steam_path(settings)
-    prefer = mode if mode not in ("", "auto") else (settings.get("preferMode") or "ddmod")
 
     installdir = re.sub(r"[^\w\- ]+", "", title).strip() or f"App{appid}"
     installdir = installdir.replace(" ", "")[:40] or f"App{appid}"
@@ -3003,27 +2701,10 @@ def install_game(
                 out["onlineFix"] = fix
             return out
 
-    lumacore_fresh = False
     try:
-        lumacore_fresh = ensure_inject(steam, progress, plugin_root=plugin_root)
+        ensure_inject(steam, progress, plugin_root=plugin_root)
     except Exception as exc:
-        # Native needs inject; ddmod/auto can continue without LumaCore.
-        if prefer == "native":
-            return {
-                "ok": False,
-                "error": f"LumaCore setup failed: {exc}",
-                "steamPath": str(steam) if steam else "",
-            }
         sys.stderr.write(f"ensure_inject: {exc}\n")
-
-    if prefer == "native" and steam is None:
-        return {
-            "ok": False,
-            "error": (
-                "Install via Steam needs a Steam folder. "
-                "Set steamPath in plugin settings, or use Download in Arachnel (CDN)."
-            ),
-        }
 
     staging = Path(tempfile.mkdtemp(prefix=f"arachnel_sm_{appid}_"))
     try:
@@ -3043,22 +2724,37 @@ def install_game(
             depot_id, mid = stem.split("_", 1)
             if depot_id.isdigit() and mid.isdigit():
                 parsed["manifests"].setdefault(depot_id, mid)
+        depot_os = resolve_depot_os(appid, settings)
         depots, manifests = filter_primary_depots(
             appid,
             parsed["depots"],
             parsed["manifests"],
             include_dlc=bool(settings.get("includeDlc")),
+            depot_os=depot_os,
+            settings=settings,
         )
         parsed = {**parsed, "depots": depots, "manifests": manifests}
 
         if steam:
-            write_stplugin_lua(steam, appid, lua)
-            patch_config_vdf_keys(steam, parsed["depots"])
-            copy_manifests_to_depotcache(steam, staging)
-            try_download_manifests(steam, parsed["manifests"], staging)
-            if platform.system() != "Windows":
-                register_sls_app(appid, parsed["manifests"])
-                create_steam_cfg(steam)
+            if steam_tree_writable(steam):
+                try:
+                    write_stplugin_lua(steam, appid, lua)
+                    patch_config_vdf_keys(steam, parsed["depots"])
+                    copy_manifests_to_depotcache(steam, staging)
+                    try_download_manifests(steam, parsed["manifests"], staging)
+                    if platform.system() != "Windows":
+                        register_sls_app(appid, parsed["manifests"])
+                        create_steam_cfg(steam)
+                except Exception as exc:
+                    sys.stderr.write(f"steam metadata write skipped: {exc}\n")
+            else:
+                sys.stderr.write(f"steam metadata write skipped (not writable): {steam}\n")
+                try_download_manifests(None, parsed["manifests"], staging)
+                for mf in staging.glob("*.manifest"):
+                    norm = normalize_depot_manifest_bytes(mf.read_bytes())
+                    if norm:
+                        mf.write_bytes(norm)
+                        shutil.copy2(mf, Path(tempfile.gettempdir()) / mf.name)
         else:
             # Still fetch manifests into staging for -manifestfile
             try_download_manifests(None, parsed["manifests"], staging)
@@ -3068,48 +2764,38 @@ def install_game(
                     mf.write_bytes(norm)
                     shutil.copy2(mf, Path(tempfile.gettempdir()) / mf.name)
 
-        installdir = re.sub(r"[^\w\- ]+", "", title).strip() or f"App{appid}"
-        installdir = installdir.replace(" ", "")[:40] or f"App{appid}"
-
-        lib_folder = (settings.get("libraryFolder") or "").strip()
-        if target:
-            install_path = Path(target)
-        elif lib_folder:
-            install_path = Path(lib_folder) / installdir
-        elif steam:
-            install_path = steam / "steamapps" / "common" / installdir
-        else:
-            install_path = default_library_root(settings) / f"{appid}-{installdir}"
-        # Keep path consistent with the early already-installed check.
         install_path = install_path_early
+        if find_ddmod(plugin_root) is None:
+            return {
+                "ok": False,
+                "error": "DepotDownloaderMod missing — run tools/fetch_third_party.sh and rebuild",
+            }
 
-        force_ddmod = prefer == "ddmod"
-        force_native = prefer == "native"
-        can_ddmod = find_ddmod(plugin_root) is not None
-
-        def do_ddmod() -> dict[str, Any]:
-            _emit_progress(progress, percent=0, detail="Downloading...", status="downloading")
-            for mf in staging.glob("*.manifest"):
-                try:
-                    shutil.copy2(mf, Path(tempfile.gettempdir()) / mf.name)
-                except Exception:
-                    pass
-            run_ddmod(
-                plugin_root,
-                appid,
-                parsed["depots"],
-                parsed["manifests"],
-                install_path,
-                progress,
-                steam=steam,
-            )
+        _emit_progress(progress, percent=0, detail="Downloading...", status="downloading")
+        for mf in staging.glob("*.manifest"):
             try:
-                strip_foreign_platform_content(install_path)
-            except Exception as exc:
-                sys.stderr.write(f"strip_platform: {exc}\n")
-            size = sum(f.stat().st_size for f in install_path.rglob("*") if f.is_file())
-            if steam:
-                # Prefer Steam common path for ACF installdir
+                shutil.copy2(mf, Path(tempfile.gettempdir()) / mf.name)
+            except Exception:
+                pass
+        run_ddmod(
+            plugin_root,
+            appid,
+            parsed["depots"],
+            parsed["manifests"],
+            install_path,
+            progress,
+            steam=steam,
+            depot_os=depot_os,
+            settings=settings,
+        )
+        try:
+            strip_foreign_platform_content(install_path, content_os=depot_os)
+        except Exception as exc:
+            sys.stderr.write(f"strip_platform: {exc}\n")
+        size = sum(f.stat().st_size for f in install_path.rglob("*") if f.is_file())
+        if steam and steam_tree_writable(steam):
+            # Prefer Steam common path for ACF installdir
+            try:
                 steam_common = steam / "steamapps" / "common" / installdir
                 if install_path.resolve() != steam_common.resolve():
                     steam_common.parent.mkdir(parents=True, exist_ok=True)
@@ -3126,132 +2812,29 @@ def install_game(
                     size=size,
                     manifests=parsed["manifests"],
                 )
-            else:
-                install_final = install_path
-            marker = install_final / ".arachnel-steamidra"
-            hint = launch_hint(steam, appid, install_final)
-            marker.write_text(
-                json.dumps({"appid": appid, "mode": "ddmod", "launch": hint}, indent=2),
-                encoding="utf-8",
-            )
-            fix = try_embed_online_fix(plugin_root, install_final, appid, settings)
-            _emit_progress(progress, percent=100, detail="Installed", status="completed")
-            out = {
-                "ok": True,
-                "installPath": str(install_final),
-                "mode": "ddmod",
-                "launch": hint,
-                "steamPath": str(steam) if steam else "",
-            }
-            if fix:
-                out["onlineFix"] = fix
-            return out
-
-        def do_native() -> dict[str, Any]:
-            if not steam:
-                return {
-                    "ok": False,
-                    "error": "native mode requires Steam — use preferMode ddmod or install Steam",
-                }
-            # LumaCore loads via dwmapi.dll at Steam start. Fresh install (or Steam
-            # already running without inject) needs a restart before ownership sticks.
-            if lumacore_fresh or not lumacore_present(steam):
-                if not lumacore_present(steam):
-                    return {
-                        "ok": False,
-                        "error": (
-                            "LumaCore is missing from the Steam folder. "
-                            "Reinstall the Steam plugin or use Download in Arachnel (CDN)."
-                        ),
-                        "steamPath": str(steam),
-                    }
-                restart_steam(steam, progress)
-            elif not stplugin_lua_present(steam, appid):
-                return {
-                    "ok": False,
-                    "error": (
-                        f"Missing stplug-in lua for app {appid}. "
-                        "Retry install, or use Download in Arachnel (CDN)."
-                    ),
-                    "steamPath": str(steam),
-                }
-            common = write_acf_stub(steam, appid, title, installdir, size=0)
-            path = common if common.exists() else install_path
-            path.mkdir(parents=True, exist_ok=True)
-            hint = launch_hint(steam, appid, path)
-            marker = path / ".arachnel-steamidra"
-            marker.write_text(
-                json.dumps({"appid": appid, "mode": "native", "launch": hint}, indent=2),
-                encoding="utf-8",
-            )
-            _emit_progress(
-                progress,
-                percent=0,
-                detail="Queued in Steam…",
-                status="downloading",
-            )
-            watched = watch_native_steam_download(steam, appid, path, progress)
-            if not watched.get("ok"):
-                return {
-                    "ok": False,
-                    "error": watched.get("error") or "Steam download did not finish",
-                    "steamPath": str(steam),
-                }
-            # Refresh installdir from ACF if Steam renamed it.
-            acf_info = parse_steam_acf(steam / "steamapps" / f"appmanifest_{appid}.acf")
-            final_dir = path
-            acf_installdir = str(acf_info.get("installdir") or "").strip()
-            if acf_installdir:
-                candidate = steam / "steamapps" / "common" / acf_installdir
-                if candidate.is_dir():
-                    final_dir = candidate
-            hint = launch_hint(steam, appid, final_dir)
-            marker = final_dir / ".arachnel-steamidra"
-            try:
-                marker.write_text(
-                    json.dumps({"appid": appid, "mode": "native", "launch": hint}, indent=2),
-                    encoding="utf-8",
-                )
-            except OSError:
-                pass
-            fix = try_embed_online_fix(plugin_root, final_dir, appid, settings)
-            _emit_progress(progress, percent=100, detail="Installed", status="completed")
-            out = {
-                "ok": True,
-                "installPath": str(final_dir),
-                "mode": "native",
-                "steamPath": str(steam),
-                "launch": hint,
-            }
-            if fix:
-                out["onlineFix"] = fix
-            return out
-
-        if force_ddmod or (prefer == "auto" and can_ddmod):
-            if force_native:
-                return do_native()
-            try:
-                return do_ddmod()
             except Exception as exc:
-                if prefer == "auto" and steam:
-                    try:
-                        return do_native()
-                    except Exception as native_exc:
-                        return {
-                            "ok": False,
-                            "error": f"ddmod failed: {exc}; native failed: {native_exc}",
-                        }
-                return {"ok": False, "error": str(exc)}
-
-        if force_native or not can_ddmod:
-            if not can_ddmod and not force_native:
-                return {
-                    "ok": False,
-                    "error": "DepotDownloaderMod missing — run tools/fetch_third_party.sh and rebuild",
-                }
-            return do_native()
-
-        return do_ddmod()
+                sys.stderr.write(f"steam library copy/acf skipped: {exc}\n")
+                install_final = install_path
+        else:
+            install_final = install_path
+        marker = install_final / ".arachnel-steamidra"
+        hint = launch_hint(steam, appid, install_final)
+        marker.write_text(
+            json.dumps({"appid": appid, "mode": "ddmod", "launch": hint}, indent=2),
+            encoding="utf-8",
+        )
+        fix = try_embed_online_fix(plugin_root, install_final, appid, settings)
+        _emit_progress(progress, percent=100, detail="Installed", status="completed")
+        out = {
+            "ok": True,
+            "installPath": str(install_final),
+            "mode": "ddmod",
+            "launch": hint,
+            "steamPath": str(steam) if steam else "",
+        }
+        if fix:
+            out["onlineFix"] = fix
+        return out
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -3287,7 +2870,7 @@ def main() -> int:
     p_inst.add_argument("--target", default="")
     p_inst.add_argument("--downloads", default="")
     p_inst.add_argument("--settings", default="")
-    p_inst.add_argument("--mode", default="auto")
+    p_inst.add_argument("--mode", default="ddmod", help="Ignored; always downloads via DDMod")
     p_inst.add_argument(
         "--force",
         action="store_true",

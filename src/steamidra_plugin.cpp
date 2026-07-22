@@ -209,26 +209,6 @@ QString SteamidraPlugin::settingsPath() const
     return dir + QStringLiteral("/settings.json");
 }
 
-void writePreferModeToSettings(const QString& settingsFile, const QString& mode)
-{
-    if (mode.isEmpty() || mode == QStringLiteral("auto"))
-        return;
-
-    QJsonObject obj;
-    {
-        QFile in(settingsFile);
-        if (in.open(QIODevice::ReadOnly))
-            obj = QJsonDocument::fromJson(in.readAll()).object();
-    }
-    if (obj.value(QStringLiteral("preferMode")).toString() == mode)
-        return;
-    obj.insert(QStringLiteral("preferMode"), mode);
-    QFile out(settingsFile);
-    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
-        return;
-    out.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
-}
-
 void SteamidraPlugin::resetCatalogCache()
 {
     QMutexLocker lock(&m_catalogMutex);
@@ -458,6 +438,15 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
         return !path.isEmpty() && QFileInfo::exists(path);
     };
 
+    auto applyOnlineFixOverrides = [&](arachnel::core::LaunchInfo& out) {
+        const QString dirPath =
+            out.workingDirectory.isEmpty() ? local.installPath : out.workingDirectory;
+        const QDir dir(dirPath);
+        if (dir.exists(QStringLiteral("winmm.dll")) || dir.exists(QStringLiteral("SteamFix.ini"))
+            || dir.exists(QStringLiteral("SteamFix64.dll")))
+            out.wineDllOverrides = QStringLiteral("winmm=n,b");
+    };
+
     const QString overridePath = local.executableOverride.trimmed();
     if (fileExists(overridePath)) {
         info.executable = overridePath;
@@ -466,6 +455,7 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
                               + QFileInfo(overridePath).completeBaseName()
                               + QStringLiteral(".pck")))
             info.arguments.append(QStringLiteral("--steam"));
+        applyOnlineFixOverrides(info);
         return info;
     }
 
@@ -500,6 +490,7 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
             && QFileInfo::exists(QFileInfo(markerExe).absolutePath() + QLatin1Char('/')
                                  + QFileInfo(markerExe).completeBaseName() + QStringLiteral(".pck")))
             info.arguments.append(QStringLiteral("--steam"));
+        applyOnlineFixOverrides(info);
         return info;
     }
 
@@ -541,6 +532,7 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
                 const QString stem = QFileInfo(best).completeBaseName();
                 if (installDir.exists(stem + QStringLiteral(".pck")))
                     info.arguments.append(QStringLiteral("--steam"));
+                applyOnlineFixOverrides(info);
                 return info;
             }
         }
@@ -592,21 +584,11 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         return m_cancelledJobs.contains(jobId);
     };
 
-    const QString resolvedMode =
-        ctx.installMode.isEmpty() ? QStringLiteral("auto") : ctx.installMode.trimmed().toLower();
-    writePreferModeToSettings(settingsPath(),
-                              resolvedMode == QStringLiteral("auto") ? QString() : resolvedMode);
-
     if (onProgress) {
         arachnel::core::OwnedDownloadProgress p;
         p.percent = 0;
         p.status = QStringLiteral("downloading");
-        if (resolvedMode == QStringLiteral("native"))
-            p.detail = QStringLiteral("Preparing Steam client…");
-        else if (resolvedMode == QStringLiteral("ddmod"))
-            p.detail = QStringLiteral("Downloading from Steam CDN…");
-        else
-            p.detail = QStringLiteral("Preparing…");
+        p.detail = QStringLiteral("Downloading from Steam CDN…");
         onProgress(p);
     }
 
@@ -615,7 +597,7 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         {QStringLiteral("install"), QStringLiteral("--appid"), appId, QStringLiteral("--title"),
          ctx.title, QStringLiteral("--target"), ctx.targetPath, QStringLiteral("--downloads"),
          ctx.downloadsPath, QStringLiteral("--settings"), settingsPath(),
-         QStringLiteral("--mode"), resolvedMode},
+         QStringLiteral("--mode"), QStringLiteral("ddmod")},
         onProgress, cancelled, 0);
 
     if (cancelled()) {

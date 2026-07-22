@@ -3,22 +3,44 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QEventLoop>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QStandardPaths>
 
 namespace steamidra {
 
 namespace {
 
-QString pythonExecutable()
+QString resolvePythonExecutable(const QString& pluginRoot)
 {
+    const QStringList bundled = {
 #if defined(Q_OS_WIN)
-    return QStringLiteral("python");
+        pluginRoot + QStringLiteral("/third_party/windows/python/python.exe"),
+        pluginRoot + QStringLiteral("/runtime/python/python.exe"),
 #else
-    return QStringLiteral("python3");
+        pluginRoot + QStringLiteral("/third_party/linux/python/bin/python3"),
+        pluginRoot + QStringLiteral("/runtime/python/bin/python3"),
 #endif
+    };
+    for (const QString& path : bundled) {
+        if (QFileInfo::exists(path))
+            return path;
+    }
+
+#if defined(Q_OS_WIN)
+    const QStringList names = {QStringLiteral("python"), QStringLiteral("python3")};
+#else
+    const QStringList names = {QStringLiteral("python3"), QStringLiteral("python")};
+#endif
+    for (const QString& name : names) {
+        const QString found = QStandardPaths::findExecutable(name);
+        if (!found.isEmpty())
+            return found;
+    }
+    return {};
 }
 
 } // namespace
@@ -26,9 +48,16 @@ QString pythonExecutable()
 WorkerResult runWorker(const QString& pluginRoot, const QStringList& args, int timeoutMs)
 {
     WorkerResult out;
+    const QString python = resolvePythonExecutable(pluginRoot);
+    if (python.isEmpty()) {
+        out.error = QStringLiteral(
+            "Python not found. Install Python 3 and ensure it is on PATH, "
+            "or bundle it under third_party/*/python.");
+        return out;
+    }
     const QString script = pluginRoot + QStringLiteral("/worker/steamidra_worker.py");
     QProcess process;
-    process.setProgram(pythonExecutable());
+    process.setProgram(python);
     QStringList fullArgs;
     fullArgs << script << args;
     process.setArguments(fullArgs);
@@ -39,7 +68,7 @@ WorkerResult runWorker(const QString& pluginRoot, const QStringList& args, int t
     process.setProcessEnvironment(env);
     process.start();
     if (!process.waitForStarted(10000)) {
-        out.error = QStringLiteral("Failed to start python worker");
+        out.error = QStringLiteral("Failed to start python worker (%1)").arg(python);
         return out;
     }
     if (timeoutMs > 0) {
@@ -69,9 +98,16 @@ WorkerResult runWorkerWithProgress(
     const std::function<bool()>& shouldCancel, int timeoutMs)
 {
     WorkerResult out;
+    const QString python = resolvePythonExecutable(pluginRoot);
+    if (python.isEmpty()) {
+        out.error = QStringLiteral(
+            "Python not found. Install Python 3 and ensure it is on PATH, "
+            "or bundle it under third_party/*/python.");
+        return out;
+    }
     const QString script = pluginRoot + QStringLiteral("/worker/steamidra_worker.py");
     QProcess process;
-    process.setProgram(pythonExecutable());
+    process.setProgram(python);
     QStringList fullArgs;
     fullArgs << script << QStringLiteral("--progress-json") << args;
     process.setArguments(fullArgs);
@@ -83,7 +119,7 @@ WorkerResult runWorkerWithProgress(
     process.setProcessChannelMode(QProcess::SeparateChannels);
     process.start();
     if (!process.waitForStarted(10000)) {
-        out.error = QStringLiteral("Failed to start python worker");
+        out.error = QStringLiteral("Failed to start python worker (%1)").arg(python);
         return out;
     }
 
