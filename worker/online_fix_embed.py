@@ -148,10 +148,21 @@ def kit_dir(plugin_root: Path, settings: dict[str, Any]) -> Path:
     configured = (settings.get("onlineFixSourceDir") or "").strip()
     if configured:
         return Path(configured).expanduser().resolve()
+    # Prefer kit shipped next to the plugin (steam.arach / online_fix_kit).
+    bundled = (plugin_root / "online_fix_kit").resolve()
+    if (bundled / "SteamFix64.dll").is_file() and (bundled / "winmm.dll").is_file():
+        return bundled
     settings_path = (settings.get("_settingsPath") or "").strip()
     if settings_path:
-        return Path(settings_path).expanduser().resolve().parent / "online_fix_kit"
-    return (plugin_root / "online_fix_kit").resolve()
+        beside_settings = Path(settings_path).expanduser().resolve().parent / "online_fix_kit"
+        if (beside_settings / "SteamFix64.dll").is_file() and (
+            beside_settings / "winmm.dll"
+        ).is_file():
+            return beside_settings
+        # Fall back to creating beside settings only when bundled kit is absent.
+        if not (bundled / "SteamFix64.dll").is_file():
+            return beside_settings
+    return bundled
 
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -187,20 +198,32 @@ def _candidate_harvest_roots(settings: dict[str, Any]) -> list[Path]:
         raw = (settings.get(key) or "").strip()
         if raw:
             roots.append(Path(raw).expanduser())
+    home = Path.home()
     # Prefer known game libraries first — they usually hold FreeTP overlays.
-    for extra in (
+    extras = [
         Path(r"D:\HydraGames"),
         Path(r"D:\ArachnelGame"),
         Path(r"C:\Games\Arachnel"),
         Path(r"D:\Games\Arachnel"),
-        Path.home() / "Games",
-    ):
+        home / "Games",
+        home / "Games" / "Online-Fix",
+        home / "Games" / "Hydra",
+        home / ".var" / "app" / "org.badkiko.sofl" / "data" / "games",
+        Path("/mnt/games"),
+        Path("/mnt/Games"),
+    ]
+    # Arachnel library folders (Linux + Windows).
+    xdg = os.environ.get("XDG_DATA_HOME") or str(home / ".local" / "share")
+    extras.append(Path(xdg) / "Arachnel" / "Arachnel" / "library")
+    extras.append(Path(xdg) / "Arachnel" / "library")
+    for extra in extras:
         roots.append(extra)
     appdata = os.environ.get("APPDATA") or ""
     if appdata:
         # Do NOT walk all of Roaming\Arachnel — junctions there break deep scans.
         roots.append(Path(appdata) / "Arachnel" / "Arachnel" / "plugins")
         roots.append(Path(appdata) / "Arachnel" / "plugins")
+        roots.append(Path(appdata) / "Arachnel" / "Arachnel" / "library")
     out: list[Path] = []
     seen: set[str] = set()
     for root in roots:

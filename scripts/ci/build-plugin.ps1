@@ -67,6 +67,7 @@ if (-not (Test-Path (Join-Path $QtPrefix "lib\cmake\Qt6\Qt6Config.cmake"))) {
 }
 
 & (Join-Path $Root "tools\fetch_third_party.ps1") windows
+& (Join-Path $Root "tools\harvest_online_fix_kit.ps1")
 
 $configureArgs = @(
     "-S", $Root,

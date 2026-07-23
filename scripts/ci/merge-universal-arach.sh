@@ -36,8 +36,22 @@ rm -rf "${MERGED}/third_party"
 mkdir -p "${MERGED}/third_party/windows" "${MERGED}/third_party/linux"
 cp -a "${WIN}/third_party/." "${MERGED}/third_party/windows/"
 cp -a "${LIN}/third_party/." "${MERGED}/third_party/linux/"
-[[ ! -f "${WIN}/third_party/README.md" ]] || \
+[[ ! -f "${MERGED}/third_party/README.md" ]] || \
   cp -a "${WIN}/third_party/README.md" "${MERGED}/third_party/README.md"
+
+# Prefer Windows-harvested SteamFix kit (Linux CI usually has none).
+if [[ -f "${WIN}/online_fix_kit/SteamFix64.dll" && -f "${WIN}/online_fix_kit/winmm.dll" ]]; then
+  rm -rf "${MERGED}/online_fix_kit"
+  mkdir -p "${MERGED}/online_fix_kit"
+  cp -a "${WIN}/online_fix_kit/." "${MERGED}/online_fix_kit/"
+elif [[ -f "${LIN}/online_fix_kit/SteamFix64.dll" && -f "${LIN}/online_fix_kit/winmm.dll" ]]; then
+  rm -rf "${MERGED}/online_fix_kit"
+  mkdir -p "${MERGED}/online_fix_kit"
+  cp -a "${LIN}/online_fix_kit/." "${MERGED}/online_fix_kit/"
+fi
+if [[ ! -f "${MERGED}/online_fix_kit/SteamFix64.dll" ]]; then
+  echo "WARNING: universal bundle missing online_fix_kit/SteamFix64.dll" >&2
+fi
 
 [[ ! -f "${LIN}/libsteamidra_plugin.so" ]] || \
   cp -a "${LIN}/libsteamidra_plugin.so" "${MERGED}/"

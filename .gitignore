@@ -6,9 +6,8 @@ __pycache__/
 *.pyc
 catalog/.cache/
 
-# Harvested FreeTP SteamFix binaries (not redistributed in git)
-online_fix_kit/
-**/online_fix_kit/
+# Harvested FreeTP SteamFix binaries live in online_fix_kit/ and ARE packaged
+# into steam.arach (required for Online Fix embeds on Linux). Keep them committed.
 
 # Vendored large/binary trees (fetch via tools/fetch_third_party.*)
 third_party/linux/dotnet/

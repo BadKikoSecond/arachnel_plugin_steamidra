@@ -81,6 +81,12 @@ add_custom_command(TARGET steamidra_plugin POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
         "${_PLUGIN_BUNDLE_DIR}/LICENSE"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${_PLUGIN_BUNDLE_DIR}/online_fix_kit"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_PLUGIN_BUNDLE_DIR}/online_fix_kit"
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/online_fix_kit
+        -DDEST_DIR=${_PLUGIN_BUNDLE_DIR}/online_fix_kit
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CopyOnlineFixKit.cmake"
     COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/_staging_steamidra_arach"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_ARACH_STAGING}"
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${_PLUGIN_BUNDLE_DIR}" "${_ARACH_STAGING}"
