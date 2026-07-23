@@ -80,7 +80,7 @@ export ARACHNEL_SDK_DIR=~/path/to/Arachnel   # or D:\Work\Arachnel
 |-----|---------|
 | `preferMode` | Legacy; installs always use DDMod. |
 | `depotOs` | `windows` (default) or `linux`. Linux hosts use Windows depots for Proton. |
-| `libraryFolder` | Override install root when Steam is absent |
+| `libraryFolder` | Fallback install root if `--target` is omitted (never Steam `steamapps/common`) |
 | `includeDlc` | Also download DLC depots (default `false`) |
 | `hubcapApiKey` | Optional Hubcap `smm…` key for richer library dates |
 | `manifestCatalogUrl` | Override catalog JSON URL |

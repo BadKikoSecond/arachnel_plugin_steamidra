@@ -1881,14 +1881,20 @@ def write_acf(
     manifests: dict[str, str] | None = None,
     *,
     state_flags: str = "4",
+    create_common_dir: bool = True,
 ) -> Path:
-    """Write appmanifest. Default StateFlags 4 = Fully Installed (post-ddmod)."""
+    """Write appmanifest. Default StateFlags 4 = Fully Installed (post-ddmod).
+
+    When create_common_dir is False, only the .acf is written (game files live in
+    the Arachnel library, not under steamapps/common).
+    """
     import time
 
     lib = steam / "steamapps"
     lib.mkdir(parents=True, exist_ok=True)
     common = lib / "common" / installdir
-    common.mkdir(parents=True, exist_ok=True)
+    if create_common_dir:
+        common.mkdir(parents=True, exist_ok=True)
     acf = lib / f"appmanifest_{appid}.acf"
     safe_title = title.replace('"', "'")
     depot_block = ""
@@ -2656,9 +2662,8 @@ def install_game(
         install_path_early = Path(target)
     elif lib_folder:
         install_path_early = Path(lib_folder) / installdir
-    elif steam:
-        install_path_early = steam / "steamapps" / "common" / installdir
     else:
+        # Never default into Steam's C: library — use Arachnel library / ~/Games.
         install_path_early = default_library_root(settings) / f"{appid}-{installdir}"
 
     # Skip DepotDownloader verify theater when the game is already on disk.
@@ -2793,30 +2798,32 @@ def install_game(
         except Exception as exc:
             sys.stderr.write(f"strip_platform: {exc}\n")
         size = sum(f.stat().st_size for f in install_path.rglob("*") if f.is_file())
+        # Keep the game in the user-selected Arachnel library. Do NOT copy into
+        # Steam's steamapps/common (usually C:) — that doubled disk use and hijacked installPath.
+        install_final = install_path
+        # Optional: unlock metadata in Steam tree only — never move/copy game files there.
+        # Skip appmanifest when the game lives outside steamapps/common (avoids empty
+        # Steam library entries pointing at a missing installdir).
         if steam and steam_tree_writable(steam):
-            # Prefer Steam common path for ACF installdir
             try:
-                steam_common = steam / "steamapps" / "common" / installdir
-                if install_path.resolve() != steam_common.resolve():
-                    steam_common.parent.mkdir(parents=True, exist_ok=True)
-                    if not steam_common.exists():
-                        shutil.copytree(install_path, steam_common, dirs_exist_ok=True)
-                    install_final = steam_common
-                else:
-                    install_final = install_path
-                write_acf(
-                    steam,
-                    appid,
-                    title,
-                    installdir,
-                    size=size,
-                    manifests=parsed["manifests"],
-                )
+                under_steam = False
+                try:
+                    under_steam = install_path.resolve().is_relative_to(
+                        (steam / "steamapps" / "common").resolve()
+                    )
+                except (OSError, ValueError, AttributeError):
+                    under_steam = False
+                if under_steam:
+                    write_acf(
+                        steam,
+                        appid,
+                        title,
+                        installdir,
+                        size=size,
+                        manifests=parsed["manifests"],
+                    )
             except Exception as exc:
-                sys.stderr.write(f"steam library copy/acf skipped: {exc}\n")
-                install_final = install_path
-        else:
-            install_final = install_path
+                sys.stderr.write(f"steam acf skipped: {exc}\n")
         marker = install_final / ".arachnel-steamidra"
         hint = launch_hint(steam, appid, install_final)
         marker.write_text(

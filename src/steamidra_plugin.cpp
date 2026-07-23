@@ -186,7 +186,7 @@ QString SteamidraPlugin::description() const
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.3.22");
+    return QStringLiteral("0.3.32");
 }
 
 QStringList SteamidraPlugin::capabilities() const
