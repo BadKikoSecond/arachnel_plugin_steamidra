@@ -187,7 +187,7 @@ QString SteamidraPlugin::description() const
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.3.35");
+    return QStringLiteral("0.3.36");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -477,8 +477,11 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
         if (dir.exists(QStringLiteral("winmm.dll")) || dir.exists(QStringLiteral("SteamFix.ini"))
             || dir.exists(QStringLiteral("SteamFix64.dll"))
             || dir.exists(QStringLiteral("OnlineFix.ini"))) {
-            out.wineDllOverrides =
-                QStringLiteral("winmm=n,b;steamfix64=n;steamoverlay64=n;winhttp=n,b");
+            out.wineDllOverrides = QStringLiteral(
+                "onlinefix64=n,b;steamoverlay64=n,b;winmm=n,b;dnet=n,b;steam_api64=n,b;winhttp=n,b;"
+                "steamfix64=n,b");
+            out.environmentExtras.insert(QStringLiteral("ARACHNEL_USE_STEAM_RUNTIME"),
+                                         QStringLiteral("1"));
         }
     };
 
