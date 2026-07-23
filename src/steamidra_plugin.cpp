@@ -9,6 +9,7 @@
 #include <QDate>
 #include <QDateTime>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -186,7 +187,7 @@ QString SteamidraPlugin::description() const
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.3.34");
+    return QStringLiteral("0.3.35");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -468,12 +469,37 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
     };
 
     auto applyOnlineFixOverrides = [&](arachnel::core::LaunchInfo& out) {
+        // Full Proton WINEDLLOVERRIDES + Steam overlay env are applied by core
+        // applyOnlineFixLaunchInfo(); keep a minimal fallback for older hosts.
         const QString dirPath =
             out.workingDirectory.isEmpty() ? local.installPath : out.workingDirectory;
         const QDir dir(dirPath);
         if (dir.exists(QStringLiteral("winmm.dll")) || dir.exists(QStringLiteral("SteamFix.ini"))
-            || dir.exists(QStringLiteral("SteamFix64.dll")))
-            out.wineDllOverrides = QStringLiteral("winmm=n,b");
+            || dir.exists(QStringLiteral("SteamFix64.dll"))
+            || dir.exists(QStringLiteral("OnlineFix.ini"))) {
+            out.wineDllOverrides =
+                QStringLiteral("winmm=n,b;steamfix64=n;steamoverlay64=n;winhttp=n,b");
+        }
+    };
+
+    auto findOverlayNearExe = [](const QString& installPath) -> QString {
+        if (installPath.isEmpty())
+            return {};
+        QDirIterator it(installPath,
+                        {QStringLiteral("winmm.dll"), QStringLiteral("SteamFix.ini"),
+                         QStringLiteral("SteamFix64.dll"), QStringLiteral("OnlineFix.ini")},
+                        QDir::Files, QDirIterator::Subdirectories);
+        int seen = 0;
+        while (it.hasNext() && seen < 5000) {
+            const QString path = it.next();
+            ++seen;
+            const QString rel = QDir(installPath).relativeFilePath(path).toLower();
+            if (rel.contains(QStringLiteral("engine/")) || rel.contains(QStringLiteral("\\engine\\"))
+                || rel.contains(QStringLiteral(".depotdownloader")))
+                continue;
+            return QFileInfo(path).absolutePath();
+        }
+        return {};
     };
 
     const QString overridePath = local.executableOverride.trimmed();
@@ -524,12 +550,47 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(
     }
 
     const QDir installDir(local.installPath);
-    const bool hasFixOverlay = installDir.exists(QStringLiteral("winmm.dll"))
+    const QString overlayDir = findOverlayNearExe(local.installPath);
+    const bool hasFixOverlay = !overlayDir.isEmpty() || installDir.exists(QStringLiteral("winmm.dll"))
         || installDir.exists(QStringLiteral("SteamFix.ini"));
 
     // Owned depot installs (and anything with SteamFix) must start the local binary.
     // steam:// skips winmm inject and often runs GameLauncher stubs → crashes (Pratfall).
     if (markerPrefersLocal || hasFixOverlay || !local.installPath.isEmpty()) {
+        // Prefer the shipping exe next to SteamFix (UE Binaries/Win64, Unity root, …).
+        if (!overlayDir.isEmpty()) {
+            const QDir fixDir(overlayDir);
+            const QStringList fixExes =
+                fixDir.entryList({QStringLiteral("*.exe")}, QDir::Files, QDir::Name);
+            QString bestFix;
+            qint64 bestFixScore = -1;
+            for (const QString& name : fixExes) {
+                const QString lower = name.toLower();
+                if (lower.contains(QStringLiteral("crash"))
+                    || lower.contains(QStringLiteral("unins"))
+                    || lower.contains(QStringLiteral("redist")))
+                    continue;
+                qint64 score = QFileInfo(fixDir.filePath(name)).size();
+                if (lower.contains(QStringLiteral("shipping")))
+                    score += 500LL * 1024 * 1024;
+                if (lower.contains(QStringLiteral("launcher"))
+                    || lower.contains(QStringLiteral("bootstrap")))
+                    score -= 50LL * 1024 * 1024;
+                if (score > bestFixScore) {
+                    bestFixScore = score;
+                    bestFix = fixDir.filePath(name);
+                }
+            }
+            if (!bestFix.isEmpty()) {
+                info.executable = bestFix;
+                info.workingDirectory = overlayDir;
+                const QString stem = QFileInfo(bestFix).completeBaseName();
+                if (fixDir.exists(stem + QStringLiteral(".pck")))
+                    info.arguments.append(QStringLiteral("--steam"));
+                applyOnlineFixOverrides(info);
+                return info;
+            }
+        }
         if (!local.installPath.isEmpty()) {
             const QStringList exes =
                 installDir.entryList({QStringLiteral("*.exe")}, QDir::Files, QDir::Name);
