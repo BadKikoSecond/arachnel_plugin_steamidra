@@ -186,7 +186,7 @@ QString SteamidraPlugin::description() const
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.3.33");
+    return QStringLiteral("0.3.34");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -227,27 +227,31 @@ void SteamidraPlugin::resetCatalogCache()
 
 void SteamidraPlugin::ensureCatalogSeeded() const
 {
-    QMutexLocker lock(&m_catalogMutex);
-    if (m_catalogLoaded && !m_catalog.isEmpty())
-        return;
+    {
+        QMutexLocker lock(&m_catalogMutex);
+        if (m_catalogLoaded && !m_catalog.isEmpty())
+            return;
+    }
 
-    m_catalog.clear();
+    const QString settingsDir = QFileInfo(settingsPath()).absolutePath();
+    const QString localCache = catalogCachePath();
+    bool forceResync = false;
+    {
+        QMutexLocker lock(&m_catalogMutex);
+        if (m_catalogLoaded && !m_catalog.isEmpty())
+            return;
+        forceResync = m_forceCatalogResync;
+        m_forceCatalogResync = false;
+        m_catalog.clear();
+    }
 
-    const auto appendGames = [this](const QJsonArray& games) {
-        m_catalog.reserve(m_catalog.size() + games.size());
-        for (const QJsonValue& v : games) {
-            if (!v.isObject())
-                continue;
-            m_catalog.append(entryFromJson(v.toObject()));
-        }
-    };
-
-    const auto loadCatalogFile = [&](const QString& path) -> bool {
+    const auto loadEntriesFromFile = [](const QString& path) -> QVector<arachnel::core::CatalogEntry> {
+        QVector<arachnel::core::CatalogEntry> out;
         if (path.isEmpty())
-            return false;
+            return out;
         QFile f(path);
         if (!f.open(QIODevice::ReadOnly))
-            return false;
+            return out;
         const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
         QJsonArray games;
         if (doc.isArray()) {
@@ -258,29 +262,35 @@ void SteamidraPlugin::ensureCatalogSeeded() const
             if (games.isEmpty())
                 games = root.value(QStringLiteral("games")).toArray();
         }
-        if (games.isEmpty())
-            return false;
-        appendGames(games);
-        return !m_catalog.isEmpty();
+        out.reserve(games.size());
+        for (const QJsonValue& v : games) {
+            if (!v.isObject())
+                continue;
+            out.append(entryFromJson(v.toObject()));
+        }
+        return out;
     };
 
-    const QString settingsDir = QFileInfo(settingsPath()).absolutePath();
-    const QString localCache = catalogCachePath();
-    const bool forceResync = m_forceCatalogResync;
-    m_forceCatalogResync = false;
+    const auto commitEntries = [this](QVector<arachnel::core::CatalogEntry>&& entries) -> bool {
+        if (entries.isEmpty())
+            return false;
+        QMutexLocker lock(&m_catalogMutex);
+        if (m_catalogLoaded && !m_catalog.isEmpty())
+            return true;
+        m_catalog = std::move(entries);
+        m_catalogLoaded = !m_catalog.isEmpty();
+        return m_catalogLoaded;
+    };
 
-    // Fast path: use local cache first (avoid blocking UI on a 20MB relay fetch).
-    // Skip after explicit refresh — otherwise "Reload" keeps serving yesterday's JSON.
-    if (!forceResync && loadCatalogFile(localCache)) {
-        m_catalogLoaded = true;
-        return;
-    }
-    if (!forceResync && loadCatalogFile(m_rootPath + QStringLiteral("/games-manifest-catalog.json"))) {
-        m_catalogLoaded = true;
-        return;
+    // Disk / network I/O must not hold m_catalogMutex — plugin auto-update can unload the DLL
+    // while catalog() runs on a QtConcurrent thread (crash: destroying locked mutex).
+    if (!forceResync) {
+        if (commitEntries(loadEntriesFromFile(localCache)))
+            return;
+        if (commitEntries(loadEntriesFromFile(m_rootPath + QStringLiteral("/games-manifest-catalog.json"))))
+            return;
     }
 
-    // Sync from Ryuu relay (force on refresh; TTL inside worker otherwise).
     QStringList args{QStringLiteral("catalog-sync"), QStringLiteral("--settings"), settingsPath()};
     if (forceResync)
         args.append(QStringLiteral("--force"));
@@ -289,13 +299,20 @@ void SteamidraPlugin::ensureCatalogSeeded() const
     QString catalogPath = syncObj.value(QStringLiteral("catalogPath")).toString();
     if (!catalogPath.isEmpty() && !QFileInfo(catalogPath).isAbsolute())
         catalogPath = settingsDir + QLatin1Char('/') + catalogPath;
-    if (loadCatalogFile(catalogPath) || loadCatalogFile(localCache)) {
-        m_catalogLoaded = true;
+    if (commitEntries(loadEntriesFromFile(catalogPath)))
         return;
+    if (commitEntries(loadEntriesFromFile(localCache)))
+        return;
+
+    QVector<arachnel::core::CatalogEntry> fallback;
+    const QJsonArray games = syncObj.value(QStringLiteral("games")).toArray();
+    fallback.reserve(games.size());
+    for (const QJsonValue& v : games) {
+        if (!v.isObject())
+            continue;
+        fallback.append(entryFromJson(v.toObject()));
     }
-    // Do not fall back to a stale bundled GitLab catalog — relay only.
-    appendGames(syncObj.value(QStringLiteral("games")).toArray());
-    m_catalogLoaded = !m_catalog.isEmpty();
+    commitEntries(std::move(fallback));
 }
 
 QVector<arachnel::core::CatalogEntry> SteamidraPlugin::catalog() const
