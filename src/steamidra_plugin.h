@@ -52,11 +52,13 @@ public:
 private:
     QString workerScriptPath() const;
     QString settingsPath() const;
+    QString catalogCachePath() const;
     void ensureCatalogSeeded() const;
 
     QString m_rootPath;
     mutable QVector<arachnel::core::CatalogEntry> m_catalog;
     mutable bool m_catalogLoaded = false;
+    mutable bool m_forceCatalogResync = false;
     mutable QRecursiveMutex m_catalogMutex;
     mutable QMutex m_cancelMutex;
     mutable QSet<QString> m_cancelledJobs;

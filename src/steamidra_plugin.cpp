@@ -186,7 +186,7 @@ QString SteamidraPlugin::description() const
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.3.32");
+    return QStringLiteral("0.3.33");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -209,11 +209,20 @@ QString SteamidraPlugin::settingsPath() const
     return dir + QStringLiteral("/settings.json");
 }
 
+QString SteamidraPlugin::catalogCachePath() const
+{
+    return QFileInfo(settingsPath()).absolutePath()
+           + QStringLiteral("/games-manifest-catalog.json");
+}
+
 void SteamidraPlugin::resetCatalogCache()
 {
     QMutexLocker lock(&m_catalogMutex);
     m_catalogLoaded = false;
     m_catalog.clear();
+    m_forceCatalogResync = true;
+    // Reload button must re-fetch from relay — memory-only clear left a stale disk cache.
+    QFile::remove(catalogCachePath());
 }
 
 void SteamidraPlugin::ensureCatalogSeeded() const
@@ -256,23 +265,26 @@ void SteamidraPlugin::ensureCatalogSeeded() const
     };
 
     const QString settingsDir = QFileInfo(settingsPath()).absolutePath();
-    const QString localCache = settingsDir + QStringLiteral("/games-manifest-catalog.json");
+    const QString localCache = catalogCachePath();
+    const bool forceResync = m_forceCatalogResync;
+    m_forceCatalogResync = false;
 
     // Fast path: use local cache first (avoid blocking UI on a 20MB relay fetch).
-    if (loadCatalogFile(localCache)) {
+    // Skip after explicit refresh — otherwise "Reload" keeps serving yesterday's JSON.
+    if (!forceResync && loadCatalogFile(localCache)) {
         m_catalogLoaded = true;
         return;
     }
-    if (loadCatalogFile(m_rootPath + QStringLiteral("/games-manifest-catalog.json"))) {
+    if (!forceResync && loadCatalogFile(m_rootPath + QStringLiteral("/games-manifest-catalog.json"))) {
         m_catalogLoaded = true;
         return;
     }
 
-    // Sync from Ryuu relay (TTL inside worker; first fetch ~20MB).
-    const WorkerResult sync =
-        runWorker(m_rootPath,
-                  {QStringLiteral("catalog-seed"), QStringLiteral("--settings"), settingsPath()},
-                  600000);
+    // Sync from Ryuu relay (force on refresh; TTL inside worker otherwise).
+    QStringList args{QStringLiteral("catalog-sync"), QStringLiteral("--settings"), settingsPath()};
+    if (forceResync)
+        args.append(QStringLiteral("--force"));
+    const WorkerResult sync = runWorker(m_rootPath, args, 600000);
     const QJsonObject syncObj = parseWorkerJson(sync);
     QString catalogPath = syncObj.value(QStringLiteral("catalogPath")).toString();
     if (!catalogPath.isEmpty() && !QFileInfo(catalogPath).isAbsolute())
