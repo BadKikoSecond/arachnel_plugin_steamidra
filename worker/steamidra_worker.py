@@ -378,7 +378,10 @@ def load_settings(path: str | None) -> dict[str, Any]:
         "relayBaseUrl": DEFAULT_RELAY_BASE,
         "relayClientToken": "",
         "manifestCatalogUrl": DEFAULT_MANIFEST_CATALOG_URL,
-        "manifestCatalogTtlHours": 24,
+        # Short disk cache: after TTL expire, next sync re-downloads from remote URL.
+        "manifestCatalogTtlMinutes": 5,
+        # Legacy; used only when manifestCatalogTtlMinutes is unset.
+        "manifestCatalogTtlHours": 0,
         "steamPath": "",
         "preferMode": "ddmod",  # legacy; installs always use DDMod
         "depotOs": "windows",  # windows | linux — Linux host defaults to windows (Proton)
@@ -829,6 +832,23 @@ def parse_manifest_catalog_payload(data: Any) -> list[dict[str, Any]]:
     return games
 
 
+def catalog_ttl_seconds(settings: dict[str, Any]) -> float:
+    """Remote catalog disk TTL. Default 5 minutes; re-fetch from URL after expiry."""
+    if "manifestCatalogTtlMinutes" in settings and settings.get("manifestCatalogTtlMinutes") is not None:
+        try:
+            minutes = float(settings.get("manifestCatalogTtlMinutes"))
+            return max(0.0, minutes) * 60.0
+        except (TypeError, ValueError):
+            pass
+    try:
+        hours = float(settings.get("manifestCatalogTtlHours") or 0)
+    except (TypeError, ValueError):
+        hours = 0.0
+    if hours > 0:
+        return hours * 3600.0
+    return 5.0 * 60.0
+
+
 def download_manifest_catalog(url: str, dest: Path, *, max_age_s: float = 3600) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and max_age_s > 0:
@@ -880,7 +900,7 @@ def load_or_sync_manifest_catalog(
     """Fetch catalog from Arachnel Ryuu relay into local cache (no stale bundled dump)."""
     cache = manifest_catalog_cache_path(settings, plugin_root)
     url = str(settings.get("manifestCatalogUrl") or DEFAULT_MANIFEST_CATALOG_URL).strip()
-    ttl = float(settings.get("manifestCatalogTtlHours") or 24) * 3600
+    ttl = catalog_ttl_seconds(settings)
     if not url:
         return load_manifest_catalog_file(cache, min_entries=1)
 
@@ -2188,32 +2208,41 @@ def find_game_exe(install_path: Path) -> Path | None:
         if any(s in name for s in skip_sub):
             return (99, 0, 0, name)
         depth = len(path.relative_to(root).parts)
-        # Prefer top-level game exe that matches folder / .pck / *_Data name.
         name_bonus = 0
         folder = root.name.lower().replace("steam-", "")
         if folder.isdigit():
             folder = ""
         if folder and (folder in stem or stem in folder):
             name_bonus += 50
-        # Pratfall.pck / Sex With Friends_Data style anchors
         if (root / f"{path.stem}.pck").is_file():
             name_bonus += 80
         if (root / f"{path.stem}_Data").is_dir():
             name_bonus += 80
         if path.parent == root and list(path.parent.glob("*_Data")):
-            # Unity root: prefer exe whose _Data exists
             if (root / f"{path.stem}_Data").is_dir():
                 name_bonus += 40
         if any(s in stem for s in deprioritize):
             name_bonus -= 60
-        if "shipping" in stem:
-            name_bonus += 30
+        # Prefer the binary that actually loads SteamFix/winmm (UE Win64 shipping),
+        # not the tiny bootstrap at install root (Meccha PenguinHotel.exe).
+        has_overlay = (path.parent / "SteamFix64.dll").is_file() or (
+            path.parent / "winmm.dll"
+        ).is_file()
+        is_shipping = "shipping" in stem or path.parent.name.lower() in ("win64", "win32")
         try:
             size = path.stat().st_size
         except OSError:
             size = 0
-        # Lower is better for depth; higher size/name_bonus wins via negatives.
-        return (0 if path.parent == root else 1, depth, -name_bonus, -size, name)
+        # Lower tuple wins. Overlay/shipping first — root stub used to beat Win64.
+        return (
+            0 if has_overlay else 1,
+            0 if is_shipping else 1,
+            0 if path.parent == root else 1,
+            depth,
+            -name_bonus,
+            -size,
+            name,
+        )
 
     exes.sort(key=score)
     for e in exes:
@@ -2694,6 +2723,10 @@ def install_game(
                 downloadRateBps=0,
             )
             fix = try_embed_online_fix(plugin_root, install_path_early, appid, settings)
+            if fix and fix.get("embedded"):
+                refreshed = launch_hint(steam, appid, install_path_early)
+                if refreshed:
+                    hint = refreshed
             out = {
                 "ok": True,
                 "installPath": str(install_path_early),
@@ -2831,6 +2864,17 @@ def install_game(
             encoding="utf-8",
         )
         fix = try_embed_online_fix(plugin_root, install_final, appid, settings)
+        # Prefer launch path from overlay embed (Win64 shipping) over root UE stub.
+        if fix and fix.get("embedded"):
+            refreshed = launch_hint(steam, appid, install_final)
+            if refreshed:
+                hint = refreshed
+                try:
+                    payload = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else {}
+                    payload["launch"] = hint
+                    marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
         _emit_progress(progress, percent=100, detail="Installed", status="completed")
         out = {
             "ok": True,

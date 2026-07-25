@@ -187,7 +187,7 @@ QString SteamidraPlugin::description() const
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.3.37");
+    return QStringLiteral("0.3.38");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -221,6 +221,7 @@ void SteamidraPlugin::resetCatalogCache()
     QMutexLocker lock(&m_catalogMutex);
     m_catalogLoaded = false;
     m_catalog.clear();
+    m_catalogLoadedAt = {};
     m_forceCatalogResync = true;
     // Reload button must re-fetch from relay — memory-only clear left a stale disk cache.
     QFile::remove(catalogCachePath());
@@ -228,9 +229,13 @@ void SteamidraPlugin::resetCatalogCache()
 
 void SteamidraPlugin::ensureCatalogSeeded() const
 {
+    // Keep a short in-memory cache aligned with worker disk TTL (~5 minutes).
+    constexpr qint64 kMemoryTtlMs = 5 * 60 * 1000;
     {
         QMutexLocker lock(&m_catalogMutex);
-        if (m_catalogLoaded && !m_catalog.isEmpty())
+        if (m_catalogLoaded && !m_catalog.isEmpty() && !m_forceCatalogResync
+            && m_catalogLoadedAt.isValid()
+            && m_catalogLoadedAt.msecsTo(QDateTime::currentDateTimeUtc()) < kMemoryTtlMs)
             return;
     }
 
@@ -239,11 +244,14 @@ void SteamidraPlugin::ensureCatalogSeeded() const
     bool forceResync = false;
     {
         QMutexLocker lock(&m_catalogMutex);
-        if (m_catalogLoaded && !m_catalog.isEmpty())
-            return;
         forceResync = m_forceCatalogResync;
         m_forceCatalogResync = false;
-        m_catalog.clear();
+        // Keep serving the previous catalog while sync runs (unless Reload forced a wipe).
+        if (forceResync) {
+            m_catalog.clear();
+            m_catalogLoaded = false;
+            m_catalogLoadedAt = {};
+        }
     }
 
     const auto loadEntriesFromFile = [](const QString& path) -> QVector<arachnel::core::CatalogEntry> {
@@ -276,22 +284,16 @@ void SteamidraPlugin::ensureCatalogSeeded() const
         if (entries.isEmpty())
             return false;
         QMutexLocker lock(&m_catalogMutex);
-        if (m_catalogLoaded && !m_catalog.isEmpty())
-            return true;
         m_catalog = std::move(entries);
         m_catalogLoaded = !m_catalog.isEmpty();
+        if (m_catalogLoaded)
+            m_catalogLoadedAt = QDateTime::currentDateTimeUtc();
         return m_catalogLoaded;
     };
 
-    // Disk / network I/O must not hold m_catalogMutex — plugin auto-update can unload the DLL
-    // while catalog() runs on a QtConcurrent thread (crash: destroying locked mutex).
-    if (!forceResync) {
-        if (commitEntries(loadEntriesFromFile(localCache)))
-            return;
-        if (commitEntries(loadEntriesFromFile(m_rootPath + QStringLiteral("/games-manifest-catalog.json"))))
-            return;
-    }
-
+    // Always ask the worker: it reuses disk cache if younger than TTL, otherwise
+    // re-downloads from manifestCatalogUrl (Ryuu). Do not short-circuit on a stale
+    // local file — that skipped remote updates for days.
     QStringList args{QStringLiteral("catalog-sync"), QStringLiteral("--settings"), settingsPath()};
     if (forceResync)
         args.append(QStringLiteral("--force"));

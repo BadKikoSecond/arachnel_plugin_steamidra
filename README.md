@@ -84,7 +84,8 @@ export ARACHNEL_SDK_DIR=~/path/to/Arachnel   # or D:\Work\Arachnel
 | `includeDlc` | Also download DLC depots (default `false`) |
 | `hubcapApiKey` | Optional Hubcap `smm…` key for richer library dates |
 | `manifestCatalogUrl` | Override catalog JSON URL |
-| `manifestCatalogTtlHours` | Refresh interval (default `24`) |
+| `manifestCatalogTtlMinutes` | Disk cache TTL before re-download (default `5`) |
+| `manifestCatalogTtlHours` | Legacy; used only if minutes key is unset |
 | `steamPath` | Override Steam root |
 | `autoEmbedOnlineFix` | After install, embed SteamFix when Steam Store has Online PvP/Co-op/MMO (default `true`) |
 | `onlineFixOnWeakMultiplayer` | Also embed on weak Multi-player/Co-op tags (default `false`) |

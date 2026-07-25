@@ -2,6 +2,7 @@
 
 #include "plugin_interface.h"
 
+#include <QDateTime>
 #include <QRecursiveMutex>
 #include <QSet>
 #include <QString>
@@ -59,6 +60,7 @@ private:
     mutable QVector<arachnel::core::CatalogEntry> m_catalog;
     mutable bool m_catalogLoaded = false;
     mutable bool m_forceCatalogResync = false;
+    mutable QDateTime m_catalogLoadedAt;
     mutable QRecursiveMutex m_catalogMutex;
     mutable QMutex m_cancelMutex;
     mutable QSet<QString> m_cancelledJobs;

@@ -17,7 +17,7 @@ Unreal with EOS / RedpointEOS (MECCHA CHAMELEON):
   - winmm.txt loads BOTH: SteamFix64.dll then EpicFix64.dll
   - SteamFix.ini: FakeWorkshop=true + Workshop=true when Store has Workshop
 
-Binaries are NOT shipped in the repo — harvested into online_fix_kit/.
+Binaries are harvested into `online_fix_kit/` (SteamFix + EpicFix packaged in releases).
 """
 
 from __future__ import annotations
@@ -887,8 +887,8 @@ def _ensure_freetp_ack_folder(
 
 def write_epic_fix_ini(path: Path) -> None:
     # FreeTP EpicFix: NoAuth=0 → ShellExecute browser auth (often freetp.org).
-    # Use numeric 1 — some builds parse true/false poorly.
-    path.write_text("[EOS]\nNoAuth=1\nDeviceAuth=true\n", encoding="utf-8")
+    # Use numeric 1 — some builds parse true/false poorly (NoAuth=true can fail).
+    path.write_bytes(b"[EOS]\r\nNoAuth=1\r\nDeviceAuth=true\r\n")
 
 
 def write_winmm_txt(path: Path, *, include_epic: bool) -> None:
@@ -897,6 +897,33 @@ def write_winmm_txt(path: Path, *, include_epic: bool) -> None:
     if include_epic:
         lines.append("EpicFix64.dll")
     path.write_bytes("\r\n".join(lines).encode("ascii"))
+
+
+def _ensure_epic_beside_eos(install_root: Path, kit: Path) -> int:
+    """Place EpicFix next to every EOSSDK*.dll (FreeTP Meccha: RedpointEOS/).
+
+    SteamFix+EpicFix in Binaries/Win64 alone is not enough — Redpoint loads
+    EOSSDK from its own folder and needs EpicFix64.dll beside it, or Join/Play
+    hits a null EOS session and CTDs (UE EXCEPTION_ACCESS_VIOLATION).
+    """
+    if not (kit / "EpicFix64.dll").is_file():
+        return 0
+    placed = 0
+    try:
+        eos_dlls = list(install_root.rglob("EOSSDK*.dll"))
+    except OSError:
+        return 0
+    for eos_dll in eos_dlls:
+        if _skip_overlay_path(eos_dll):
+            continue
+        eos_dir = eos_dll.parent
+        try:
+            _copy_file_best_effort(kit / "EpicFix64.dll", eos_dir / "EpicFix64.dll")
+            write_epic_fix_ini(eos_dir / "EpicFix.ini")
+            placed += 1
+        except OSError as exc:
+            sys.stderr.write(f"online_fix: EpicFix beside {eos_dll.name}: {exc}\n")
+    return placed
 
 
 def _cleanup_stray_root_overlay(install_root: Path, primary: Path) -> None:
@@ -1061,20 +1088,25 @@ def embed_online_fix(
                 # Do NOT copy FreeTP/.hash — it is path-bound and causes promo opens.
                 donor = _find_freetp_overlay_dir_for_appid(str(appid), settings)
                 if donor is not None and donor.resolve() != target.resolve():
-                    for name in ("SteamFix.ini", "winmm.txt", "SteamFix64.dll", "winmm.dll", "SteamFix32.dll"):
+                    for name in (
+                        "SteamFix.ini",
+                        "winmm.txt",
+                        "SteamFix64.dll",
+                        "winmm.dll",
+                        "SteamFix32.dll",
+                        "EpicFix64.dll",
+                        "EpicFix.ini",
+                    ):
                         src = donor / name
                         if src.is_file():
                             _copy_file_best_effort(src, target / name)
                 else:
                     write_steam_fix_ini(target / "SteamFix.ini", str(appid), workshop=workshop)
-                    write_winmm_txt(target / "winmm.txt", include_epic=use_epic)
                     _copy_file_best_effort(kit / "SteamFix64.dll", target / "SteamFix64.dll")
                     _copy_file_best_effort(kit / "winmm.dll", target / "winmm.dll")
                     if (kit / "SteamFix32.dll").is_file():
                         _copy_file_best_effort(kit / "SteamFix32.dll", target / "SteamFix32.dll")
 
-                if use_epic:
-                    write_epic_fix_ini(target / "EpicFix.ini")
                 # FreeTP + winmm/SteamFix: no steam_appid.txt.
                 # Non-winmm Steamworks (.NET tools): keep steam_appid.txt=480 (written below).
                 game_exe = _find_launch_exe_for_overlay(target)
@@ -1098,18 +1130,23 @@ def embed_online_fix(
                 elif needs_appid_file:
                     _write_fake_steam_appid(target, "480")
 
-                if use_epic:
-                    _copy_file_best_effort(kit / "EpicFix64.dll", target / "EpicFix64.dll")
-                    write_epic_fix_ini(target / "EpicFix.ini")
-                    for eos_dll in root.rglob("EOSSDK*.dll"):
-                        if _skip_overlay_path(eos_dll):
-                            continue
-                        eos_dir = eos_dll.parent
-                        try:
-                            _copy_file_best_effort(kit / "EpicFix64.dll", eos_dir / "EpicFix64.dll")
-                            write_epic_fix_ini(eos_dir / "EpicFix.ini")
-                        except OSError:
-                            pass
+            # Always refresh loader list + EpicFix — even when SteamFix was already present.
+            # A prior "complete" Win64 overlay used to skip RedpointEOS sidecars (Meccha Join CTD).
+            write_winmm_txt(target / "winmm.txt", include_epic=use_epic)
+            if use_epic:
+                epic_src = kit / "EpicFix64.dll"
+                donor_epic = target / "EpicFix64.dll"
+                if epic_src.is_file():
+                    _copy_file_best_effort(epic_src, target / "EpicFix64.dll")
+                elif not donor_epic.is_file():
+                    return {
+                        "ok": False,
+                        "error": "EpicFix64.dll missing from kit and overlay target",
+                        "applied": applied,
+                        "analysis": analysis,
+                    }
+                write_epic_fix_ini(target / "EpicFix.ini")
+                _ensure_epic_beside_eos(root, kit if (kit / "EpicFix64.dll").is_file() else target)
 
             _ensure_freetp_ack_folder(target, str(appid), settings, plugin_root)
             applied.append(str(target))
