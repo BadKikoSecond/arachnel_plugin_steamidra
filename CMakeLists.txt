@@ -11,6 +11,11 @@ if(NOT DEFINED ARACHNEL_SDK_DIR)
         set(ARACHNEL_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Arachnel")
     endif()
 endif()
+# Prefer sibling Arachnel checkout used in this workspace layout.
+if(NOT EXISTS "${ARACHNEL_SDK_DIR}/cmake/ArachnelPluginSdk.cmake"
+   AND EXISTS "D:/Work/Arachnel/cmake/ArachnelPluginSdk.cmake")
+    set(ARACHNEL_SDK_DIR "D:/Work/Arachnel")
+endif()
 cmake_path(ABSOLUTE_PATH ARACHNEL_SDK_DIR NORMALIZE)
 
 find_package(Qt6 REQUIRED COMPONENTS Core Network)
@@ -21,7 +26,11 @@ arachnel_plugin_sdk_init(${ARACHNEL_SDK_DIR})
 add_library(steamidra_plugin SHARED
     src/plugin_entry.cpp
     src/steamidra_plugin.cpp
-    src/worker_bridge.cpp
+    src/http_client.cpp
+    src/plugin_settings.cpp
+    src/catalog_sync.cpp
+    src/online_fix_embed.cpp
+    src/install_pipeline.cpp
 )
 
 target_include_directories(steamidra_plugin PRIVATE src)
@@ -57,12 +66,7 @@ set(_TP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/${_TP_OS}")
 arachnel_stage_plugin_bundle(steamidra_plugin steamidra "${_PLUGIN_BUNDLE_DIR}")
 
 add_custom_command(TARGET steamidra_plugin POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E rm -rf
-        "${CMAKE_CURRENT_SOURCE_DIR}/worker/__pycache__"
-        "${_PLUGIN_BUNDLE_DIR}/worker"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/worker"
-        "${_PLUGIN_BUNDLE_DIR}/worker"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${_PLUGIN_BUNDLE_DIR}/worker"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/config"
         "${_PLUGIN_BUNDLE_DIR}/config"
@@ -90,9 +94,20 @@ add_custom_command(TARGET steamidra_plugin POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/_staging_steamidra_arach"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_ARACH_STAGING}"
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${_PLUGIN_BUNDLE_DIR}" "${_ARACH_STAGING}"
-    COMMENT "Stage steamidra worker + OS third_party (${_TP_OS})"
+    COMMENT "Stage steamidra config + OS third_party (${_TP_OS}) — no Python worker"
 )
 
 arachnel_package_plugin_arach(steamidra_plugin steamidra "${_ARACH_STAGING}" "${_ARACH}")
 
 add_custom_target(steamidra_arach ALL DEPENDS steamidra_plugin)
+
+# Dev smoke tool (catalog + relay + optional Meccha embed)
+add_executable(steamidra_smoke
+    src/http_client.cpp
+    src/plugin_settings.cpp
+    src/catalog_sync.cpp
+    src/online_fix_embed.cpp
+    tools/smoke_cpp_runtime.cpp
+)
+target_include_directories(steamidra_smoke PRIVATE src)
+target_link_libraries(steamidra_smoke PRIVATE arachnel_plugin_sdk Qt6::Core Qt6::Network)

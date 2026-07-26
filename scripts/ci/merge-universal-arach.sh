@@ -31,7 +31,7 @@ MERGED="${STAGING}/merged/steamidra"
 cp -a "${WIN}/." "${MERGED}/"
 rm -rf "${MERGED}/Release" "${MERGED}/Debug" "${MERGED}/RelWithDebInfo" "${MERGED}/MinSizeRel"
 
-# Keep platform runtimes separate; the worker selects the current OS.
+# Keep platform runtimes separate; C++ plugin selects the current OS.
 rm -rf "${MERGED}/third_party"
 mkdir -p "${MERGED}/third_party/windows" "${MERGED}/third_party/linux"
 cp -a "${WIN}/third_party/." "${MERGED}/third_party/windows/"

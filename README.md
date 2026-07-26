@@ -62,9 +62,10 @@ Fetch before release builds:
 ## Requirements
 
 - CMake 3.20+, C++20, Qt 6.8+ (Core, Network), Ninja
-- Python 3.10+ on PATH
-- Arachnel checkout (`ARACHNEL_SDK_DIR`)
+- Arachnel checkout (`ARACHNEL_SDK_DIR`) — **no Python required at runtime**
 - **Steam optional** for download; recommended for library / Proton launch
+
+Runtime is fully self-contained: DepotDownloaderMod + .NET 9 + Online Fix kit are bundled. Python is only used in CI/dev for catalog rebuild tools.
 
 ## Build & install
 

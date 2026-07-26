@@ -51,7 +51,6 @@ public:
     void cancelOwnedDownload(const QString& jobId) const override;
 
 private:
-    QString workerScriptPath() const;
     QString settingsPath() const;
     QString catalogCachePath() const;
     void ensureCatalogSeeded() const;

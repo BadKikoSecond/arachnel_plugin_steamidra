@@ -26,3 +26,12 @@ third_party/windows/DDMod/*.exe
 # Local GitLab Runner (must not be committed)
 /config.toml
 
+
+# Local build trees
+build-*/
+build-cpp/
+build-msvc/
+build-linux-wsl/
+build-ci-*/
+dist/
+.ci/

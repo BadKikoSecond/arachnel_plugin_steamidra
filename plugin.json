@@ -1,10 +1,10 @@
 {
   "id": "steamidra",
   "name": "Steam",
-  "version": "0.3.38",
+  "version": "0.4.1",
   "apiVersion": 3,
   "library": "steamidra_plugin",
   "iconName": "stadia_controller",
-  "description": "Steam depot installs via Arachnel Ryuu relay (manifests + fixes as addons)",
+  "description": "Steam depot installs via Arachnel Ryuu relay (self-contained C++, no Python)",
   "catalogUrl": "https://ryuu.badkiko.ru/v1/catalog"
 }

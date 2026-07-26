@@ -13,8 +13,8 @@ cmake --build "$BUILD" --target steamidra_arach
 BUNDLE="$BUILD/plugin-bundle"
 # POST_BUILD may skip when the DLL is unchanged — always refresh loose assets.
 cp -f "$ROOT/plugin.json" "$BUNDLE/plugin.json"
+# Runtime is C++ only — do not ship Python worker.
 rm -rf "$BUNDLE/worker"
-cp -a "$ROOT/worker" "$BUNDLE/worker"
 if [[ -d "$ROOT/config" ]]; then
   cp -a "$ROOT/config/." "$BUNDLE/config/"
 fi

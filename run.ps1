@@ -72,10 +72,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $bundle = Join-Path $buildPath "plugin-bundle"
 # POST_BUILD may skip when the DLL is unchanged — always refresh loose assets.
 Copy-Item -Force (Join-Path $Root "plugin.json") (Join-Path $bundle "plugin.json")
+# Runtime is C++ only — do not ship Python worker.
 if (Test-Path (Join-Path $bundle "worker")) {
     Remove-Item -Recurse -Force (Join-Path $bundle "worker")
 }
-Copy-Item -Recurse -Force (Join-Path $Root "worker") (Join-Path $bundle "worker")
 if (Test-Path (Join-Path $Root "config")) {
     Copy-Item -Recurse -Force (Join-Path $Root "config") (Join-Path $bundle "config")
 }
