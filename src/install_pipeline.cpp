@@ -157,41 +157,66 @@ LuaParsed parseLua(const QString& text)
     return out;
 }
 
+/** Extract .lua / .manifest from a ZIP in memory (no zip on disk — Defender MalUri).
+ *  Handles store (method 0); deflated entries are skipped (Ryuu packs store). */
+bool extractRelayZipMemory(const QByteArray& raw, const QString& staging, QString* luaOut)
+{
+    if (raw.size() < 30 || raw[0] != 'P' || raw[1] != 'K')
+        return false;
+    QDir().mkpath(staging);
+    bool wrote = false;
+    int pos = 0;
+    while (pos + 30 <= raw.size()) {
+        const auto u16 = [&](int off) -> quint16 {
+            return quint16(quint8(raw[pos + off])) | (quint16(quint8(raw[pos + off + 1])) << 8);
+        };
+        const auto u32 = [&](int off) -> quint32 {
+            return quint32(u16(off)) | (quint32(u16(off + 2)) << 16);
+        };
+        if (u32(0) != 0x04034b50u)
+            break;
+        const quint16 method = u16(8);
+        const quint32 compSize = u32(18);
+        const quint32 uncompSize = u32(22);
+        const quint16 nameLen = u16(26);
+        const quint16 extraLen = u16(28);
+        const int dataOff = pos + 30 + nameLen + extraLen;
+        if (dataOff < 0 || dataOff + int(compSize) > raw.size())
+            break;
+        const QString name = QString::fromUtf8(raw.constData() + pos + 30, nameLen);
+        const QString base = QFileInfo(name).fileName().toLower();
+        pos = dataOff + int(compSize);
+        if (method != 0 || compSize != uncompSize)
+            continue; // only stored entries
+        if (!base.endsWith(QStringLiteral(".lua")) && !base.endsWith(QStringLiteral(".manifest")))
+            continue;
+        const QByteArray data = raw.mid(dataOff, int(compSize));
+        if (base.endsWith(QStringLiteral(".lua")) && luaOut && luaOut->isEmpty())
+            *luaOut = QString::fromUtf8(data);
+        if (base.endsWith(QStringLiteral(".manifest"))) {
+            QFile out(staging + QLatin1Char('/') + QFileInfo(name).fileName());
+            if (out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                out.write(data);
+                wrote = true;
+            }
+        } else if (base.endsWith(QStringLiteral(".lua"))) {
+            QFile out(staging + QLatin1Char('/') + QFileInfo(name).fileName());
+            if (out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                out.write(data);
+            wrote = true;
+        }
+    }
+    return wrote || (luaOut && !luaOut->isEmpty());
+}
+
 QString extractLuaFromBytes(const QByteArray& raw, const QString& staging)
 {
     QDir().mkpath(staging);
     if (raw.size() >= 2 && raw[0] == 'P' && raw[1] == 'K') {
-        // Avoid a "*.zip" name in %TEMP%: Defender often quarantines relay payloads as MalUri.
-        const QString zipPath = staging + QStringLiteral("/_relay_payload.bin");
-        QFile zf(zipPath);
-        if (!zf.open(QIODevice::WriteOnly))
-            return {};
-        zf.write(raw);
-        zf.close();
-        const QString extractDir = staging + QStringLiteral("/_zip");
-        QDir().mkpath(extractDir);
-        const bool ok = extractZipToDir(zipPath, extractDir);
-        QFile::remove(zipPath);
-        if (!ok)
-            return {};
         QString luaText;
-        QDirIterator it(extractDir, QDir::Files, QDirIterator::Subdirectories);
-        while (it.hasNext()) {
-            it.next();
-            const QString lower = it.fileName().toLower();
-            QFile f(it.filePath());
-            if (!f.open(QIODevice::ReadOnly))
-                continue;
-            const QByteArray data = f.readAll();
-            if (lower.endsWith(QStringLiteral(".lua")) && luaText.isEmpty())
-                luaText = QString::fromUtf8(data);
-            if (lower.endsWith(QStringLiteral(".manifest"))) {
-                QFile out(staging + QLatin1Char('/') + it.fileName());
-                if (out.open(QIODevice::WriteOnly))
-                    out.write(data);
-            }
-        }
-        return luaText;
+        if (extractRelayZipMemory(raw, staging, &luaText))
+            return luaText;
+        return {};
     }
     const QString text = QString::fromUtf8(raw);
     if (text.toLower().contains(QStringLiteral("addappid")))
@@ -210,47 +235,82 @@ QString fetchLua(const QString& appid, const PluginSettings& settings, const QSt
         headers.insert(QStringLiteral("X-Arachnel-Token"), settings.relayClientToken);
 
     QStringList errors;
-    for (const QString& fileType : {QStringLiteral("lua"), QStringLiteral("manifest")}) {
-        emitProgress(onProgress, 0, QStringLiteral("Relay (%1)…").arg(fileType));
+    QString luaText;
+
+    emitProgress(onProgress, 0, QStringLiteral("Relay (lua)…"));
+    {
         QString err;
         const QByteArray raw =
-            httpGet(QStringLiteral("%1/v1/download/%2?file_type=%3").arg(relay, appid, fileType),
-                    120000, headers, &err);
+            httpGet(QStringLiteral("%1/v1/download/%2?file_type=lua").arg(relay, appid), 120000,
+                    headers, &err);
         if (raw.isEmpty()) {
-            errors.append(QStringLiteral("relay %1: %2").arg(fileType, err));
-            continue;
-        }
-        if (fileType == QStringLiteral("lua")) {
+            errors.append(QStringLiteral("relay lua: %1").arg(err));
+        } else {
             const QString text = QString::fromUtf8(raw);
             if (!text.toLower().contains(QStringLiteral("addappid"))) {
                 errors.append(QStringLiteral("relay lua: invalid"));
-                continue;
+            } else {
+                luaText = text;
+                QFile f(staging + QLatin1Char('/') + appid + QStringLiteral(".lua"));
+                if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                    f.write(text.toUtf8());
             }
-            QFile f(staging + QLatin1Char('/') + appid + QStringLiteral(".lua"));
-            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
-                f.write(text.toUtf8());
-            const bool hasMf = !QDir(staging).entryList({QStringLiteral("*.manifest")}, QDir::Files).isEmpty();
-            const LuaParsed probe = parseLua(text);
-            // Empty manifests is OK: DepotDownloader then takes the latest public build
-            // (Ryuu often comments out stale setManifestid on purpose).
-            if (hasMf || !probe.depots.isEmpty() || !probe.manifests.isEmpty())
-                return text;
-            errors.append(QStringLiteral("relay lua: no depots/manifests"));
-            continue;
         }
-        const QString lua = extractLuaFromBytes(raw, staging);
-        const bool hasMf = !QDir(staging).entryList({QStringLiteral("*.manifest")}, QDir::Files).isEmpty();
-        const LuaParsed probe = parseLua(lua);
-        if (!lua.isEmpty()
-            && (hasMf || !probe.depots.isEmpty() || !probe.manifests.isEmpty()))
-            return lua;
-        errors.append(lua.isEmpty() ? QStringLiteral("relay zip: no lua")
-                                    : QStringLiteral("relay zip: lua without depots/manifests"));
     }
+
+    // Anonymous Steam CDN 401s without a local -manifestfile. Always pull the
+    // relay zip (in memory — writing it triggers Defender MalUri) for *.manifest.
+    emitProgress(onProgress, 0, QStringLiteral("Relay (manifest)…"));
+    {
+        QString err;
+        const QByteArray raw =
+            httpGet(QStringLiteral("%1/v1/download/%2?file_type=manifest").arg(relay, appid),
+                    120000, headers, &err);
+        if (raw.isEmpty()) {
+            errors.append(QStringLiteral("relay manifest: %1").arg(err));
+        } else {
+            QString zipLua;
+            if (!extractRelayZipMemory(raw, staging, &zipLua)) {
+                errors.append(QStringLiteral("relay zip: extract failed"));
+            } else if (luaText.isEmpty() && !zipLua.isEmpty()) {
+                luaText = zipLua;
+            }
+        }
+    }
+
+    if (!luaText.isEmpty()) {
+        const LuaParsed probe = parseLua(luaText);
+        const bool hasMf =
+            !QDir(staging).entryList({QStringLiteral("*.manifest")}, QDir::Files).isEmpty();
+        if (hasMf || !probe.depots.isEmpty() || !probe.manifests.isEmpty())
+            return luaText;
+        errors.append(QStringLiteral("relay: lua without depots/manifests"));
+    }
+
     throw std::runtime_error(
         QStringLiteral("Relay could not prepare app %1 (%2). Check https://ryuu.badkiko.ru")
             .arg(appid, errors.join(QStringLiteral("; ")))
             .toStdString());
+}
+
+void adoptStagingManifests(const QString& staging, LuaParsed& parsed)
+{
+    for (const QString& name : QDir(staging).entryList({QStringLiteral("*.manifest")}, QDir::Files)) {
+        const QString stem = QFileInfo(name).completeBaseName();
+        const int us = stem.indexOf(QLatin1Char('_'));
+        if (us <= 0)
+            continue;
+        const QString depotId = stem.left(us);
+        const QString mid = stem.mid(us + 1);
+        bool ok1 = false, ok2 = false;
+        depotId.toLongLong(&ok1);
+        mid.toLongLong(&ok2);
+        if (!ok1 || !ok2)
+            continue;
+        // Lua active setManifestid wins; otherwise take relay file (needed for -manifestfile).
+        if (!parsed.manifests.contains(depotId))
+            parsed.manifests.insert(depotId, mid);
+    }
 }
 
 void filterPrimaryDepots(const QString& appid, LuaParsed& parsed, bool includeDlc)
@@ -419,10 +479,23 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
         }
         log += proc.readAll();
         if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
-            QString err = QString::fromUtf8(log).trimmed().right(800);
-            err.replace(QLatin1Char('\n'), QLatin1Char(' '));
+            const QString full = QString::fromUtf8(log);
+            QString err;
+            for (const QString& line : full.split(QLatin1Char('\n'))) {
+                const QString t = line.trimmed();
+                if (t.contains(QStringLiteral("401"), Qt::CaseInsensitive)
+                    || t.contains(QStringLiteral("Unable"), Qt::CaseInsensitive)
+                    || t.contains(QStringLiteral("Error"), Qt::CaseInsensitive)
+                    || t.contains(QStringLiteral("failed"), Qt::CaseInsensitive)
+                    || t.contains(QStringLiteral("Aborting"), Qt::CaseInsensitive)) {
+                    err += t + QLatin1Char(' ');
+                }
+            }
             if (err.isEmpty())
-                err = QStringLiteral("exit %1 (no output — often stale TEMP manifests or AV lock)")
+                err = full.trimmed();
+            err = err.simplified().right(600);
+            if (err.isEmpty())
+                err = QStringLiteral("exit %1 (no output — often missing -manifestfile / AV lock)")
                           .arg(proc.exitCode());
             throw std::runtime_error(
                 QStringLiteral("DepotDownloader failed for depot %1: %2")
@@ -616,30 +689,9 @@ InstallPipelineResult runInstallPipeline(
         emitProgress(onProgress, 0, QStringLiteral("Getting game info…"));
         const QString lua = fetchLua(appid, settings, staging.path(), onProgress);
         LuaParsed parsed = parseLua(lua);
-        // If lua has no active (uncommented) setManifestid, Ryuu wants "latest" —
-        // do not re-pin from stale *.manifest files inside the relay zip (that caused
-        // Meccha staying on 3.0.0 while Steam/catalog already showed 3.3.0).
-        if (parsed.manifests.isEmpty()) {
-            for (const QString& name :
-                 QDir(staging.path()).entryList({QStringLiteral("*.manifest")}, QDir::Files)) {
-                QFile::remove(staging.path() + QLatin1Char('/') + name);
-            }
-        } else {
-            for (const QString& name :
-                 QDir(staging.path()).entryList({QStringLiteral("*.manifest")}, QDir::Files)) {
-                const QString stem = QFileInfo(name).completeBaseName();
-                const int us = stem.indexOf(QLatin1Char('_'));
-                if (us <= 0)
-                    continue;
-                const QString depotId = stem.left(us);
-                const QString mid = stem.mid(us + 1);
-                bool ok1 = false, ok2 = false;
-                depotId.toLongLong(&ok1);
-                mid.toLongLong(&ok2);
-                if (ok1 && ok2)
-                    parsed.manifests.insert(depotId, mid);
-            }
-        }
+        // Local *.manifest from Ryuu are required: anonymous Steam returns 401 without
+        // -manifestfile. Prefer active (uncommented) setManifestid from lua when present.
+        adoptStagingManifests(staging.path(), parsed);
         filterPrimaryDepots(appid, parsed, settings.includeDlc);
         if (!steam.isEmpty()) {
             QDir().mkpath(steam + QStringLiteral("/config/stplug-in"));
