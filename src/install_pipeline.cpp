@@ -128,18 +128,31 @@ LuaParsed parseLua(const QString& text)
     static const QRegularExpression manRe(
         QStringLiteral(R"(setManifestid\(\s*(\d+)\s*,\s*["']?(\d+)["']?\s*(?:,|\)))"),
         QRegularExpression::CaseInsensitiveOption);
-    auto it = addRe.globalMatch(text);
-    while (it.hasNext()) {
-        const QRegularExpressionMatch m = it.next();
-        const QString depotId = m.captured(1);
-        const QString key = m.captured(3).toLower();
-        if (!key.isEmpty())
-            out.depots.insert(depotId, key);
-    }
-    auto it2 = manRe.globalMatch(text);
-    while (it2.hasNext()) {
-        const QRegularExpressionMatch m = it2.next();
-        out.manifests.insert(m.captured(1), m.captured(2));
+
+    // Ryuu / Hubcap often leave stale setManifestid lines commented with `--`.
+    // Matching those pins DepotDownloader to an old build (e.g. Meccha 3.0.0 vs 3.3.0).
+    const QStringList lines = text.split(QLatin1Char('\n'));
+    for (QString line : lines) {
+        const int comment = line.indexOf(QStringLiteral("--"));
+        if (comment >= 0)
+            line = line.left(comment);
+        line = line.trimmed();
+        if (line.isEmpty())
+            continue;
+
+        auto it = addRe.globalMatch(line);
+        while (it.hasNext()) {
+            const QRegularExpressionMatch m = it.next();
+            const QString depotId = m.captured(1);
+            const QString key = m.captured(3).toLower();
+            if (!key.isEmpty())
+                out.depots.insert(depotId, key);
+        }
+        auto it2 = manRe.globalMatch(line);
+        while (it2.hasNext()) {
+            const QRegularExpressionMatch m = it2.next();
+            out.manifests.insert(m.captured(1), m.captured(2));
+        }
     }
     return out;
 }
@@ -214,18 +227,22 @@ QString fetchLua(const QString& appid, const PluginSettings& settings, const QSt
             if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
                 f.write(text.toUtf8());
             const bool hasMf = !QDir(staging).entryList({QStringLiteral("*.manifest")}, QDir::Files).isEmpty();
-            if (hasMf || text.toLower().contains(QStringLiteral("setmanifestid")))
+            const LuaParsed probe = parseLua(text);
+            // Empty manifests is OK: DepotDownloader then takes the latest public build
+            // (Ryuu often comments out stale setManifestid on purpose).
+            if (hasMf || !probe.depots.isEmpty() || !probe.manifests.isEmpty())
                 return text;
-            errors.append(QStringLiteral("relay lua: no manifests"));
+            errors.append(QStringLiteral("relay lua: no depots/manifests"));
             continue;
         }
         const QString lua = extractLuaFromBytes(raw, staging);
         const bool hasMf = !QDir(staging).entryList({QStringLiteral("*.manifest")}, QDir::Files).isEmpty();
+        const LuaParsed probe = parseLua(lua);
         if (!lua.isEmpty()
-            && (hasMf || lua.toLower().contains(QStringLiteral("setmanifestid"))))
+            && (hasMf || !probe.depots.isEmpty() || !probe.manifests.isEmpty()))
             return lua;
         errors.append(lua.isEmpty() ? QStringLiteral("relay zip: no lua")
-                                    : QStringLiteral("relay zip: lua without manifests"));
+                                    : QStringLiteral("relay zip: lua without depots/manifests"));
     }
     throw std::runtime_error(
         QStringLiteral("Relay could not prepare app %1 (%2). Check https://ryuu.badkiko.ru")
