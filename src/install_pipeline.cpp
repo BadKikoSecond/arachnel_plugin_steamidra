@@ -207,7 +207,7 @@ QString fetchLua(const QString& appid, const PluginSettings& settings, const QSt
         headers.insert(QStringLiteral("X-Arachnel-Token"), settings.relayClientToken);
 
     QStringList errors;
-    for (const QString& fileType : {QStringLiteral("manifest"), QStringLiteral("lua")}) {
+    for (const QString& fileType : {QStringLiteral("lua"), QStringLiteral("manifest")}) {
         emitProgress(onProgress, 0, QStringLiteral("Relay (%1)…").arg(fileType));
         QString err;
         const QByteArray raw =
@@ -368,20 +368,21 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
         if (parsed.manifests.contains(depotId))
             args << QStringLiteral("-manifest") << parsed.manifests.value(depotId);
 
-        // Prefer local normalized manifest in temp
-        const QString localMf =
-            QDir::tempPath()
-            + QStringLiteral("/arachnel_dd_%1.manifest").arg(depotId);
-        QString stagingMf;
+        // Prefer local normalized manifest in temp only when lua actually pins this depot.
+        // Leftover arachnel_dd_*.manifest from older installs must not override "latest".
         if (parsed.manifests.contains(depotId)) {
-            stagingMf = QDir::tempPath()
-                        + QStringLiteral("/%1_%2.manifest")
-                              .arg(depotId, parsed.manifests.value(depotId));
+            const QString localMf =
+                QDir::tempPath()
+                + QStringLiteral("/arachnel_dd_%1.manifest").arg(depotId);
+            const QString stagingMf =
+                QDir::tempPath()
+                + QStringLiteral("/%1_%2.manifest")
+                      .arg(depotId, parsed.manifests.value(depotId));
+            if (QFileInfo::exists(localMf))
+                args << QStringLiteral("-manifestfile") << localMf;
+            else if (QFileInfo::exists(stagingMf))
+                args << QStringLiteral("-manifestfile") << stagingMf;
         }
-        if (QFileInfo::exists(localMf))
-            args << QStringLiteral("-manifestfile") << localMf;
-        else if (!stagingMf.isEmpty() && QFileInfo::exists(stagingMf))
-            args << QStringLiteral("-manifestfile") << stagingMf;
 
         QProcess proc;
         QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
@@ -606,19 +607,29 @@ InstallPipelineResult runInstallPipeline(
         emitProgress(onProgress, 0, QStringLiteral("Getting game info…"));
         const QString lua = fetchLua(appid, settings, staging.path(), onProgress);
         LuaParsed parsed = parseLua(lua);
-        for (const QString& name :
-             QDir(staging.path()).entryList({QStringLiteral("*.manifest")}, QDir::Files)) {
-            const QString stem = QFileInfo(name).completeBaseName();
-            const int us = stem.indexOf(QLatin1Char('_'));
-            if (us <= 0)
-                continue;
-            const QString depotId = stem.left(us);
-            const QString mid = stem.mid(us + 1);
-            bool ok1 = false, ok2 = false;
-            depotId.toLongLong(&ok1);
-            mid.toLongLong(&ok2);
-            if (ok1 && ok2)
-                parsed.manifests.insert(depotId, mid);
+        // If lua has no active (uncommented) setManifestid, Ryuu wants "latest" —
+        // do not re-pin from stale *.manifest files inside the relay zip (that caused
+        // Meccha staying on 3.0.0 while Steam/catalog already showed 3.3.0).
+        if (parsed.manifests.isEmpty()) {
+            for (const QString& name :
+                 QDir(staging.path()).entryList({QStringLiteral("*.manifest")}, QDir::Files)) {
+                QFile::remove(staging.path() + QLatin1Char('/') + name);
+            }
+        } else {
+            for (const QString& name :
+                 QDir(staging.path()).entryList({QStringLiteral("*.manifest")}, QDir::Files)) {
+                const QString stem = QFileInfo(name).completeBaseName();
+                const int us = stem.indexOf(QLatin1Char('_'));
+                if (us <= 0)
+                    continue;
+                const QString depotId = stem.left(us);
+                const QString mid = stem.mid(us + 1);
+                bool ok1 = false, ok2 = false;
+                depotId.toLongLong(&ok1);
+                mid.toLongLong(&ok2);
+                if (ok1 && ok2)
+                    parsed.manifests.insert(depotId, mid);
+            }
         }
         filterPrimaryDepots(appid, parsed, settings.includeDlc);
         if (!steam.isEmpty()) {
@@ -627,7 +638,8 @@ InstallPipelineResult runInstallPipeline(
             if (luaOut.open(QIODevice::WriteOnly | QIODevice::Truncate))
                 luaOut.write(lua.toUtf8());
         }
-        copyManifestsFromStaging(staging.path());
+        if (!parsed.manifests.isEmpty())
+            copyManifestsFromStaging(staging.path());
 
         QString depotOs = settings.depotOs;
         if (depotOs.isEmpty())
