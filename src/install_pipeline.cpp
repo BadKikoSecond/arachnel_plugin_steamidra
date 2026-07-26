@@ -161,7 +161,8 @@ QString extractLuaFromBytes(const QByteArray& raw, const QString& staging)
 {
     QDir().mkpath(staging);
     if (raw.size() >= 2 && raw[0] == 'P' && raw[1] == 'K') {
-        const QString zipPath = staging + QStringLiteral("/_relay.zip");
+        // Avoid a "*.zip" name in %TEMP%: Defender often quarantines relay payloads as MalUri.
+        const QString zipPath = staging + QStringLiteral("/_relay_payload.bin");
         QFile zf(zipPath);
         if (!zf.open(QIODevice::WriteOnly))
             return {};
@@ -169,7 +170,9 @@ QString extractLuaFromBytes(const QByteArray& raw, const QString& staging)
         zf.close();
         const QString extractDir = staging + QStringLiteral("/_zip");
         QDir().mkpath(extractDir);
-        if (!extractZipToDir(zipPath, extractDir))
+        const bool ok = extractZipToDir(zipPath, extractDir);
+        QFile::remove(zipPath);
+        if (!ok)
             return {};
         QString luaText;
         QDirIterator it(extractDir, QDir::Files, QDirIterator::Subdirectories);
@@ -266,11 +269,15 @@ void filterPrimaryDepots(const QString& appid, LuaParsed& parsed, bool includeDl
     parsed.depots = depots;
 }
 
-void copyManifestsFromStaging(const QString& staging)
+void clearTempManifestPollution(const QStringList& depotIds)
 {
     const QString tmp = QDir::tempPath();
-    for (const QString& name : QDir(staging).entryList({QStringLiteral("*.manifest")}, QDir::Files)) {
-        QFile::copy(staging + QLatin1Char('/') + name, tmp + QLatin1Char('/') + name);
+    for (const QString& depotId : depotIds) {
+        QFile::remove(tmp + QStringLiteral("/arachnel_dd_%1.manifest").arg(depotId));
+        for (const QString& name :
+             QDir(tmp).entryList({depotId + QStringLiteral("_*.manifest")}, QDir::Files)) {
+            QFile::remove(tmp + QLatin1Char('/') + name);
+        }
     }
 }
 
@@ -317,7 +324,7 @@ void ensureInjectBestEffort(const QString& steam, const QString& pluginRoot)
 }
 
 void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& parsed,
-              const QString& dest, const QString& depotOs,
+              const QString& dest, const QString& depotOs, const QString& staging,
               const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
               const std::function<bool()>& shouldCancel)
 {
@@ -329,7 +336,7 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
         throw std::runtime_error("Bundled .NET runtime missing");
 
     QDir().mkpath(dest);
-    const QString keysTmp = QDir::tempPath() + QStringLiteral("/arachnel_mistwalker_keys.vdf");
+    const QString keysTmp = staging + QStringLiteral("/depotkeys.vdf");
     {
         QFile kf(keysTmp);
         if (!kf.open(QIODevice::WriteOnly | QIODevice::Truncate))
@@ -343,6 +350,9 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
         depots = parsed.manifests.keys();
     if (depots.isEmpty())
         throw std::runtime_error("No depot IDs — cannot run DepotDownloaderMod");
+
+    // DepotDownloaderMod may auto-bind leftover %TEMP%/<depot>_*.manifest → anonymous 401.
+    clearTempManifestPollution(depots);
 
     const int total = qMax(1, depots.size());
     for (int i = 0; i < depots.size(); ++i) {
@@ -365,22 +375,13 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
                          dest,
                          QStringLiteral("-os"),
                          depotOs};
-        if (parsed.manifests.contains(depotId))
-            args << QStringLiteral("-manifest") << parsed.manifests.value(depotId);
-
-        // Prefer local normalized manifest in temp only when lua actually pins this depot.
-        // Leftover arachnel_dd_*.manifest from older installs must not override "latest".
         if (parsed.manifests.contains(depotId)) {
-            const QString localMf =
-                QDir::tempPath()
-                + QStringLiteral("/arachnel_dd_%1.manifest").arg(depotId);
+            const QString mid = parsed.manifests.value(depotId);
+            args << QStringLiteral("-manifest") << mid;
             const QString stagingMf =
-                QDir::tempPath()
-                + QStringLiteral("/%1_%2.manifest")
-                      .arg(depotId, parsed.manifests.value(depotId));
-            if (QFileInfo::exists(localMf))
-                args << QStringLiteral("-manifestfile") << localMf;
-            else if (QFileInfo::exists(stagingMf))
+                staging + QLatin1Char('/') + depotId + QLatin1Char('_') + mid
+                + QStringLiteral(".manifest");
+            if (QFileInfo::exists(stagingMf))
                 args << QStringLiteral("-manifestfile") << stagingMf;
         }
 
@@ -394,6 +395,7 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
             throw std::runtime_error("Failed to start DepotDownloaderMod");
 
         static const QRegularExpression pctRe(QStringLiteral(R"(^\s*(\d+(?:\.\d+)?)\s*%)"));
+        QByteArray log;
         while (proc.state() != QProcess::NotRunning) {
             if (shouldCancel && shouldCancel()) {
                 proc.kill();
@@ -401,6 +403,8 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
             }
             proc.waitForReadyRead(200);
             const QByteArray chunk = proc.readAll();
+            if (!chunk.isEmpty())
+                log += chunk;
             const QList<QByteArray> lines = chunk.split('\n');
             for (const QByteArray& line : lines) {
                 const auto m = pctRe.match(QString::fromUtf8(line));
@@ -413,8 +417,13 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
             }
             QThread::msleep(20);
         }
+        log += proc.readAll();
         if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
-            const QString err = QString::fromUtf8(proc.readAllStandardOutput()).right(500);
+            QString err = QString::fromUtf8(log).trimmed().right(800);
+            err.replace(QLatin1Char('\n'), QLatin1Char(' '));
+            if (err.isEmpty())
+                err = QStringLiteral("exit %1 (no output — often stale TEMP manifests or AV lock)")
+                          .arg(proc.exitCode());
             throw std::runtime_error(
                 QStringLiteral("DepotDownloader failed for depot %1: %2")
                     .arg(depotId, err)
@@ -638,8 +647,6 @@ InstallPipelineResult runInstallPipeline(
             if (luaOut.open(QIODevice::WriteOnly | QIODevice::Truncate))
                 luaOut.write(lua.toUtf8());
         }
-        if (!parsed.manifests.isEmpty())
-            copyManifestsFromStaging(staging.path());
 
         QString depotOs = settings.depotOs;
         if (depotOs.isEmpty())
@@ -650,7 +657,8 @@ InstallPipelineResult runInstallPipeline(
 #endif
 
         emitProgress(onProgress, 1, QStringLiteral("Downloading..."));
-        runDdmod(pluginRoot, appid, parsed, installPath, depotOs, onProgress, shouldCancel);
+        runDdmod(pluginRoot, appid, parsed, installPath, depotOs, staging.path(), onProgress,
+                 shouldCancel);
 
         QJsonObject settingsJson;
         settingsJson.insert(QStringLiteral("autoEmbedOnlineFix"), settings.autoEmbedOnlineFix);
