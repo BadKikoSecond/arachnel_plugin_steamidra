@@ -5,6 +5,7 @@
 
 #include <QDir>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -383,6 +384,9 @@ void ensureInjectBestEffort(const QString& steam, const QString& pluginRoot)
 #endif
 }
 
+bool processIoBytes(qint64 pid, qint64* readOut, qint64* writeOut);
+qint64 dirByteSize(const QString& path);
+
 void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& parsed,
               const QString& dest, const QString& depotOs, const QString& staging,
               const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
@@ -414,13 +418,19 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
     // DepotDownloaderMod may auto-bind leftover %TEMP%/<depot>_*.manifest → anonymous 401.
     clearTempManifestPollution(depots);
 
-    const int total = qMax(1, depots.size());
+    const int depotCount = qMax(1, depots.size());
+    qint64 completedWritten = 0;
+    qint64 totalHint = 0;
+    QElapsedTimer sizeTimer;
+    sizeTimer.start();
+
     for (int i = 0; i < depots.size(); ++i) {
         if (shouldCancel && shouldCancel())
             throw std::runtime_error("Cancelled");
         const QString depotId = depots.at(i);
-        const int basePct = qMax(1, int(99.0 * double(i) / double(total)));
-        emitProgress(onProgress, basePct, QStringLiteral("Downloading depot %1…").arg(depotId));
+        const int basePct = qMax(1, int(99.0 * double(i) / double(depotCount)));
+        emitProgress(onProgress, basePct, QStringLiteral("Downloading depot %1…").arg(depotId),
+                     QStringLiteral("downloading"), completedWritten, totalHint);
 
         QStringList args{dll,
                          QStringLiteral("-app"),
@@ -454,6 +464,14 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
         if (!proc.waitForStarted(30000))
             throw std::runtime_error("Failed to start DepotDownloaderMod");
 
+        qint64 readStart = 0, writeStart = 0;
+        const bool ioOk = processIoBytes(proc.processId(), &readStart, &writeStart);
+        qint64 procWrittenMax = 0;
+        double depotPeakLocal = 0.0;
+        QElapsedTimer emitTimer;
+        emitTimer.restart();
+        Q_UNUSED(readStart);
+
         static const QRegularExpression pctRe(QStringLiteral(R"(^\s*(\d+(?:\.\d+)?)\s*%)"));
         QByteArray log;
         while (proc.state() != QProcess::NotRunning) {
@@ -465,19 +483,45 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
             const QByteArray chunk = proc.readAll();
             if (!chunk.isEmpty())
                 log += chunk;
-            const QList<QByteArray> lines = chunk.split('\n');
-            for (const QByteArray& line : lines) {
+            for (const QByteArray& line : chunk.split('\n')) {
                 const auto m = pctRe.match(QString::fromUtf8(line));
-                if (m.hasMatch()) {
-                    const double local = m.captured(1).toDouble();
-                    const int overall =
-                        qBound(1, 99, int(99.0 * (double(i) + local / 100.0) / double(total)));
-                    emitProgress(onProgress, overall, QStringLiteral("Downloading..."));
-                }
+                if (m.hasMatch())
+                    depotPeakLocal = qMax(depotPeakLocal, qMin(100.0, m.captured(1).toDouble()));
             }
-            QThread::msleep(20);
+
+            if (emitTimer.elapsed() < 400)
+                continue;
+            emitTimer.restart();
+
+            if (ioOk) {
+                qint64 readNow = 0, writeNow = 0;
+                if (processIoBytes(proc.processId(), &readNow, &writeNow))
+                    procWrittenMax = qMax(procWrittenMax, qMax<qint64>(0, writeNow - writeStart));
+                Q_UNUSED(readNow);
+            }
+            // Logical size after SetLength = good total; do not use as downloaded.
+            if (sizeTimer.elapsed() >= 1000 || totalHint <= 0) {
+                totalHint = qMax(totalHint, dirByteSize(dest));
+                sizeTimer.restart();
+            }
+            const qint64 downloaded = completedWritten + procWrittenMax;
+            totalHint = qMax(totalHint, downloaded);
+            int overall =
+                qBound(1, 99, int(99.0 * (double(i) + depotPeakLocal / 100.0) / double(depotCount)));
+            if (totalHint >= 64LL * 1024 * 1024 && downloaded > 0)
+                overall = qBound(1, 99, int(downloaded * 99 / totalHint));
+            emitProgress(onProgress, overall, QStringLiteral("Downloading..."),
+                         QStringLiteral("downloading"), downloaded, totalHint);
         }
         log += proc.readAll();
+        if (ioOk) {
+            qint64 readNow = 0, writeNow = 0;
+            if (processIoBytes(proc.processId(), &readNow, &writeNow))
+                procWrittenMax = qMax(procWrittenMax, qMax<qint64>(0, writeNow - writeStart));
+        }
+        completedWritten += procWrittenMax;
+        totalHint = qMax(totalHint, dirByteSize(dest));
+
         if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
             const QString full = QString::fromUtf8(log);
             QString err;
@@ -502,6 +546,11 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
                     .arg(depotId, err)
                     .toStdString());
         }
+
+        emitProgress(onProgress,
+                     qBound(1, 99, int(99.0 * double(i + 1) / double(depotCount))),
+                     QStringLiteral("Downloading..."), QStringLiteral("downloading"),
+                     completedWritten, totalHint);
     }
 }
 
@@ -514,6 +563,47 @@ qint64 dirByteSize(const QString& path)
         n += it.fileInfo().size();
     }
     return n;
+}
+
+/** Actual bytes written by DepotDownloader (SetLength prealloc does not inflate this). */
+bool processIoBytes(qint64 pid, qint64* readOut, qint64* writeOut)
+{
+    if (pid <= 0)
+        return false;
+#if defined(Q_OS_WIN)
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (!h)
+        return false;
+    IO_COUNTERS counters{};
+    const BOOL ok = GetProcessIoCounters(h, &counters);
+    CloseHandle(h);
+    if (!ok)
+        return false;
+    if (readOut)
+        *readOut = static_cast<qint64>(counters.ReadTransferCount);
+    if (writeOut)
+        *writeOut = static_cast<qint64>(counters.WriteTransferCount);
+    return true;
+#else
+    QFile f(QStringLiteral("/proc/%1/io").arg(pid));
+    if (!f.open(QIODevice::ReadOnly))
+        return false;
+    qint64 r = -1, w = -1;
+    while (!f.atEnd()) {
+        const QByteArray line = f.readLine().trimmed();
+        if (line.startsWith("read_bytes:"))
+            r = line.mid(11).trimmed().toLongLong();
+        else if (line.startsWith("write_bytes:"))
+            w = line.mid(12).trimmed().toLongLong();
+    }
+    if (r < 0 || w < 0)
+        return false;
+    if (readOut)
+        *readOut = r;
+    if (writeOut)
+        *writeOut = w;
+    return true;
+#endif
 }
 
 bool alreadyInstalled(const QString& path, const QString& appid)
