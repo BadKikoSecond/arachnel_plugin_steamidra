@@ -7,6 +7,7 @@ stages:
   - build
   - package
   - release
+  - publish
 
 variables:
   GIT_DEPTH: "1"
@@ -167,9 +168,9 @@ release:
       Install in Arachnel: **Settings → Plugins** → \`steam.arach\`.
 
       Universal bundle for Windows and Linux.
-      Built against Arachnel plugin API v3 (\`feature/new_plugin_sdk\` until the next launcher release).
       Internal plugin id remains \`steamidra\` for settings and upgrade compatibility.
-      Requires Arachnel plugin API v3.
+      Requires Arachnel plugin API v4 (JSON catalog). Arachnel v0.1.34+ picks this build;
+      older launchers keep installing the last API v3 package from sourcelist history.
       EOF
     - |
       curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
@@ -183,10 +184,41 @@ release:
         "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/${PACKAGE_ID}/package_files" \
         | jq -r '.[0].id')"
       DOWNLOAD_URL="${CI_PROJECT_URL}/-/package_files/${FILE_ID}/download"
+      echo "DOWNLOAD_URL=${DOWNLOAD_URL}" > download.env
       release-cli create \
         --name "Steam plugin ${CI_COMMIT_TAG}" \
         --tag-name "${CI_COMMIT_TAG}" \
         --description "$(cat release-notes.md)" \
         --assets-link "[{\"name\":\"steam.arach\",\"url\":\"${DOWNLOAD_URL}\",\"link_type\":\"package\"}]"
+  artifacts:
+    reports:
+      dotenv: download.env
+    paths:
+      - steam.arach
+      - download.env
+    expire_in: 7 days
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[\w.]+)?$/
+
+publish-sourcelist:
+  stage: publish
+  image: python:3.12-slim
+  tags:
+    - vps
+  needs:
+    - job: release
+      artifacts: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git ca-certificates
+    - pip install --quiet --upgrade pip
+  script:
+    - |
+      set -a
+      # shellcheck disable=SC1091
+      source scripts/ci/launcher-toolchain.env
+      if [ -f download.env ]; then source download.env; fi
+      set +a
+      chmod +x scripts/ci/publish-sourcelist.sh
+      bash scripts/ci/publish-sourcelist.sh steam.arach
   rules:
     - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[\w.]+)?$/

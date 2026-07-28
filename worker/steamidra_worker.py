@@ -107,8 +107,9 @@ def _fmt_eta(remaining: int, bps: float) -> str:
 def _trustworthy_total(downloaded: int, total: int) -> bool:
     if total <= 0 or downloaded < 0 or total < downloaded:
         return False
-    # Never trust invented totals that blow past ~2× downloaded early on.
-    return total <= max(downloaded * 2, downloaded + 256 * 1024 * 1024)
+    # Totals come from DDMod preallocated folder size (stable), not from
+    # max(downloaded, snapshot) invention - a large remaining gap is normal.
+    return True
 
 
 def transfer_detail(downloaded: int, total: int, bps: float, *, percent: int = 0) -> str:
@@ -209,9 +210,9 @@ def _print_cli_ticker(
 
 def _emit_progress(enabled: bool, **kwargs: Any) -> None:
     if enabled:
-        payload = {"type": "progress", **kwargs}
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+    payload = {"type": "progress", **kwargs}
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
     if _cli_ticker or enabled or _progress_log_path is not None:
         _print_cli_ticker(
             int(kwargs.get("percent") or 0),
@@ -987,7 +988,7 @@ def cmd_search(query: str, settings: dict[str, Any], plugin_root: Path) -> dict[
                 return {"ok": True, "games": [g], "source": "steam-appid"}
         except Exception:
             pass
-    ql = q.lower()
+        ql = q.lower()
     filtered = [
         g
         for g in catalog
@@ -1231,10 +1232,10 @@ def fetch_lua(
         _emit_progress(progress, percent=0, detail=msg, status="downloading")
 
     def _from_package(raw: bytes) -> str | None:
-        lua = extract_lua_and_manifests(raw, staging)
+                lua = extract_lua_and_manifests(raw, staging)
         if not lua or "addappid" not in lua.lower():
             return None
-        return lua
+                    return lua
 
     def _has_manifests() -> bool:
         return any(staging.glob("*.manifest"))
@@ -1270,16 +1271,16 @@ def fetch_lua(
                 continue
             lua = _from_package(raw)
             if lua and (_has_manifests() or "setmanifestid" in lua.lower()):
-                return lua
+            return lua
             if lua:
                 errors.append("relay zip: lua without manifests")
             else:
                 errors.append("relay zip: no lua")
-        except Exception as exc:
+    except Exception as exc:
             errors.append(f"relay {file_type}: {exc}")
 
     detail = "; ".join(errors[-4:]) if errors else "unknown"
-    raise RuntimeError(
+            raise RuntimeError(
         f"Relay could not prepare app {appid} ({detail}). "
         "Check https://ryuu.badkiko.ru and RYUU_AUTH_KEY on the relay host."
     )
@@ -1372,10 +1373,10 @@ def _lumacore_bundle_dir(plugin_root: Path | None) -> Path | None:
     if not plugin_root:
         return None
     wanted = {"dwmapi.dll", "xinput1_4.dll", "lumacore.dll", "lumacorepayload.dll"}
-    for cand in (
-        plugin_root / "third_party" / "LumaCore",
-        plugin_root / "third_party" / "windows" / "LumaCore",
-    ):
+        for cand in (
+            plugin_root / "third_party" / "LumaCore",
+            plugin_root / "third_party" / "windows" / "LumaCore",
+        ):
         if not cand.is_dir():
             continue
         names = {p.name.lower() for p in cand.rglob("*") if p.is_file()}
@@ -1854,14 +1855,14 @@ def ensure_inject(steam: Path | None, progress: bool, plugin_root: Path | None =
         _emit_progress(progress, percent=0, detail="Preparing…", status="downloading")
         return False
     try:
-        if platform.system() == "Windows":
+    if platform.system() == "Windows":
             freshly_installed = False
-            if not (steam / "LumaCore.dll").exists() and not (steam / "dwmapi.dll").exists():
-                setup_lumacore(steam, progress, plugin_root=plugin_root)
+        if not (steam / "LumaCore.dll").exists() and not (steam / "dwmapi.dll").exists():
+            setup_lumacore(steam, progress, plugin_root=plugin_root)
                 freshly_installed = True
-            else:
+        else:
                 _emit_progress(progress, percent=0, detail="Preparing Steam…", status="downloading")
-            (steam / "config" / "stplug-in").mkdir(parents=True, exist_ok=True)
+        (steam / "config" / "stplug-in").mkdir(parents=True, exist_ok=True)
             return freshly_installed
 
         share, _ = slssteam_paths()
@@ -1914,7 +1915,7 @@ def write_acf(
     lib.mkdir(parents=True, exist_ok=True)
     common = lib / "common" / installdir
     if create_common_dir:
-        common.mkdir(parents=True, exist_ok=True)
+    common.mkdir(parents=True, exist_ok=True)
     acf = lib / f"appmanifest_{appid}.acf"
     safe_title = title.replace('"', "'")
     depot_block = ""
@@ -2032,7 +2033,7 @@ def resolve_depot_os(appid: str, settings: dict[str, Any] | None = None) -> str:
     configured = str((settings or {}).get("depotOs") or "").strip().lower()
     if configured in ("windows", "linux", "macos"):
         return configured
-    return "windows"
+        return "windows"
 
 
 def is_steamworks_redistributable(depot_id: str) -> bool:
@@ -2074,11 +2075,11 @@ def filter_primary_depots(
     try:
         info = steamcmd_app_info(appid) or {}
         if not include_dlc:
-            ext = info.get("extended") or {}
-            for part in str(ext.get("listofdlc") or "").split(","):
-                part = part.strip()
-                if part.isdigit():
-                    dlc_ids.add(part)
+        ext = info.get("extended") or {}
+        for part in str(ext.get("listofdlc") or "").split(","):
+            part = part.strip()
+            if part.isdigit():
+                dlc_ids.add(part)
         raw_depots = info.get("depots") or {}
         if isinstance(raw_depots, dict):
             depot_meta = {str(k): v for k, v in raw_depots.items() if isinstance(v, dict)}
@@ -2106,7 +2107,7 @@ def filter_primary_depots(
             for k, v in depots.items()
             if k != appid and not is_steamworks_redistributable(k)
         }
-        out_m = {k: v for k, v in manifests.items() if k in out_d}
+    out_m = {k: v for k, v in manifests.items() if k in out_d}
     if not out_d:
         return depots, manifests
     return out_d, out_m or {k: v for k, v in manifests.items() if k in out_d}
@@ -2249,7 +2250,7 @@ def find_game_exe(install_path: Path) -> Path | None:
         name = e.name.lower()
         if any(s in name for s in skip_sub):
             continue
-        return e
+            return e
     return exes[0]
 
 
@@ -2409,6 +2410,12 @@ def run_ddmod(
     last_emit_downloaded = -1
     depot_peak_local = 0.0
     completed_written = 0
+    # Monotonic max of folder snapshot (DDMod prealloc). Never max() with
+    # downloaded - that collapsed total≈downloaded and forced percent to 99.
+    stable_total_hint = 0
+    progress_debug = bool(_progress_log_path) or (
+        str(os.environ.get("ARACHNEL_PROGRESS_DEBUG") or "").strip() not in ("", "0", "false", "False")
+    )
 
     def _update_speed(now: float, downloaded: int) -> float:
         nonlocal speed_ema
@@ -2458,19 +2465,33 @@ def run_ddmod(
         reading: bool = False,
     ) -> None:
         global _progress_phase
-        nonlocal last_emit_downloaded
+        nonlocal last_emit_downloaded, stable_total_hint
         downloaded = max(0, raw_downloaded)
         bps = _update_speed(time.monotonic(), downloaded)
         stagnant = last_emit_downloaded >= 0 and downloaded <= last_emit_downloaded
         last_emit_downloaded = downloaded
         verifying = stagnant and reading and bps < MIN_DISPLAY_BPS
         _progress_phase = "verify" if verifying else "download"
-        percent = _smooth_pct(overall_pct, verifying=verifying)
-        total_hint = max(downloaded, size_tracker.snapshot())
-        # Unlike downloaded bytes, DDMod's preallocated logical file size is a
-        # useful total. Prefer byte progress once that total becomes available.
-        if total_hint >= 64 * 1024 * 1024 and 0 < downloaded <= total_hint:
-            percent = max(percent, min(99, int(downloaded * 99 / total_hint)))
+
+        snapshot = max(0, int(size_tracker.snapshot()))
+        if snapshot > stable_total_hint:
+            stable_total_hint = snapshot
+        total_hint = stable_total_hint
+
+        # Prefer depot/DDMod %; only blend byte ratio when total is meaningfully
+        # ahead of downloaded (prealloc finished, transfer still catching up).
+        raw_pct = float(overall_pct)
+        ratio_pct = 0
+        if (
+            total_hint >= 64 * 1024 * 1024
+            and downloaded > 0
+            and total_hint > downloaded
+            and (total_hint - downloaded) >= max(1024 * 1024, int(total_hint * 0.02))
+        ):
+            ratio_pct = max(1, min(99, int(downloaded * 100 / total_hint)))
+            raw_pct = max(raw_pct, float(ratio_pct))
+
+        percent = _smooth_pct(raw_pct, verifying=verifying)
         if detail is None:
             if verifying and percent >= 3:
                 auto_detail = f"{_fmt_bytes(downloaded)} · verifying..."
@@ -2478,6 +2499,12 @@ def run_ddmod(
                 auto_detail = transfer_detail(downloaded, total_hint, bps, percent=percent)
         else:
             auto_detail = detail
+        if progress_debug:
+            _append_progress_log(
+                f"snapshot={snapshot} stableTotalHint={total_hint} "
+                f"ratioPercent={ratio_pct} rawPct={raw_pct:.1f} finalPercent={percent} "
+                f"downloaded={downloaded}"
+            )
         _emit_progress(
             progress,
             **progress_kwargs(
@@ -2496,25 +2523,25 @@ def run_ddmod(
                 max(1, int(99 * frac0)),
                 completed_written,
                 detail="Downloading...",
-            )
-            cmd = [
-                str(dotnet),
-                str(dll),
-                "-app",
-                appid,
-                "-depot",
-                depot_id,
-                "-depotkeys",
-                str(keys_tmp),
-                "-max-downloads",
+        )
+        cmd = [
+            str(dotnet),
+            str(dll),
+            "-app",
+            appid,
+            "-depot",
+            depot_id,
+            "-depotkeys",
+            str(keys_tmp),
+            "-max-downloads",
                 "64",
-                "-dir",
-                str(dest),
-                "-os",
-                depot_os,
-            ]
-            if depot_id in manifests:
-                cmd += ["-manifest", manifests[depot_id]]
+            "-dir",
+            str(dest),
+            "-os",
+            depot_os,
+        ]
+        if depot_id in manifests:
+            cmd += ["-manifest", manifests[depot_id]]
             # Always prefer a local .manifest when present (Steam CDN is 401 for anonymous).
             local_manifest: Path | None = None
             search_roots: list[Path] = []
@@ -2633,7 +2660,7 @@ def run_ddmod(
                 tail = "\n".join(err_tail)
                 sys.stderr.write(("\n" if _cli_ticker or progress else "") + tail[-800:] + "\n")
                 if "401" in tail or "No manifest request code" in tail:
-                    raise RuntimeError(
+            raise RuntimeError(
                         "Steam blocked downloading game files (need a packaged manifest). "
                         "Try another title, or check the Ryuu relay."
                     )
@@ -2740,7 +2767,7 @@ def install_game(
             return out
 
     try:
-        ensure_inject(steam, progress, plugin_root=plugin_root)
+    ensure_inject(steam, progress, plugin_root=plugin_root)
     except Exception as exc:
         sys.stderr.write(f"ensure_inject: {exc}\n")
 
@@ -2776,13 +2803,13 @@ def install_game(
         if steam:
             if steam_tree_writable(steam):
                 try:
-                    write_stplugin_lua(steam, appid, lua)
-                    patch_config_vdf_keys(steam, parsed["depots"])
-                    copy_manifests_to_depotcache(steam, staging)
-                    try_download_manifests(steam, parsed["manifests"], staging)
-                    if platform.system() != "Windows":
-                        register_sls_app(appid, parsed["manifests"])
-                        create_steam_cfg(steam)
+            write_stplugin_lua(steam, appid, lua)
+            patch_config_vdf_keys(steam, parsed["depots"])
+            copy_manifests_to_depotcache(steam, staging)
+            try_download_manifests(steam, parsed["manifests"], staging)
+            if platform.system() != "Windows":
+                register_sls_app(appid, parsed["manifests"])
+                create_steam_cfg(steam)
                 except Exception as exc:
                     sys.stderr.write(f"steam metadata write skipped: {exc}\n")
             else:
@@ -2810,30 +2837,30 @@ def install_game(
             }
 
         _emit_progress(progress, percent=0, detail="Downloading...", status="downloading")
-        for mf in staging.glob("*.manifest"):
-            try:
-                shutil.copy2(mf, Path(tempfile.gettempdir()) / mf.name)
-            except Exception:
-                pass
-        run_ddmod(
-            plugin_root,
-            appid,
-            parsed["depots"],
-            parsed["manifests"],
-            install_path,
-            progress,
-            steam=steam,
+            for mf in staging.glob("*.manifest"):
+                try:
+                    shutil.copy2(mf, Path(tempfile.gettempdir()) / mf.name)
+                except Exception:
+                    pass
+            run_ddmod(
+                plugin_root,
+                appid,
+                parsed["depots"],
+                parsed["manifests"],
+                install_path,
+                progress,
+                steam=steam,
             depot_os=depot_os,
             settings=settings,
-        )
+            )
         try:
             strip_foreign_platform_content(install_path, content_os=depot_os)
         except Exception as exc:
             sys.stderr.write(f"strip_platform: {exc}\n")
-        size = sum(f.stat().st_size for f in install_path.rglob("*") if f.is_file())
+            size = sum(f.stat().st_size for f in install_path.rglob("*") if f.is_file())
         # Keep the game in the user-selected Arachnel library. Do NOT copy into
         # Steam's steamapps/common (usually C:) — that doubled disk use and hijacked installPath.
-        install_final = install_path
+                    install_final = install_path
         # Optional: unlock metadata in Steam tree only — never move/copy game files there.
         # Skip appmanifest when the game lives outside steamapps/common (avoids empty
         # Steam library entries pointing at a missing installdir).
@@ -2847,22 +2874,22 @@ def install_game(
                 except (OSError, ValueError, AttributeError):
                     under_steam = False
                 if under_steam:
-                    write_acf(
-                        steam,
-                        appid,
-                        title,
-                        installdir,
-                        size=size,
-                        manifests=parsed["manifests"],
-                    )
+                write_acf(
+                    steam,
+                    appid,
+                    title,
+                    installdir,
+                    size=size,
+                    manifests=parsed["manifests"],
+                )
             except Exception as exc:
                 sys.stderr.write(f"steam acf skipped: {exc}\n")
-        marker = install_final / ".arachnel-steamidra"
-        hint = launch_hint(steam, appid, install_final)
-        marker.write_text(
-            json.dumps({"appid": appid, "mode": "ddmod", "launch": hint}, indent=2),
-            encoding="utf-8",
-        )
+            marker = install_final / ".arachnel-steamidra"
+            hint = launch_hint(steam, appid, install_final)
+            marker.write_text(
+                json.dumps({"appid": appid, "mode": "ddmod", "launch": hint}, indent=2),
+                encoding="utf-8",
+            )
         fix = try_embed_online_fix(plugin_root, install_final, appid, settings)
         # Prefer launch path from overlay embed (Win64 shipping) over root UE stub.
         if fix and fix.get("embedded"):
@@ -2877,12 +2904,12 @@ def install_game(
                     pass
         _emit_progress(progress, percent=100, detail="Installed", status="completed")
         out = {
-            "ok": True,
-            "installPath": str(install_final),
-            "mode": "ddmod",
-            "launch": hint,
-            "steamPath": str(steam) if steam else "",
-        }
+                "ok": True,
+                "installPath": str(install_final),
+                "mode": "ddmod",
+                "launch": hint,
+                "steamPath": str(steam) if steam else "",
+            }
         if fix:
             out["onlineFix"] = fix
         return out

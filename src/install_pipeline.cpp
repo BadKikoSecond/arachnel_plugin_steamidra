@@ -469,8 +469,7 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
         qint64 procWrittenMax = 0;
         double depotPeakLocal = 0.0;
         QElapsedTimer emitTimer;
-        emitTimer.restart();
-        Q_UNUSED(readStart);
+        emitTimer.start();
 
         static const QRegularExpression pctRe(QStringLiteral(R"(^\s*(\d+(?:\.\d+)?)\s*%)"));
         QByteArray log;
@@ -495,21 +494,26 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
 
             if (ioOk) {
                 qint64 readNow = 0, writeNow = 0;
-                if (processIoBytes(proc.processId(), &readNow, &writeNow))
+                if (processIoBytes(proc.processId(), &readNow, &writeNow)) {
+                    Q_UNUSED(readNow);
                     procWrittenMax = qMax(procWrittenMax, qMax<qint64>(0, writeNow - writeStart));
-                Q_UNUSED(readNow);
+                }
             }
             // Logical size after SetLength = good total; do not use as downloaded.
+            // Never max(total, downloaded) - that collapsed total≈downloaded and stuck at 99%.
             if (sizeTimer.elapsed() >= 1000 || totalHint <= 0) {
                 totalHint = qMax(totalHint, dirByteSize(dest));
                 sizeTimer.restart();
             }
             const qint64 downloaded = completedWritten + procWrittenMax;
-            totalHint = qMax(totalHint, downloaded);
             int overall =
                 qBound(1, 99, int(99.0 * (double(i) + depotPeakLocal / 100.0) / double(depotCount)));
-            if (totalHint >= 64LL * 1024 * 1024 && downloaded > 0)
-                overall = qBound(1, 99, int(downloaded * 99 / totalHint));
+            if (totalHint >= 64LL * 1024 * 1024 && downloaded > 0 && totalHint > downloaded
+                && (totalHint - downloaded)
+                       >= qMax<qint64>(1024LL * 1024, totalHint / 50)) {
+                const int ratioPct = qBound(1, 99, int(downloaded * 100 / totalHint));
+                overall = qMax(overall, ratioPct);
+            }
             emitProgress(onProgress, overall, QStringLiteral("Downloading..."),
                          QStringLiteral("downloading"), downloaded, totalHint);
         }
