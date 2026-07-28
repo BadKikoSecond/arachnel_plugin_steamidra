@@ -88,7 +88,7 @@ QString SteamidraPlugin::name() const
 
 QString SteamidraPlugin::description() const
 {
-    return QStringLiteral("Steam depot installs via Arachnel Ryuu relay (self-contained, no Python)");
+    return QStringLiteral("Steam direct download via Ryuu manifests");
 }
 
 QString SteamidraPlugin::version() const
