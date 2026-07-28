@@ -17,6 +17,12 @@ Unreal with EOS / RedpointEOS (MECCHA CHAMELEON):
   - winmm.txt loads BOTH: SteamFix64.dll then EpicFix64.dll
   - SteamFix.ini: FakeWorkshop=true + Workshop=true when Store has Workshop
 
+32-bit / classic Steamworks (Binding of Isaac, old Unity x86):
+  - SteamFix32.dll + x86 winmm (from kit `winmm32.dll`) + winmm.txt("SteamFix32.dll")
+  - Keep Valve steam_api.dll (classic SteamAPI_Init exports) - never flat-API cracks
+  - Always steam_appid.txt=480; skip EpicFix64 (Win32 EOSSDK is not x64)
+  - Steamless unpack on launch exes with a `.bind` section (SteamStub → Steam license UI)
+
 Binaries are harvested into `online_fix_kit/` (SteamFix + EpicFix packaged in releases).
 """
 
@@ -57,7 +63,7 @@ LOCAL_OR_LAN_CATEGORY_IDS = frozenset({24, 37, 39, 47, 48})  # Local / split / L
 WORKSHOP_CATEGORY_ID = 30
 
 KIT_REQUIRED = ("SteamFix64.dll", "winmm.dll")
-KIT_OPTIONAL = ("SteamFix32.dll", "EpicFix64.dll", "EpicFix.ini")
+KIT_OPTIONAL = ("SteamFix32.dll", "winmm32.dll", "EpicFix64.dll", "EpicFix.ini")
 
 
 def analyze_store_categories(store_data: dict[str, Any]) -> dict[str, Any]:
@@ -306,7 +312,7 @@ def harvest_online_fix_kit(plugin_root: Path, settings: dict[str, Any]) -> Path 
     dest.mkdir(parents=True, exist_ok=True)
 
     steam = _harvest_named_files(
-        settings, ("SteamFix64.dll", "winmm.dll", "SteamFix32.dll", "winmm.txt")
+        settings, ("SteamFix64.dll", "winmm.dll", "SteamFix32.dll", "winmm32.dll", "winmm.txt")
     )
     if "SteamFix64.dll" not in steam or "winmm.dll" not in steam:
         return None if not ((dest / "SteamFix64.dll").is_file() and (dest / "winmm.dll").is_file()) else dest
@@ -317,6 +323,22 @@ def harvest_online_fix_kit(plugin_root: Path, settings: dict[str, Any]) -> Path 
         except OSError as exc:
             sys.stderr.write(f"online_fix: failed to copy {src}: {exc}\n")
             return None
+
+    # If we harvested an x86 winmm (Isaac / FreeTP 32-bit packs), keep winmm32.dll
+    # so x64 kits can still ship a separate winmm.dll for AMD64 titles.
+    harvested_winmm = dest / "winmm.dll"
+    if harvested_winmm.is_file() and _pe_machine(harvested_winmm) == _PE_I386:
+        try:
+            shutil.copy2(harvested_winmm, dest / "winmm32.dll")
+        except OSError as exc:
+            sys.stderr.write(f"online_fix: winmm32 harvest: {exc}\n")
+    # Prefer keeping kit winmm.dll as x64 when both exist.
+    # (Caller may already have x64 winmm; don't overwrite with x86.)
+    elif (dest / "winmm32.dll").is_file() and _pe_machine(dest / "winmm32.dll") != _PE_I386:
+        try:
+            (dest / "winmm32.dll").unlink()
+        except OSError:
+            pass
 
     # Prefer a FreeTP pack that already bundles EpicFix (Meccha-style).
     epic = _harvest_named_files(
@@ -480,6 +502,208 @@ def game_has_eos(install_root: Path) -> bool:
     return False
 
 
+def _pe_machine(path: Path) -> int:
+    """PE Machine field: 0x14C = i386, 0x8664 = AMD64, 0 = unknown."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return 0
+    if len(data) < 0x40 or data[0:2] != b"MZ":
+        return 0
+    pe = int.from_bytes(data[0x3C:0x40], "little")
+    if pe + 6 >= len(data) or data[pe : pe + 4] != b"PE\0\0":
+        return 0
+    return int.from_bytes(data[pe + 4 : pe + 6], "little")
+
+
+def _pe_has_export_name(path: Path, export_name: str) -> bool:
+    """True when the DLL export table lists export_name (ASCII)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    if len(data) < 0x40 or data[0:2] != b"MZ":
+        return False
+    pe = int.from_bytes(data[0x3C:0x40], "little")
+    if pe + 24 >= len(data) or data[pe : pe + 4] != b"PE\0\0":
+        return False
+    magic = int.from_bytes(data[pe + 24 : pe + 26], "little")
+    if magic == 0x10B:
+        dd = pe + 24 + 96
+    elif magic == 0x20B:
+        dd = pe + 24 + 112
+    else:
+        return False
+    if dd + 8 > len(data):
+        return False
+    export_rva = int.from_bytes(data[dd : dd + 4], "little")
+    if export_rva == 0:
+        return False
+    num_sections = int.from_bytes(data[pe + 6 : pe + 8], "little")
+    opt_size = int.from_bytes(data[pe + 20 : pe + 22], "little")
+    sec = pe + 24 + opt_size
+
+    def rva_to_off(rva: int) -> int:
+        for i in range(num_sections):
+            s = sec + i * 40
+            if s + 40 > len(data):
+                break
+            va = int.from_bytes(data[s + 12 : s + 16], "little")
+            raw_size = int.from_bytes(data[s + 16 : s + 20], "little")
+            raw_ptr = int.from_bytes(data[s + 20 : s + 24], "little")
+            virt_size = int.from_bytes(data[s + 8 : s + 12], "little")
+            span = max(raw_size, virt_size)
+            if va <= rva < va + span and raw_ptr:
+                return rva - va + raw_ptr
+        return -1
+
+    exp = rva_to_off(export_rva)
+    if exp < 0 or exp + 40 > len(data):
+        return False
+    names_count = int.from_bytes(data[exp + 24 : exp + 28], "little")
+    names_rva = int.from_bytes(data[exp + 32 : exp + 36], "little")
+    names_off = rva_to_off(names_rva)
+    if names_off < 0:
+        return False
+    needle = export_name.encode("ascii")
+    for i in range(min(names_count, 4096)):
+        entry = names_off + i * 4
+        if entry + 4 > len(data):
+            break
+        name_rva = int.from_bytes(data[entry : entry + 4], "little")
+        name_off = rva_to_off(name_rva)
+        if name_off < 0 or name_off >= len(data):
+            continue
+        end = data.find(b"\0", name_off)
+        if end < 0:
+            continue
+        if data[name_off:end] == needle:
+            return True
+    return False
+
+
+_PE_I386 = 0x14C
+_PE_AMD64 = 0x8664
+
+
+def _resolve_kit_winmm32(kit: Path) -> Path | None:
+    named = kit / "winmm32.dll"
+    if named.is_file() and _pe_machine(named) == _PE_I386:
+        return named
+    plain = kit / "winmm.dll"
+    if plain.is_file() and _pe_machine(plain) == _PE_I386:
+        return plain
+    return None
+
+
+def _pe_section_names(path: Path) -> list[str]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    if len(data) < 0x40 or data[0:2] != b"MZ":
+        return []
+    pe = int.from_bytes(data[0x3C:0x40], "little")
+    if pe + 24 >= len(data) or data[pe : pe + 4] != b"PE\0\0":
+        return []
+    num_sections = int.from_bytes(data[pe + 6 : pe + 8], "little")
+    opt_size = int.from_bytes(data[pe + 20 : pe + 22], "little")
+    sec = pe + 24 + opt_size
+    names: list[str] = []
+    for i in range(num_sections):
+        s = sec + i * 40
+        if s + 8 > len(data):
+            break
+        raw = data[s : s + 8]
+        names.append(raw.split(b"\0", 1)[0].decode("ascii", errors="ignore"))
+    return names
+
+
+def _looks_steamstubbed(path: Path) -> bool:
+    """True when the PE still has SteamStub's `.bind` section."""
+    return ".bind" in _pe_section_names(path)
+
+
+def try_unpack_steamstub(exe: Path, kit: Path) -> bool:
+    """Run Steamless on a SteamStubbed launch exe (Windows only).
+
+    SteamStub talks to Steam with the real AppId *before* winmm/SteamFix load.
+    That opens the Steam install/license UI even when steam_appid.txt=480.
+    """
+    if os.name != "nt":
+        return False
+    if not exe.is_file() or not _looks_steamstubbed(exe):
+        return False
+    cli = kit / "steamless" / "Steamless.CLI.exe"
+    if not cli.is_file():
+        sys.stderr.write(
+            "online_fix: Steamless.CLI.exe missing in online_fix_kit/steamless; "
+            f"SteamStub on {exe.name} will hit Steam license checks\n"
+        )
+        return False
+    unpacked = Path(str(exe) + ".unpacked.exe")
+    if unpacked.is_file():
+        try:
+            unpacked.unlink()
+        except OSError:
+            pass
+    try:
+        proc = subprocess.run(
+            [str(cli), str(exe)],
+            cwd=str(exe.parent),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.stderr.write(f"online_fix: Steamless failed on {exe.name}: {exc}\n")
+        return False
+    if not unpacked.is_file():
+        tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-3:]
+        sys.stderr.write(
+            f"online_fix: Steamless did not unpack {exe.name}"
+            + (f" ({'; '.join(tail)})" if tail else "")
+            + "\n"
+        )
+        return False
+    bak = Path(str(exe) + ".steamstub-bak")
+    try:
+        if not bak.is_file():
+            shutil.copy2(exe, bak)
+        shutil.copy2(unpacked, exe)
+        sys.stderr.write(f"online_fix: unpacked SteamStub on {exe.name}\n")
+        return True
+    except OSError as exc:
+        sys.stderr.write(f"online_fix: replace unpacked {exe.name}: {exc}\n")
+        return False
+
+
+def _ensure_classic_steam_api(target: Path) -> None:
+    """Keep Valve-style steam_api.dll when a modern flat-API crack replaced it."""
+    api = target / "steam_api.dll"
+    if not api.is_file():
+        return
+    if _pe_has_export_name(api, "SteamAPI_Init"):
+        return
+    for bak_name in (
+        "steam_api.dll.valve-bak",
+        "steam_api.dll.arachnel-valve-bak",
+        "steam_api.dll.bak",
+    ):
+        bak = target / bak_name
+        if bak.is_file() and _pe_has_export_name(bak, "SteamAPI_Init"):
+            modern = target / "steam_api.dll.arachnel-modern-bak"
+            try:
+                if modern.exists():
+                    modern.unlink()
+                api.replace(modern)
+                shutil.copy2(bak, api)
+            except OSError as exc:
+                sys.stderr.write(f"online_fix: restore classic steam_api: {exc}\n")
+            return
+
+
 def _pe_mentions_dll(exe: Path, dll_name: str) -> bool:
     """Cheap PE scan: true if the binary likely imports/loads dll_name."""
     try:
@@ -553,15 +777,10 @@ def game_has_steam_api(install_root: Path) -> bool:
 
 
 def game_needs_epic_fix(install_root: Path) -> bool:
-    """EpicFix when the install talks to EOS (Redpoint or EOSSDK).
+    """EpicFix64 when the install talks to x64 EOS (Redpoint or EOSSDK).
 
-    SteamFix alone uses FakeAppId=480. Games that exchange a Steam session
-    ticket with EOS (Unrailed 2) then fail:
-      Expected App ID [real], got [480, …]
-    EpicFix with NoAuth=1 skips that EOS Steam auth (Meccha FreeTP layout).
-
-    Always write NoAuth=1 — NoAuth=0 opens a browser (freetp.org) and can
-    black-screen titles like Pratfall.
+    Win32 EOSSDK (Isaac etc.) must not require EpicFix64 - wrong arch and it
+    used to abort the whole SteamFix embed.
     """
     try:
         for path in install_root.rglob("RedpointEOS"):
@@ -569,10 +788,17 @@ def game_needs_epic_fix(install_root: Path) -> bool:
                 return True
         for path in install_root.rglob("RedpointEOS*.dll"):
             if path.is_file() and not _skip_overlay_path(path):
-                return True
+                mach = _pe_machine(path)
+                if mach in (0, _PE_AMD64):
+                    return True
         for path in install_root.rglob("EOSSDK*.dll"):
-            if path.is_file() and not _skip_overlay_path(path):
-                return True
+            if not path.is_file() or _skip_overlay_path(path):
+                continue
+            if "win32" in path.name.lower():
+                continue
+            if _pe_machine(path) == _PE_I386:
+                continue
+            return True
     except OSError:
         return False
     return False
@@ -891,12 +1117,46 @@ def write_epic_fix_ini(path: Path) -> None:
     path.write_bytes(b"[EOS]\r\nNoAuth=1\r\nDeviceAuth=true\r\n")
 
 
-def write_winmm_txt(path: Path, *, include_epic: bool) -> None:
+def write_winmm_txt(path: Path, *, include_epic: bool, use32: bool = False) -> None:
     # FreeTP packs often omit the trailing newline.
-    lines = ["SteamFix64.dll"]
-    if include_epic:
+    # EpicFix64 is x64-only - never list it for 32-bit loaders.
+    lines = ["SteamFix32.dll" if use32 else "SteamFix64.dll"]
+    if include_epic and not use32:
         lines.append("EpicFix64.dll")
     path.write_bytes("\r\n".join(lines).encode("ascii"))
+
+
+def overlay_complete(target: Path, *, need_epic: bool, want32: bool = False) -> bool:
+    if not (target / "SteamFix.ini").is_file():
+        return False
+    if want32:
+        if not (target / "SteamFix32.dll").is_file():
+            return False
+        if not (target / "winmm.dll").is_file():
+            return False
+        if _pe_machine(target / "winmm.dll") != _PE_I386:
+            return False
+        if not (target / "winmm.txt").is_file():
+            return False
+        txt = (target / "winmm.txt").read_text(encoding="utf-8", errors="replace")
+        return "SteamFix32.dll" in txt
+    if not (target / "SteamFix64.dll").is_file():
+        return False
+    if not (target / "winmm.dll").is_file():
+        return False
+    if not (target / "winmm.txt").is_file():
+        return False
+    txt = (target / "winmm.txt").read_text(encoding="utf-8", errors="replace")
+    if "SteamFix64.dll" not in txt:
+        return False
+    if need_epic and not (target / "EpicFix64.dll").is_file():
+        return False
+    if need_epic:
+        if "EpicFix64.dll" not in txt:
+            return False
+        if not (target / "EpicFix.ini").is_file():
+            return False
+    return True
 
 
 def _ensure_epic_beside_eos(install_root: Path, kit: Path) -> int:
@@ -915,6 +1175,8 @@ def _ensure_epic_beside_eos(install_root: Path, kit: Path) -> int:
         return 0
     for eos_dll in eos_dlls:
         if _skip_overlay_path(eos_dll):
+            continue
+        if "win32" in eos_dll.name.lower() or _pe_machine(eos_dll) == _PE_I386:
             continue
         eos_dir = eos_dll.parent
         try:
@@ -954,28 +1216,6 @@ def _cleanup_stray_root_overlay(install_root: Path, primary: Path) -> None:
                 path.unlink()
             except OSError:
                 pass
-
-
-def overlay_complete(target: Path, *, need_epic: bool) -> bool:
-    if not (target / "SteamFix.ini").is_file():
-        return False
-    if not (target / "SteamFix64.dll").is_file():
-        return False
-    if not (target / "winmm.dll").is_file():
-        return False
-    if not (target / "winmm.txt").is_file():
-        return False
-    txt = (target / "winmm.txt").read_text(encoding="utf-8", errors="replace")
-    if "SteamFix64.dll" not in txt:
-        return False
-    if need_epic and not (target / "EpicFix64.dll").is_file():
-        return False
-    if need_epic:
-        if "EpicFix64.dll" not in txt:
-            return False
-        if not (target / "EpicFix.ini").is_file():
-            return False
-    return True
 
 
 def _copy_file_best_effort(src: Path, dst: Path) -> None:
@@ -1081,59 +1321,84 @@ def embed_online_fix(
 
     workshop = bool(analysis.get("hasWorkshop"))
     applied: list[str] = []
+    used_epic = False
     for target in targets:
         try:
-            if not (overlay_complete(target, need_epic=use_epic) and not force):
+            game_exe = _find_launch_exe_for_overlay(target)
+            if game_exe is not None:
+                try_unpack_steamstub(game_exe, kit)
+                # Re-resolve in case Steamless rewrote the path's contents.
+                game_exe = _find_launch_exe_for_overlay(target) or game_exe
+            want32 = bool(game_exe and _pe_machine(game_exe) == _PE_I386)
+            # Win32 titles never get EpicFix64.
+            target_use_epic = use_epic and not want32
+            _ensure_classic_steam_api(target)
+
+            if not (overlay_complete(target, need_epic=target_use_epic, want32=want32) and not force):
                 # Prefer byte-exact FreeTP overlay for this AppId (ini + dlls).
                 # Do NOT copy FreeTP/.hash — it is path-bound and causes promo opens.
                 donor = _find_freetp_overlay_dir_for_appid(str(appid), settings)
                 if donor is not None and donor.resolve() != target.resolve():
-                    for name in (
+                    names = [
                         "SteamFix.ini",
                         "winmm.txt",
-                        "SteamFix64.dll",
+                        "SteamFix32.dll" if want32 else "SteamFix64.dll",
                         "winmm.dll",
-                        "SteamFix32.dll",
-                        "EpicFix64.dll",
-                        "EpicFix.ini",
-                    ):
+                    ]
+                    if want32 and (donor / "SteamFix32.dll").is_file():
+                        names.append("SteamFix32.dll")
+                    if not want32:
+                        names.extend(["SteamFix64.dll", "SteamFix32.dll"])
+                        if target_use_epic:
+                            names.extend(["EpicFix64.dll", "EpicFix.ini"])
+                    for name in names:
                         src = donor / name
                         if src.is_file():
                             _copy_file_best_effort(src, target / name)
+                    # Donor winmm must match exe arch.
+                    donor_winmm = donor / "winmm.dll"
+                    if want32 and donor_winmm.is_file() and _pe_machine(donor_winmm) != _PE_I386:
+                        kit_w32 = _resolve_kit_winmm32(kit)
+                        if kit_w32 is not None:
+                            _copy_file_best_effort(kit_w32, target / "winmm.dll")
                 else:
                     write_steam_fix_ini(target / "SteamFix.ini", str(appid), workshop=workshop)
-                    _copy_file_best_effort(kit / "SteamFix64.dll", target / "SteamFix64.dll")
-                    _copy_file_best_effort(kit / "winmm.dll", target / "winmm.dll")
-                    if (kit / "SteamFix32.dll").is_file():
-                        _copy_file_best_effort(kit / "SteamFix32.dll", target / "SteamFix32.dll")
+                    if want32:
+                        # Strip wrong-arch leftovers from a prior x64 embed.
+                        for bad in ("SteamFix64.dll", "EpicFix64.dll", "EpicFix.ini"):
+                            bad_path = target / bad
+                            if bad_path.is_file():
+                                try:
+                                    bad_path.unlink()
+                                except OSError:
+                                    pass
+                        if (kit / "SteamFix32.dll").is_file():
+                            _copy_file_best_effort(kit / "SteamFix32.dll", target / "SteamFix32.dll")
+                        kit_w32 = _resolve_kit_winmm32(kit)
+                        if kit_w32 is not None:
+                            _copy_file_best_effort(kit_w32, target / "winmm.dll")
+                        else:
+                            # No x86 winmm in kit - don't leave a broken x64 winmm.
+                            winmm = target / "winmm.dll"
+                            if winmm.is_file() and _pe_machine(winmm) == _PE_AMD64:
+                                try:
+                                    winmm.unlink()
+                                except OSError:
+                                    pass
+                    else:
+                        _copy_file_best_effort(kit / "SteamFix64.dll", target / "SteamFix64.dll")
+                        _copy_file_best_effort(kit / "winmm.dll", target / "winmm.dll")
+                        if (kit / "SteamFix32.dll").is_file():
+                            _copy_file_best_effort(kit / "SteamFix32.dll", target / "SteamFix32.dll")
 
-                # FreeTP + winmm/SteamFix: no steam_appid.txt.
-                # Non-winmm Steamworks (.NET tools): keep steam_appid.txt=480 (written below).
-                game_exe = _find_launch_exe_for_overlay(target)
-                needs_appid_file = bool(
-                    game_exe
-                    and not (target / f"{game_exe.stem}_Data").is_dir()
-                    and not list(target.glob("*Shipping*.exe"))
-                    and not _pe_mentions_dll(game_exe, "winmm.dll")
-                    and (
-                        game_has_steam_api(target)
-                        or (target / "steam_api64.dll").is_file()
-                        or (target / "steam_api.dll").is_file()
-                    )
-                )
-                stray_appid = target / "steam_appid.txt"
-                if stray_appid.is_file() and not needs_appid_file:
-                    try:
-                        stray_appid.unlink()
-                    except OSError:
-                        pass
-                elif needs_appid_file:
-                    _write_fake_steam_appid(target, "480")
+                # Always write FakeAppId for classic steam_api / Steamworks.NET.
+                # Critical for x86 (Isaac) where winmm+SteamFix32 hooks Valve steam_api.
+                _write_fake_steam_appid(target, "480")
 
-            # Always refresh loader list + EpicFix — even when SteamFix was already present.
-            # A prior "complete" Win64 overlay used to skip RedpointEOS sidecars (Meccha Join CTD).
-            write_winmm_txt(target / "winmm.txt", include_epic=use_epic)
-            if use_epic:
+            write_winmm_txt(
+                target / "winmm.txt", include_epic=target_use_epic, use32=want32
+            )
+            if target_use_epic:
                 epic_src = kit / "EpicFix64.dll"
                 donor_epic = target / "EpicFix64.dll"
                 if epic_src.is_file():
@@ -1147,6 +1412,16 @@ def embed_online_fix(
                     }
                 write_epic_fix_ini(target / "EpicFix.ini")
                 _ensure_epic_beside_eos(root, kit if (kit / "EpicFix64.dll").is_file() else target)
+                used_epic = True
+            elif want32:
+                # Ensure x64 EpicFix is not sitting next to a 32-bit game.
+                for bad in ("EpicFix64.dll", "EpicFix.ini", "SteamFix64.dll"):
+                    bad_path = target / bad
+                    if bad_path.is_file():
+                        try:
+                            bad_path.unlink()
+                        except OSError:
+                            pass
 
             _ensure_freetp_ack_folder(target, str(appid), settings, plugin_root)
             applied.append(str(target))
@@ -1173,7 +1448,7 @@ def embed_online_fix(
         payload["onlineFix"] = {
             "embedded": True,
             "targets": applied,
-            "epic": use_epic,
+            "epic": used_epic,
             "steamAppIdFile": (primary / "steam_appid.txt").is_file(),
             "layout": "ue-shipping" if primary.name in ("Win64", "Win32") else "unity-or-root",
             "analysis": {
@@ -1192,7 +1467,7 @@ def embed_online_fix(
         "ok": True,
         "embedded": True,
         "targets": applied,
-        "epic": use_epic,
+        "epic": used_epic,
         "steamAppIdFile": (primary / "steam_appid.txt").is_file(),
         "kit": str(kit),
         "analysis": analysis,

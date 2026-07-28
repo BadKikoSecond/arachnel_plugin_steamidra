@@ -105,7 +105,15 @@ if (Test-Path (Join-Path $bundle "steamidra_plugin.dll")) {
         $cand = Join-Path $probe "online_fix_kit"
         if (Test-Path $cand) { $kitSrc = $cand; break }
     }
-    if ($kitSrc) {
+    # Only keep an older install kit when the build bundle is incomplete.
+    # Otherwise restoring it would wipe SteamFix32 / winmm32 / steamless from the new build.
+    $bundleKit = Join-Path $bundle "online_fix_kit"
+    $bundleKitOk = (Test-Path (Join-Path $bundleKit "SteamFix64.dll")) -and `
+        (Test-Path (Join-Path $bundleKit "winmm.dll")) -and `
+        (Test-Path (Join-Path $bundleKit "SteamFix32.dll")) -and `
+        (Test-Path (Join-Path $bundleKit "winmm32.dll")) -and `
+        (Test-Path (Join-Path $bundleKit "steamless\Steamless.CLI.exe"))
+    if ($kitSrc -and -not $bundleKitOk) {
         Copy-Item -Recurse -Force $kitSrc (Join-Path $keepDir "online_fix_kit")
     }
     foreach ($probe in $destCandidates) {
