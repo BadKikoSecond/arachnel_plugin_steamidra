@@ -235,11 +235,10 @@ publish-sourcelist:
     - pip install --quiet --upgrade pip
   script:
     - |
-      set -a
-      # shellcheck disable=SC1091
-      source scripts/ci/read-launcher-toolchain.sh
-      if [ -f download.env ]; then source download.env; fi
-      set +a
+      if [ -f download.env ]; then
+        # Avoid `source` + accidental $1/.arach; dotenv is a single DOWNLOAD_URL line.
+        export DOWNLOAD_URL="$(sed -n 's/^DOWNLOAD_URL=//p' download.env | tr -d '\r' | head -n1)"
+      fi
       chmod +x scripts/ci/publish-sourcelist.sh
       bash scripts/ci/publish-sourcelist.sh steam.arach
   rules:
