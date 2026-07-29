@@ -111,8 +111,9 @@ QJsonObject normalizeCatalogGame(const QJsonObject& raw)
     entry.insert(QStringLiteral("needsOnlineFix"), needsFix);
     entry.insert(QStringLiteral("installKind"), installKind);
     entry.insert(QStringLiteral("sourceId"), QStringLiteral("steamidra"));
-    if (raw.value(QStringLiteral("addons")).isArray())
-        entry.insert(QStringLiteral("addons"), raw.value(QStringLiteral("addons")));
+    // TEMP: hide catalog add-ons (Online-Fix repair zips, etc.) until the flow is ready.
+    // if (raw.value(QStringLiteral("addons")).isArray())
+    //     entry.insert(QStringLiteral("addons"), raw.value(QStringLiteral("addons")));
     return entry;
 }
 
@@ -175,13 +176,8 @@ arachnel::core::CatalogEntry catalogEntryFromJson(const QJsonObject& obj)
         e.coverUrl = QStringLiteral("https://cdn.akamai.steamstatic.com/steam/apps/%1/header.jpg")
                          .arg(e.steamAppId);
     }
-    const QJsonArray addons = obj.value(QStringLiteral("addons")).toArray();
-    e.addons.reserve(addons.size());
-    for (const QJsonValue& addonValue : addons) {
-        if (!addonValue.isObject())
-            continue;
-        e.addons.append(addonFromJson(addonValue.toObject(), e.id));
-    }
+    // TEMP: hide catalog add-ons (Online-Fix repair zips, etc.) in the download sheet.
+    e.addons.clear();
     return e;
 }
 

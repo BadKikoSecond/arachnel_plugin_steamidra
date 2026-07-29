@@ -785,7 +785,8 @@ def normalize_catalog_game(raw: dict[str, Any]) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         entry["installKind"] = 2 if entry["needsOnlineFix"] else 0
     addons_in = raw.get("addons")
-    if isinstance(addons_in, list) and addons_in:
+    # TEMP: hide catalog add-ons in the launcher until the download sheet flow is ready.
+    if False and isinstance(addons_in, list) and addons_in:
         addons_out: list[dict[str, Any]] = []
         for addon in addons_in:
             if not isinstance(addon, dict):
