@@ -87,8 +87,6 @@ rebuild-catalog-full:
 build:linux:
   stage: build
   image: ubuntu:24.04
-  tags:
-    - vps
   timeout: 2h
   before_script:
     - apt-get update
@@ -105,9 +103,7 @@ build:linux:
 
 build:windows:
   stage: build
-  # Home PC runner (shell/powershell). Linux stays on VPS (`vps`).
-  tags:
-    - windows
+  # Home PC runner (shell/powershell). Linux on home runner.
   timeout: 2h
   before_script:
     # Runner is LocalSystem: user PATH / choco are often missing. Prefer known installs.
@@ -147,8 +143,6 @@ build:windows:
 package:universal:
   stage: package
   image: ubuntu:24.04
-  tags:
-    - vps
   needs:
     - job: build:linux
       artifacts: true
@@ -170,8 +164,6 @@ package:universal:
 release:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
-  tags:
-    - vps
   needs:
     - job: package:universal
       artifacts: true
@@ -221,8 +213,6 @@ release:
 publish-sourcelist:
   stage: publish
   image: python:3.12-slim
-  tags:
-    - vps
   needs:
     - job: release
       artifacts: true
