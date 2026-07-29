@@ -233,7 +233,7 @@ publish-sourcelist:
     - |
       set -a
       # shellcheck disable=SC1091
-      source scripts/ci/launcher-toolchain.env
+      source scripts/ci/read-launcher-toolchain.sh
       if [ -f download.env ]; then source download.env; fi
       set +a
       chmod +x scripts/ci/publish-sourcelist.sh

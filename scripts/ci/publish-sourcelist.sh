@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
 # shellcheck disable=SC1091
-source "${ROOT}/scripts/ci/launcher-toolchain.env"
+source "${ROOT}/scripts/ci/read-launcher-toolchain.sh"
 
 ARACH="${1:-}"
 if [[ -z "${ARACH}" || ! -f "${ARACH}" ]]; then
