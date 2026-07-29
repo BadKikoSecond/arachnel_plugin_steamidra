@@ -110,12 +110,30 @@ build:windows:
     - windows
   timeout: 2h
   before_script:
-    - if (-not (Get-Command python -ErrorAction SilentlyContinue)) { choco install python3 -y --no-progress --execution-timeout 1200 }
-    - if (-not (Test-Path "C:\Program Files\7-Zip\7z.exe")) { choco install 7zip -y --no-progress --execution-timeout 1200 }
-    - python --version
-    - if (-not $env:QT_INSTALL_DIR) { $env:QT_INSTALL_DIR = "D:\Qt" }
-    - if (-not $env:QT_VERSION) { $env:QT_VERSION = "6.11.1" }
-    - if (-not $env:ARACHNEL_SDK_DIR -and (Test-Path "D:\Work\Arachnel\cmake\ArachnelPluginSdk.cmake")) { $env:ARACHNEL_SDK_DIR = "D:\Work\Arachnel" }
+    # Runner is LocalSystem: user PATH / choco are often missing. Prefer known installs.
+    - |
+      $ErrorActionPreference = 'Stop'
+      if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+        $candidates = @(
+          'C:\Users\kiril\AppData\Local\Programs\Python\Python311\python.exe',
+          'C:\Users\kiril\AppData\Local\Programs\Python\Python312\python.exe',
+          'C:\Program Files\Python311\python.exe',
+          'C:\Program Files\Python312\python.exe'
+        )
+        $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $found) { throw 'python not found for LocalSystem runner. Install Python for all users or add it to Machine PATH.' }
+        $dir = Split-Path -Parent $found
+        $env:Path = "$dir;$(Join-Path $dir 'Scripts');$env:Path"
+      }
+      if (-not (Test-Path 'C:\Program Files\7-Zip\7z.exe')) {
+        throw '7-Zip not found at C:\Program Files\7-Zip\7z.exe'
+      }
+      python --version
+      if (-not $env:QT_INSTALL_DIR) { $env:QT_INSTALL_DIR = 'D:\Qt' }
+      if (-not $env:QT_VERSION) { $env:QT_VERSION = '6.11.1' }
+      if (-not $env:ARACHNEL_SDK_DIR -and (Test-Path 'D:\Work\Arachnel\cmake\ArachnelPluginSdk.cmake')) {
+        $env:ARACHNEL_SDK_DIR = 'D:\Work\Arachnel'
+      }
   script:
     - pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/ci/build-plugin.ps1
   artifacts:
