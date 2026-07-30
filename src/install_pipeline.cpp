@@ -745,6 +745,11 @@ InstallPipelineResult runInstallPipeline(
             settingsJson.insert(QStringLiteral("onlineFixSourceDir"), settings.onlineFixSourceDir);
             const OnlineFixResult fix =
                 embedOnlineFix(installPath, appid, pluginRoot, settingsJson, false);
+            if (!fix.ok && !fix.error.isEmpty()) {
+                emitProgress(onProgress, 100,
+                             QStringLiteral("Online-Fix: %1").arg(fix.error),
+                             QStringLiteral("warning"));
+            }
             QString launchPath = findLaunchExeForInstall(installPath);
             QJsonObject launch;
             if (!launchPath.isEmpty()) {
@@ -811,6 +816,11 @@ InstallPipelineResult runInstallPipeline(
         settingsJson.insert(QStringLiteral("onlineFixSourceDir"), settings.onlineFixSourceDir);
         const OnlineFixResult fix =
             embedOnlineFix(installPath, appid, pluginRoot, settingsJson, false);
+        if (!fix.ok && !fix.error.isEmpty()) {
+            emitProgress(onProgress, 95,
+                         QStringLiteral("Online-Fix: %1").arg(fix.error),
+                         QStringLiteral("warning"));
+        }
 
         QString launchPath = findLaunchExeForInstall(installPath);
         QJsonObject launch;

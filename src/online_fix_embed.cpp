@@ -9,6 +9,7 @@
 #include <QProcess>
 #include <QSaveFile>
 #include <QSet>
+#include <QTemporaryDir>
 #include <QtGlobal>
 
 #include <algorithm>
@@ -16,16 +17,106 @@
 namespace steamidra {
 namespace {
 
+enum class KitFlavor { None, SteamFix, OnlineFix };
+
+bool kitLooksSteamFix(const QString& dir)
+{
+    return QFileInfo::exists(dir + QStringLiteral("/SteamFix64.dll"))
+           && QFileInfo::exists(dir + QStringLiteral("/winmm.dll"));
+}
+
+bool kitLooksOnlineFix(const QString& dir)
+{
+    return QFileInfo::exists(dir + QStringLiteral("/OnlineFix64.dll"))
+           || QFileInfo::exists(dir + QStringLiteral("/OnlineFix.dll"));
+}
+
+KitFlavor detectKitFlavor(const QString& dir)
+{
+    if (kitLooksOnlineFix(dir))
+        return KitFlavor::OnlineFix;
+    if (kitLooksSteamFix(dir))
+        return KitFlavor::SteamFix;
+    return KitFlavor::None;
+}
+
+bool kitUsable(const QString& dir)
+{
+    return detectKitFlavor(dir) != KitFlavor::None;
+}
+
+QString hostKitSubdir()
+{
+#if defined(Q_OS_WIN)
+    return QStringLiteral("windows");
+#else
+    return QStringLiteral("linux");
+#endif
+}
+
+bool extractZipToDir(const QString& zipPath, const QString& destDir)
+{
+    QDir().mkpath(destDir);
+#if defined(Q_OS_WIN)
+    QProcess p;
+    p.start(QStringLiteral("tar"),
+            {QStringLiteral("-xf"), zipPath, QStringLiteral("-C"), destDir});
+    if (!p.waitForFinished(120000) || p.exitCode() != 0) {
+        QProcess ps;
+        const QString cmd = QStringLiteral(
+            "Expand-Archive -LiteralPath '%1' -DestinationPath '%2' -Force")
+                                .arg(zipPath, destDir);
+        ps.start(QStringLiteral("powershell"),
+                 {QStringLiteral("-NoProfile"), QStringLiteral("-Command"), cmd});
+        return ps.waitForFinished(120000) && ps.exitCode() == 0;
+    }
+    return true;
+#else
+    QProcess p;
+    p.start(QStringLiteral("unzip"), {QStringLiteral("-o"), zipPath, QStringLiteral("-d"), destDir});
+    if (p.waitForFinished(120000) && p.exitCode() == 0)
+        return true;
+    QProcess tar;
+    tar.start(QStringLiteral("tar"),
+              {QStringLiteral("-xf"), zipPath, QStringLiteral("-C"), destDir});
+    return tar.waitForFinished(120000) && tar.exitCode() == 0;
+#endif
+}
+
+QString pickBestKitDir(const QString& root)
+{
+    if (kitUsable(root))
+        return root;
+    const QString host = root + QLatin1Char('/') + hostKitSubdir();
+    if (kitUsable(host))
+        return host;
+#if !defined(Q_OS_WIN)
+    // Universal packages ship the Linux kit as linux.zip so Windows Defender never
+    // sees loose OnlineFix*.dll under %AppData%. Extract once on Linux hosts only.
+    const QString linuxDir = root + QStringLiteral("/linux");
+    const QString linuxZip = root + QStringLiteral("/linux.zip");
+    if (!kitUsable(linuxDir) && QFileInfo::exists(linuxZip)) {
+        QDir().mkpath(linuxDir);
+        if (extractZipToDir(linuxZip, linuxDir) && kitUsable(linuxDir))
+            return linuxDir;
+    }
+    if (kitUsable(linuxDir))
+        return linuxDir;
+    // Incomplete linux kit: SteamFix x64 under windows/ still works on Proton.
+    const QString win = root + QStringLiteral("/windows");
+    if (kitLooksSteamFix(win))
+        return win;
+#endif
+    return root;
+}
+
 QString kitDir(const QString& pluginRoot, const QJsonObject& settings)
 {
     const QString configured = settings.value(QStringLiteral("onlineFixSourceDir")).toString().trimmed();
-    if (!configured.isEmpty() && QFileInfo::exists(configured + QStringLiteral("/SteamFix64.dll")))
+    if (!configured.isEmpty() && kitUsable(configured))
         return configured;
     const QString bundled = pluginRoot + QStringLiteral("/online_fix_kit");
-    if (QFileInfo::exists(bundled + QStringLiteral("/SteamFix64.dll"))
-        && QFileInfo::exists(bundled + QStringLiteral("/winmm.dll")))
-        return bundled;
-    return bundled;
+    return pickBestKitDir(bundled);
 }
 
 bool copyFileBestEffort(const QString& src, const QString& dst)
@@ -103,7 +194,162 @@ QString resolveKitWinmm32(const QString& kit)
     const QString plain = kit + QStringLiteral("/winmm.dll");
     if (QFileInfo::exists(plain) && peMachine(plain) == kPeI386)
         return plain;
+    const QString opt = kit + QStringLiteral("/x86_optional/winmm32.dll");
+    if (QFileInfo::exists(opt) && peMachine(opt) == kPeI386)
+        return opt;
     return {};
+}
+
+/** Resolve 32-bit SteamFix pair without keeping PE next to the plugin after embed. */
+struct X86KitResolved {
+    QString steamFix32;
+    QString winmm32;
+    QTemporaryDir temp;
+    bool ok = false;
+};
+
+X86KitResolved resolveX86SteamFixKit(const QString& kit)
+{
+    X86KitResolved out;
+    auto tryPair = [&](const QString& fix, const QString& winmm) -> bool {
+        if (!QFileInfo::exists(fix) || !QFileInfo::exists(winmm))
+            return false;
+        if (peMachine(fix) != kPeI386)
+            return false;
+        out.steamFix32 = fix;
+        out.winmm32 = winmm;
+        out.ok = true;
+        return true;
+    };
+
+    if (tryPair(kit + QStringLiteral("/SteamFix32.dll"), kit + QStringLiteral("/winmm32.dll")))
+        return out;
+    if (tryPair(kit + QStringLiteral("/x86_optional/SteamFix32.dll"),
+                kit + QStringLiteral("/x86_optional/winmm32.dll")))
+        return out;
+
+    const QString zip = kit + QStringLiteral("/x86_optional.zip");
+    if (!QFileInfo::exists(zip) || !out.temp.isValid())
+        return out;
+    if (!extractZipToDir(zip, out.temp.path()))
+        return out;
+    if (tryPair(out.temp.path() + QStringLiteral("/SteamFix32.dll"),
+                out.temp.path() + QStringLiteral("/winmm32.dll")))
+        return out;
+    QDirIterator it(out.temp.path(), {QStringLiteral("SteamFix32.dll")}, QDir::Files,
+                    QDirIterator::Subdirectories);
+    if (it.hasNext()) {
+        const QString fix = it.next();
+        tryPair(fix, QFileInfo(fix).absolutePath() + QStringLiteral("/winmm32.dll"));
+    }
+    return out;
+}
+
+/** online-fix.me 32-bit layout (Galaxy Burger etc.): OnlineFix.dll + SteamOverlay32 + winmm. */
+struct X86OnlineFixResolved {
+    QString onlineFix; // OnlineFix.dll or OnlineFix32.dll
+    QString overlay32;
+    QString stub32;
+    QString winmm32;
+    QTemporaryDir temp;
+    bool ok = false;
+};
+
+X86OnlineFixResolved resolveX86OnlineFixKit(const QString& kit)
+{
+    X86OnlineFixResolved out;
+    auto accept = [&](const QString& dir) -> bool {
+        const QString of32 = dir + QStringLiteral("/OnlineFix32.dll");
+        const QString of = dir + QStringLiteral("/OnlineFix.dll");
+        QString fix;
+        if (QFileInfo::exists(of32) && peMachine(of32) == kPeI386)
+            fix = of32;
+        else if (QFileInfo::exists(of) && peMachine(of) == kPeI386)
+            fix = of;
+        else
+            return false;
+        const QString winmmNamed = dir + QStringLiteral("/winmm32.dll");
+        const QString winmmPlain = dir + QStringLiteral("/winmm.dll");
+        QString winmm;
+        if (QFileInfo::exists(winmmNamed) && peMachine(winmmNamed) == kPeI386)
+            winmm = winmmNamed;
+        else if (QFileInfo::exists(winmmPlain) && peMachine(winmmPlain) == kPeI386)
+            winmm = winmmPlain;
+        if (winmm.isEmpty())
+            return false;
+        out.onlineFix = fix;
+        out.winmm32 = winmm;
+        const QString ov = dir + QStringLiteral("/SteamOverlay32.dll");
+        if (QFileInfo::exists(ov) && peMachine(ov) == kPeI386)
+            out.overlay32 = ov;
+        const QString stub = dir + QStringLiteral("/StubDRM32.dll");
+        if (QFileInfo::exists(stub) && peMachine(stub) == kPeI386)
+            out.stub32 = stub;
+        out.ok = true;
+        return true;
+    };
+
+    if (accept(kit) || accept(kit + QStringLiteral("/x86_optional")))
+        return out;
+
+    const QString zip = kit + QStringLiteral("/x86_optional.zip");
+    if (!QFileInfo::exists(zip) || !out.temp.isValid())
+        return out;
+    if (!extractZipToDir(zip, out.temp.path()))
+        return out;
+    if (accept(out.temp.path()))
+        return out;
+    // Nested folder from zip without -j
+    QDirIterator it(out.temp.path(), {QStringLiteral("OnlineFix.dll"), QStringLiteral("OnlineFix32.dll")},
+                    QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        if (accept(QFileInfo(it.filePath()).absolutePath()))
+            return out;
+    }
+    return out;
+}
+
+void writeOnlineFixIni(const QString& path, const QString& realAppId, const QString& fakeAppId)
+{
+    QSaveFile f(path);
+    if (!f.open(QIODevice::WriteOnly))
+        return;
+    QByteArray body = "[Main]\r\n";
+    if (!realAppId.isEmpty() && realAppId != QStringLiteral("0")) {
+        body += "RealAppId=";
+        body += realAppId.toUtf8();
+        body += "\r\n";
+    }
+    body += "FakeAppId=";
+    body += fakeAppId.toUtf8();
+    body += "\r\n";
+    f.write(body);
+    f.commit();
+}
+
+void writeDllListTxt(const QString& path, const QStringList& dllNames)
+{
+    QSaveFile f(path);
+    if (!f.open(QIODevice::WriteOnly))
+        return;
+    QByteArray body;
+    for (const QString& name : dllNames) {
+        if (name.isEmpty())
+            continue;
+        body += name.toUtf8();
+        body += "\r\n";
+    }
+    f.write(body);
+    f.commit();
+}
+
+bool copyKitFileIfExists(const QString& kit, const QString& name, const QString& targetDir)
+{
+    const QString src = kit + QLatin1Char('/') + name;
+    if (!QFileInfo::exists(src))
+        return false;
+    return copyFileBestEffort(src, targetDir + QLatin1Char('/') + name);
 }
 
 bool peHasExportName(const QString& path, const char* exportName)
@@ -178,12 +424,11 @@ bool peHasExportName(const QString& path, const char* exportName)
     return false;
 }
 
-void ensureClassicSteamApi(const QString& target)
+void ensureClassicSteamApiAt(const QString& api)
 {
     // Old titles (Isaac etc.) need classic SteamAPI_Init / SteamUser exports.
     // Modern cracked steam_api (OF/Goldberg flat API) is ~260KB+ and lacks those
-    // names → STATUS_ENTRYPOINT_NOT_FOUND. SteamFix hooks the Valve DLL instead.
-    const QString api = target + QStringLiteral("/steam_api.dll");
+    // names → STATUS_ENTRYPOINT_NOT_FOUND. SteamFix/OnlineFix hooks the Valve DLL.
     if (!QFileInfo::exists(api))
         return;
     if (peHasExportName(api, "SteamAPI_Init"))
@@ -191,7 +436,8 @@ void ensureClassicSteamApi(const QString& target)
     const QStringList backups = {
         api + QStringLiteral(".valve-bak"),
         api + QStringLiteral(".arachnel-valve-bak"),
-        target + QStringLiteral("/steam_api.dll.bak"),
+        api + QStringLiteral(".bak"),
+        QFileInfo(api).absolutePath() + QStringLiteral("/steam_api.dll.bak"),
     };
     for (const QString& bak : backups) {
         if (!QFileInfo::exists(bak) || !peHasExportName(bak, "SteamAPI_Init"))
@@ -201,6 +447,19 @@ void ensureClassicSteamApi(const QString& target)
         QFile::rename(api, modernBak);
         QFile::copy(bak, api);
         return;
+    }
+}
+
+void ensureClassicSteamApi(const QString& target)
+{
+    ensureClassicSteamApiAt(target + QStringLiteral("/steam_api.dll"));
+    // Unity often loads steam_api from Plugins/x86 (Galaxy Burger / OF.me x86 layout).
+    ensureClassicSteamApiAt(target + QStringLiteral("/Plugins/x86/steam_api.dll"));
+    QDirIterator dataDirs(target, {QStringLiteral("*_Data")}, QDir::Dirs);
+    while (dataDirs.hasNext()) {
+        const QString data = dataDirs.next();
+        ensureClassicSteamApiAt(data + QStringLiteral("/Plugins/x86/steam_api.dll"));
+        ensureClassicSteamApiAt(data + QStringLiteral("/Plugins/x86_64/steam_api64.dll"));
     }
 }
 
@@ -286,10 +545,30 @@ void stripWrongArchOverlay(const QString& target, bool want32)
         removeIf(QStringLiteral("winmm.dll"), kPeAmd64);
         removeIf(QStringLiteral("SteamFix64.dll"), kPeAmd64);
         removeIf(QStringLiteral("EpicFix64.dll"), kPeAmd64);
-        // Also drop x64 leftovers even if PE read fails (known FreeTP names).
+        removeIf(QStringLiteral("OnlineFix64.dll"), kPeAmd64);
+        removeIf(QStringLiteral("SteamOverlay64.dll"), kPeAmd64);
+        removeIf(QStringLiteral("StubDRM64.dll"), kPeAmd64);
+        // Drop known x64 leftovers even if PE read fails.
         QFile::remove(target + QStringLiteral("/SteamFix64.dll"));
         QFile::remove(target + QStringLiteral("/EpicFix64.dll"));
         QFile::remove(target + QStringLiteral("/EpicFix.ini"));
+        QFile::remove(target + QStringLiteral("/OnlineFix64.dll"));
+        QFile::remove(target + QStringLiteral("/SteamOverlay64.dll"));
+        QFile::remove(target + QStringLiteral("/StubDRM64.dll"));
+    } else {
+        removeIf(QStringLiteral("winmm.dll"), kPeI386);
+        removeIf(QStringLiteral("SteamFix32.dll"), kPeI386);
+        removeIf(QStringLiteral("OnlineFix32.dll"), kPeI386);
+        removeIf(QStringLiteral("SteamOverlay32.dll"), kPeI386);
+        removeIf(QStringLiteral("StubDRM32.dll"), kPeI386);
+        // Unversioned OnlineFix.dll is usually the 32-bit OF.me payload.
+        const QString of = target + QStringLiteral("/OnlineFix.dll");
+        if (QFileInfo::exists(of) && peMachine(of) == kPeI386)
+            QFile::remove(of);
+        QFile::remove(target + QStringLiteral("/SteamFix32.dll"));
+        QFile::remove(target + QStringLiteral("/OnlineFix32.dll"));
+        QFile::remove(target + QStringLiteral("/SteamOverlay32.dll"));
+        QFile::remove(target + QStringLiteral("/StubDRM32.dll"));
     }
 }
 
@@ -324,8 +603,10 @@ bool skipOverlayPath(const QString& path)
 
 bool gameNeedsEpicFix(const QString& root)
 {
-    // EpicFix64 only helps x64 EOS. Win32 EOSSDK (Isaac etc.) must not block embed
-    // or receive an x64 EpicFix beside a 32-bit exe.
+    // FreeTP policy: EpicFix only for RedpointEOS (Meccha etc.).
+    // Plain EOSSDK*.dll alone (Pratfall) gets SteamFix/OnlineFix without EpicFix —
+    // forcing EpicFix opens freetp.org and can black-screen.
+    // EpicFix64 is x64-only; Win32 Redpoint/EOSSDK must not receive it.
     QDirIterator it(root, QDirIterator::Subdirectories);
     while (it.hasNext()) {
         it.next();
@@ -341,19 +622,26 @@ bool gameNeedsEpicFix(const QString& root)
             const quint16 m = peMachine(it.filePath());
             if (m == kPeAmd64 || m == 0)
                 return true;
-            continue;
-        }
-        if (name.startsWith(QStringLiteral("EOSSDK"), Qt::CaseInsensitive)
-            && name.endsWith(QStringLiteral(".dll"), Qt::CaseInsensitive)) {
-            if (name.contains(QStringLiteral("Win32"), Qt::CaseInsensitive))
-                continue;
-            const quint16 m = peMachine(it.filePath());
-            if (m == kPeI386)
-                continue;
-            return true;
         }
     }
     return false;
+}
+
+/** EpicFix lives in FreeTP windows kit; OF.me linux kit keeps it as sibling windows/. */
+QString resolveEpicFixDir(const QString& kit, const QString& pluginRoot)
+{
+    const QStringList candidates = {
+        kit,
+        kit + QStringLiteral("/windows"),
+        QFileInfo(kit).absolutePath() + QStringLiteral("/windows"),
+        pluginRoot + QStringLiteral("/online_fix_kit/windows"),
+        pluginRoot + QStringLiteral("/online_fix_kit"),
+    };
+    for (const QString& dir : candidates) {
+        if (QFileInfo::exists(dir + QStringLiteral("/EpicFix64.dll")))
+            return dir;
+    }
+    return {};
 }
 
 bool gameHasSteamApi(const QString& root)
@@ -427,9 +715,9 @@ QStringList findOverlayTargets(const QString& installRoot)
     return {installRoot};
 }
 
-int ensureEpicBesideEos(const QString& installRoot, const QString& kit)
+int ensureEpicBesideEos(const QString& installRoot, const QString& epicKit)
 {
-    const QString epicDll = kit + QStringLiteral("/EpicFix64.dll");
+    const QString epicDll = epicKit + QStringLiteral("/EpicFix64.dll");
     if (!QFileInfo::exists(epicDll))
         return 0;
     int placed = 0;
@@ -495,7 +783,9 @@ QString findLaunchExeForInstall(const QString& installPath)
             continue;
         qint64 score = it.fileInfo().size();
         const bool hasOverlay = QFileInfo::exists(it.fileInfo().absolutePath() + QStringLiteral("/SteamFix64.dll"))
-                                || QFileInfo::exists(it.fileInfo().absolutePath() + QStringLiteral("/winmm.dll"));
+                                || QFileInfo::exists(it.fileInfo().absolutePath() + QStringLiteral("/winmm.dll"))
+                                || QFileInfo::exists(it.fileInfo().absolutePath() + QStringLiteral("/OnlineFix64.dll"))
+                                || QFileInfo::exists(it.fileInfo().absolutePath() + QStringLiteral("/OnlineFix.dll"));
         if (hasOverlay)
             score += 500LL * 1024 * 1024;
         if (lower.contains(QStringLiteral("shipping")))
@@ -527,10 +817,12 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
     }
 
     const QString kit = kitDir(pluginRoot, settingsJson);
-    if (!QFileInfo::exists(kit + QStringLiteral("/SteamFix64.dll"))
-        || !QFileInfo::exists(kit + QStringLiteral("/winmm.dll"))) {
+    const KitFlavor flavor = detectKitFlavor(kit);
+    if (flavor == KitFlavor::None) {
         r.ok = false;
-        r.error = QStringLiteral("Online-fix kit missing (SteamFix64.dll / winmm.dll)");
+        r.error = QStringLiteral(
+            "Online-Fix kit missing or quarantined (need SteamFix64+winmm or OnlineFix64). "
+            "Restore the plugin kit or add a Windows Security exclusion for the Arachnel folder.");
         return r;
     }
 
@@ -547,73 +839,135 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
     }
 
     const bool needEpic = gameNeedsEpicFix(installPath) || gameNeedsEpicFix(targets.first());
-    if (needEpic && !QFileInfo::exists(kit + QStringLiteral("/EpicFix64.dll"))) {
+    const QString epicKit = resolveEpicFixDir(kit, pluginRoot);
+    if (needEpic && epicKit.isEmpty()) {
         r.ok = false;
         r.error = QStringLiteral(
-            "Game uses RedpointEOS/EOSSDK but EpicFix64.dll is not in online_fix_kit");
+            "Game uses RedpointEOS but EpicFix64.dll is not in online_fix_kit "
+            "(expected FreeTP windows/EpicFix64.dll beside the host kit)");
         return r;
     }
 
     bool usedEpic = false;
-    for (const QString& target : targets) {
-        writeSteamFixIni(target + QStringLiteral("/SteamFix.ini"), appid, false);
+    X86KitResolved x86SteamKit;
+    X86OnlineFixResolved x86OnlineKit;
+    if (flavor == KitFlavor::SteamFix)
+        x86SteamKit = resolveX86SteamFixKit(kit);
+    else if (flavor == KitFlavor::OnlineFix)
+        x86OnlineKit = resolveX86OnlineFixKit(kit);
 
+    for (const QString& target : targets) {
         QString launchExe = findLaunchExeForInstall(target.isEmpty() ? installPath : target);
         if (launchExe.isEmpty())
             launchExe = findLaunchExeForInstall(installPath);
-        // SteamStub runs before winmm - unpack so FakeAppId/SteamFix can take over.
-        if (!launchExe.isEmpty())
-            tryUnpackSteamStub(launchExe, kit);
         const quint16 machine = peMachine(launchExe);
         const bool want32 = machine == kPeI386;
-        const bool haveFix32 = QFileInfo::exists(kit + QStringLiteral("/SteamFix32.dll"));
-        const QString kitWinmm32 = resolveKitWinmm32(kit);
-        // x64 EpicFix only on x64 overlays (Win32 EOSSDK must not pull EpicFix64).
-        const bool useEpic = needEpic && !want32;
+        const bool useEpic = needEpic && !want32 && !epicKit.isEmpty();
+
+        if (flavor == KitFlavor::OnlineFix) {
+            const QString fakeAppId = QStringLiteral("480");
+            writeOnlineFixIni(target + QStringLiteral("/OnlineFix.ini"), appid, fakeAppId);
+            QFile::remove(target + QStringLiteral("/SteamFix.ini"));
+
+            stripWrongArchOverlay(target, want32);
+            ensureClassicSteamApi(target);
+
+            QStringList dllList;
+            if (want32) {
+                // Galaxy Burger / Unity x86 OF.me: winmm loads OnlineFix.dll (+ SteamOverlay32).
+                if (!x86OnlineKit.ok) {
+                    r.ok = false;
+                    r.error = QStringLiteral(
+                        "32-bit Online-Fix kit missing (x86_optional.zip with OnlineFix.dll + "
+                        "winmm32 + SteamOverlay32). Kit may be quarantined.");
+                    return r;
+                }
+                const QString fixName = QFileInfo(x86OnlineKit.onlineFix).fileName();
+                copyFileBestEffort(x86OnlineKit.onlineFix, target + QLatin1Char('/') + fixName);
+                copyFileBestEffort(x86OnlineKit.winmm32, target + QStringLiteral("/winmm.dll"));
+                if (!x86OnlineKit.overlay32.isEmpty())
+                    copyFileBestEffort(x86OnlineKit.overlay32,
+                                       target + QStringLiteral("/SteamOverlay32.dll"));
+                if (!x86OnlineKit.stub32.isEmpty())
+                    copyFileBestEffort(x86OnlineKit.stub32,
+                                       target + QStringLiteral("/StubDRM32.dll"));
+                for (const QString& n : {QStringLiteral("SteamOverlay32.dll"), fixName,
+                                         QStringLiteral("StubDRM32.dll")}) {
+                    if (QFileInfo::exists(target + QLatin1Char('/') + n))
+                        dllList.append(n);
+                }
+                writeDllListTxt(target + QStringLiteral("/dlllist.txt"), dllList);
+            } else {
+                if (!copyKitFileIfExists(kit, QStringLiteral("OnlineFix64.dll"), target)
+                    && !copyKitFileIfExists(kit, QStringLiteral("OnlineFix.dll"), target)) {
+                    r.ok = false;
+                    r.error = QStringLiteral(
+                        "Online-Fix kit missing OnlineFix64.dll (kit missing/quarantined?)");
+                    return r;
+                }
+                copyKitFileIfExists(kit, QStringLiteral("SteamOverlay64.dll"), target);
+                copyKitFileIfExists(kit, QStringLiteral("StubDRM64.dll"), target);
+                for (const QString& n : {QStringLiteral("OnlineFix64.dll"),
+                                         QStringLiteral("OnlineFix.dll"),
+                                         QStringLiteral("SteamOverlay64.dll"),
+                                         QStringLiteral("StubDRM64.dll")}) {
+                    if (QFileInfo::exists(target + QLatin1Char('/') + n))
+                        dllList.append(n);
+                }
+                if (useEpic) {
+                    copyFileBestEffort(epicKit + QStringLiteral("/EpicFix64.dll"),
+                                       target + QStringLiteral("/EpicFix64.dll"));
+                    writeEpicFixIni(target + QStringLiteral("/EpicFix.ini"));
+                    if (QFileInfo::exists(target + QStringLiteral("/EpicFix64.dll")))
+                        dllList.append(QStringLiteral("EpicFix64.dll"));
+                    ensureEpicBesideEos(installPath, epicKit);
+                    usedEpic = true;
+                }
+                writeDllListTxt(target + QStringLiteral("/dlllist.txt"), dllList);
+            }
+
+            writeSteamAppIdFile(target, fakeAppId);
+            r.targets.append(target);
+            continue;
+        }
+
+        // FreeTP SteamFix layout (Windows kit).
+        writeSteamFixIni(target + QStringLiteral("/SteamFix.ini"), appid, false);
+        if (!launchExe.isEmpty())
+            tryUnpackSteamStub(launchExe, kit);
 
         stripWrongArchOverlay(target, want32);
         ensureClassicSteamApi(target);
 
         if (want32) {
-            // FreeTP-style x86: SteamFix32 + 32-bit winmm + winmm.txt + steam_appid.txt.
-            // Never place x64 winmm beside a 32-bit exe (LoadLibrary ERROR_BAD_EXE_FORMAT).
-            if (haveFix32 && !kitWinmm32.isEmpty()) {
-                copyFileBestEffort(kit + QStringLiteral("/SteamFix32.dll"),
-                                   target + QStringLiteral("/SteamFix32.dll"));
-                copyFileBestEffort(kitWinmm32, target + QStringLiteral("/winmm.dll"));
+            if (x86SteamKit.ok) {
+                copyFileBestEffort(x86SteamKit.steamFix32, target + QStringLiteral("/SteamFix32.dll"));
+                copyFileBestEffort(x86SteamKit.winmm32, target + QStringLiteral("/winmm.dll"));
                 writeWinmmTxt(target + QStringLiteral("/winmm.txt"), false, true);
-            } else if (haveFix32) {
-                // SteamFix32 alone cannot load without an x86 winmm proxy.
-                copyFileBestEffort(kit + QStringLiteral("/SteamFix32.dll"),
-                                   target + QStringLiteral("/SteamFix32.dll"));
-                QFile::remove(target + QStringLiteral("/winmm.dll"));
-                QFile::remove(target + QStringLiteral("/winmm.txt"));
             } else {
                 QFile::remove(target + QStringLiteral("/winmm.dll"));
                 QFile::remove(target + QStringLiteral("/winmm.txt"));
+                r.ok = false;
+                r.error = QStringLiteral(
+                    "32-bit Online-Fix kit missing (x86_optional.zip / SteamFix32). "
+                    "It may have been quarantined by Windows Security.");
+                return r;
             }
         } else {
             copyFileBestEffort(kit + QStringLiteral("/SteamFix64.dll"),
                                target + QStringLiteral("/SteamFix64.dll"));
             copyFileBestEffort(kit + QStringLiteral("/winmm.dll"), target + QStringLiteral("/winmm.dll"));
-            if (haveFix32)
-                copyFileBestEffort(kit + QStringLiteral("/SteamFix32.dll"),
-                                   target + QStringLiteral("/SteamFix32.dll"));
             writeWinmmTxt(target + QStringLiteral("/winmm.txt"), useEpic, false);
         }
-        // FakeAppId file - critical for Steamworks / classic steam_api when winmm hooks.
         writeSteamAppIdFile(target);
 
         if (useEpic) {
-            copyFileBestEffort(kit + QStringLiteral("/EpicFix64.dll"),
+            copyFileBestEffort(epicKit + QStringLiteral("/EpicFix64.dll"),
                                target + QStringLiteral("/EpicFix64.dll"));
             writeEpicFixIni(target + QStringLiteral("/EpicFix.ini"));
-            ensureEpicBesideEos(installPath, kit);
+            ensureEpicBesideEos(installPath, epicKit);
             usedEpic = true;
         }
-        // FreeTP ack folder + native cmd.exe stub. Do not patch SteamFix*.dll —
-        // VMProtect integrity fails with "File corrupted!". CreateProcess for the
-        // promo uses "cmd.exe" and searches the game dir before System32.
         QDir().mkpath(target + QStringLiteral("/FreeTP/UserData"));
         QFile anon(target + QStringLiteral("/FreeTP/UserData/AnonFolderSave.txt"));
         if (!anon.exists() && anon.open(QIODevice::WriteOnly))
@@ -626,7 +980,6 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
 
     r.embedded = !r.targets.isEmpty();
     r.epic = usedEpic;
-    // Update marker launch path
     const QString markerPath = installPath + QStringLiteral("/.arachnel-steamidra");
     QJsonObject payload;
     QFile marker(markerPath);
@@ -643,7 +996,10 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
     }
     QJsonObject of;
     of.insert(QStringLiteral("embedded"), true);
-    of.insert(QStringLiteral("epic"), needEpic);
+    of.insert(QStringLiteral("epic"), usedEpic);
+    of.insert(QStringLiteral("flavor"),
+              flavor == KitFlavor::OnlineFix ? QStringLiteral("onlinefix-me")
+                                             : QStringLiteral("steamfix"));
     of.insert(QStringLiteral("targets"), QJsonArray::fromStringList(r.targets));
     payload.insert(QStringLiteral("onlineFix"), of);
     if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate))

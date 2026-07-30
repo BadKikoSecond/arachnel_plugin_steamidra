@@ -150,23 +150,56 @@ def merge_genre_string(existing: str, analysis: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+def _kit_usable(path: Path) -> bool:
+    if (path / "OnlineFix64.dll").is_file() or (path / "OnlineFix.dll").is_file():
+        return True
+    return (path / "SteamFix64.dll").is_file() and (path / "winmm.dll").is_file()
+
+
+def _pick_best_kit(root: Path) -> Path:
+    if _kit_usable(root):
+        return root
+    host = "windows" if os.name == "nt" else "linux"
+    host_dir = root / host
+    if _kit_usable(host_dir):
+        return host_dir
+    if os.name != "nt":
+        linux_dir = root / "linux"
+        linux_zip = root / "linux.zip"
+        if not _kit_usable(linux_dir) and linux_zip.is_file():
+            linux_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                import zipfile
+
+                with zipfile.ZipFile(linux_zip, "r") as zf:
+                    zf.extractall(linux_dir)
+            except OSError as exc:
+                sys.stderr.write(f"online_fix: failed to extract linux.zip: {exc}\n")
+        if _kit_usable(linux_dir):
+            return linux_dir
+        win = root / "windows"
+        if _kit_usable(win):
+            return win
+    return root
+
+
 def kit_dir(plugin_root: Path, settings: dict[str, Any]) -> Path:
     configured = (settings.get("onlineFixSourceDir") or "").strip()
     if configured:
-        return Path(configured).expanduser().resolve()
+        cfg = Path(configured).expanduser().resolve()
+        if _kit_usable(cfg):
+            return cfg
     # Prefer kit shipped next to the plugin (steam.arach / online_fix_kit).
-    bundled = (plugin_root / "online_fix_kit").resolve()
-    if (bundled / "SteamFix64.dll").is_file() and (bundled / "winmm.dll").is_file():
+    bundled = _pick_best_kit((plugin_root / "online_fix_kit").resolve())
+    if _kit_usable(bundled):
         return bundled
     settings_path = (settings.get("_settingsPath") or "").strip()
     if settings_path:
         beside_settings = Path(settings_path).expanduser().resolve().parent / "online_fix_kit"
-        if (beside_settings / "SteamFix64.dll").is_file() and (
-            beside_settings / "winmm.dll"
-        ).is_file():
-            return beside_settings
-        # Fall back to creating beside settings only when bundled kit is absent.
-        if not (bundled / "SteamFix64.dll").is_file():
+        picked = _pick_best_kit(beside_settings)
+        if _kit_usable(picked):
+            return picked
+        if not _kit_usable(bundled):
             return beside_settings
     return bundled
 
@@ -360,6 +393,8 @@ def harvest_online_fix_kit(plugin_root: Path, settings: dict[str, Any]) -> Path 
 def ensure_online_fix_kit(plugin_root: Path, settings: dict[str, Any]) -> Path | None:
     dest = kit_dir(plugin_root, settings)
     dest.mkdir(parents=True, exist_ok=True)
+    if (dest / "OnlineFix64.dll").is_file() or (dest / "OnlineFix.dll").is_file():
+        return dest
     have_steam = (dest / "SteamFix64.dll").is_file() and (dest / "winmm.dll").is_file()
     have_epic = (dest / "EpicFix64.dll").is_file()
     if have_steam and have_epic:
@@ -1287,9 +1322,9 @@ def embed_online_fix(
         return {
             "ok": False,
             "error": (
-                "Online-fix kit missing (SteamFix64.dll / winmm.dll). "
-                "Install any FreeTP online game once, or set onlineFixSourceDir "
-                "to a folder that contains those files."
+                "Online-Fix kit missing or quarantined (need SteamFix64+winmm or OnlineFix64). "
+                "Restore the plugin kit, harvest FreeTP/OF.me binaries, or add a Windows Security "
+                "exclusion for the Arachnel folder."
             ),
             "analysis": analysis,
         }

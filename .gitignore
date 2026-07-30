@@ -6,8 +6,9 @@ __pycache__/
 *.pyc
 catalog/.cache/
 
-# Harvested FreeTP SteamFix binaries live in online_fix_kit/ and ARE packaged
-# into steam.arach (required for Online Fix embeds on Linux). Keep them committed.
+# Harvested FreeTP / OF.me binaries live under online_fix_kit/{windows,linux}/
+# and ARE packaged into steam.arach. Keep Windows SteamFix x64 (+ x86_optional.zip) committed.
+# Do not commit unpacked OnlineFix*.dll from OF.me unless you intend to redistribute them.
 
 # Vendored large/binary trees (fetch via tools/fetch_third_party.*)
 third_party/linux/dotnet/

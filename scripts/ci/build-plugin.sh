@@ -33,6 +33,8 @@ if [[ ! -f "${QT_PATH}/lib/cmake/Qt6/Qt6Config.cmake" ]]; then
 fi
 
 bash tools/fetch_third_party.sh linux
+# Best-effort OF.me harvest into online_fix_kit/linux (falls back to SteamFix x64 in CMake).
+bash tools/harvest_onlinefix_me_kit.sh || true
 cmake -S "${ROOT}" -B "${BUILD}" -G Ninja \
   -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
   -DCMAKE_PREFIX_PATH="${QT_PATH}" \

@@ -90,7 +90,7 @@ export ARACHNEL_SDK_DIR=~/path/to/Arachnel   # or D:\Work\Arachnel
 | `steamPath` | Override Steam root |
 | `autoEmbedOnlineFix` | After install, embed SteamFix when Steam Store has Online PvP/Co-op/MMO (default `true`) |
 | `onlineFixOnWeakMultiplayer` | Also embed on weak Multi-player/Co-op tags (default `false`) |
-| `onlineFixSourceDir` | Folder with `SteamFix64.dll` + `winmm.dll` (else harvest from FreeTP installs into `online_fix_kit/`) |
+| `onlineFixSourceDir` | Folder with FreeTP (`SteamFix64`+`winmm`) or OF.me (`OnlineFix64`) kit (else harvest into `online_fix_kit/windows` or `linux/`) |
 
 ## When is an online fix needed?
 
@@ -104,10 +104,33 @@ EpicFix is **never** decided from the Store alone. Plain `EOSSDK*.dll` (e.g. Pra
 
 ## Online fix layout
 
-Binaries are harvested into `online_fix_kit/` (not shipped in git):
+Platform kits under `online_fix_kit/`:
+
+- **Windows** — FreeTP SteamFix x64 (+ `x86_optional.zip` for 32-bit on demand)
+- **Linux** — online-fix.me x64 + `x86_optional.zip` (`OnlineFix.dll` PE32 + Overlay32 + winmm32)
+- **Universal** — Windows kit flat; Linux kit as `linux.zip` only (no loose OF.me PE for Defender)
+
+Harvest:
+
+```powershell
+.\tools\harvest_online_fix_kit.ps1          # FreeTP → online_fix_kit/windows
+.\tools\harvest_onlinefix_me_kit.ps1        # OF.me → online_fix_kit/linux
+```
+
+```bash
+./tools/harvest_onlinefix_me_kit.sh
+```
+
+Embed targets:
+
 - **Unity** — next to `<Game>.exe` + `*_Data`
 - **Unreal** — only `<Game>/Binaries/Win64` (never `Engine/`, never install root)
-- **EOS** — `EpicFix64.dll` + `EpicFix.ini` `[EOS] NoAuth=true`; `winmm.txt` loads both DLLs
+- **EOS** — only when install has **RedpointEOS**: `EpicFix64.dll` + `EpicFix.ini` (`NoAuth=1`).
+  On Linux (OF.me kit) EpicFix is loaded from sibling `online_fix_kit/windows/`; on Windows
+  from the FreeTP kit. Listed in `winmm.txt` (SteamFix) or `dlllist.txt` (OF.me). Also copied
+  next to every `EOSSDK*.dll`. Plain EOSSDK without Redpoint → no EpicFix.
+
+Defender note: loose `SteamFix32.dll` is not shipped in the default Windows plugin payload.
 
 ## Modes
 
