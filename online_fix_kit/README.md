@@ -21,6 +21,10 @@ Notes:
   Do not replace it with a modern flat-API crack; SteamFix hooks the Valve DLL.
 - Win32 `EOSSDK` must not force `EpicFix64` (wrong arch).
 - Embed always writes `steam_appid.txt=480` (FakeAppId) for Steamworks fallback.
+- **FreeTP promo:** SteamFix opens `freetp.org` via `cmd.exe /c start "link"` when
+  `FreeTP/.hash` is missing/wrong. Do **not** byte-patch SteamFix*.dll — VMProtect
+  integrity pops "File corrupted!". Ship `cmd_stub.exe` here; embed copies it to
+  the game dir as `cmd.exe` (CreateProcess searches the app dir first).
 
 Used by `worker/online_fix_embed.py` and `src/online_fix_embed.cpp` after depot installs.
 CI packages this folder into `steam.arach` for both platforms.

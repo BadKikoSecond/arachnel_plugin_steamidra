@@ -944,6 +944,7 @@ def _cmd_stub_path(plugin_root: Path) -> Path | None:
         here / "assets" / "cmd_stub.exe",
         plugin_root / "worker" / "assets" / "cmd_stub.exe",
         plugin_root / "assets" / "cmd_stub.exe",
+        plugin_root / "online_fix_kit" / "cmd_stub.exe",
     ):
         if cand.is_file():
             return cand
@@ -951,18 +952,15 @@ def _cmd_stub_path(plugin_root: Path) -> Path | None:
 
 
 def _prime_freetp_hash(target: Path, plugin_root: Path) -> bool:
-    """Generate path-local FreeTP/.hash without opening the promo browser.
+    """Best-effort FreeTP/.hash + native cmd.exe stub (do not patch SteamFix DLLs).
 
-    SteamFix writes FreeTP/.hash from the install path. A hash copied from another
-    folder is rejected: it opens freetp.org via `cmd.exe /c start \"link\" ...` and
-    rewrites the file. Dropping a no-op cmd.exe next to the game intercepts that
-    CreateProcess search (app dir before System32) so the ack is written silently.
+    SteamFix computes a path-bound 4-byte FreeTP/.hash inside VMProtect — we cannot
+    forge it offline, and byte-patching SteamFix*.dll trips integrity ("File corrupted!").
 
-    On Linux/Proton we only plant the stub — the game primes .hash on first launch.
-
-    Important: keep the stub in place until .hash exists (and prefer leaving it as a
-    permanent safety net). Deleting the stub after a failed prime is what lets the
-    next real launch open freetp.org.
+    Plant a native no-op cmd.exe next to the game so CreateProcess("cmd.exe /c start …")
+    hits the stub first (app dir before System32) and the promo browser never opens.
+    On Linux/Proton we only plant the stub; on Windows we briefly launch the game
+    so SteamFix can write a real path-local .hash.
     """
     hash_path = target / "FreeTP" / ".hash"
     if hash_path.is_file() and hash_path.stat().st_size == 4:

@@ -611,11 +611,16 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
             ensureEpicBesideEos(installPath, kit);
             usedEpic = true;
         }
-        // FreeTP ack folder (best-effort)
+        // FreeTP ack folder + native cmd.exe stub. Do not patch SteamFix*.dll —
+        // VMProtect integrity fails with "File corrupted!". CreateProcess for the
+        // promo uses "cmd.exe" and searches the game dir before System32.
         QDir().mkpath(target + QStringLiteral("/FreeTP/UserData"));
         QFile anon(target + QStringLiteral("/FreeTP/UserData/AnonFolderSave.txt"));
         if (!anon.exists() && anon.open(QIODevice::WriteOnly))
             anon.close();
+        const QString stubSrc = kit + QStringLiteral("/cmd_stub.exe");
+        if (QFileInfo::exists(stubSrc))
+            copyFileBestEffort(stubSrc, target + QStringLiteral("/cmd.exe"));
         r.targets.append(target);
     }
 
