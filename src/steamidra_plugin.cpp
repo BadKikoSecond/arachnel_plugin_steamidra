@@ -284,21 +284,56 @@ arachnel::core::InstallAnalysis SteamidraPlugin::analyzeFileNames(const QStringL
 std::optional<QString> SteamidraPlugin::detectUpdate(const arachnel::core::LibraryGame& local,
                                                      const arachnel::core::CatalogEntry& remote) const
 {
-    if (remote.uploadDate.isEmpty())
-        return std::nullopt;
-    if (local.uploadDate.isEmpty())
-        return remote.version.isEmpty() ? remote.uploadDate.left(10) : remote.version;
+    const auto remoteLabel = [&]() -> QString {
+        if (!remote.version.isEmpty())
+            return remote.version;
+        if (!remote.uploadDate.isEmpty())
+            return remote.uploadDate.left(10);
+        return {};
+    };
 
-    const QDateTime remoteDt = QDateTime::fromString(remote.uploadDate, Qt::ISODate);
-    const QDateTime localDt = QDateTime::fromString(local.uploadDate, Qt::ISODate);
-    bool newer = false;
-    if (remoteDt.isValid() && localDt.isValid())
-        newer = remoteDt > localDt;
-    else
-        newer = remote.uploadDate > local.uploadDate;
-    if (!newer)
-        return std::nullopt;
-    return remote.version.isEmpty() ? remote.uploadDate.left(10) : remote.version;
+    // 1) Steam buildId / catalog version changed (preferred over Ryuu updated_date).
+    // Relays now set version=public buildid when known; date-only versions still work.
+    if (!remote.version.isEmpty() && !local.version.isEmpty()
+        && remote.version != local.version) {
+        const bool remoteIsDate = QDate::fromString(remote.version.left(10), Qt::ISODate).isValid()
+                                  && remote.version.size() <= 10;
+        const bool localIsDate = QDate::fromString(local.version.left(10), Qt::ISODate).isValid()
+                                 && local.version.size() <= 10;
+        if (!(remoteIsDate && localIsDate)) {
+            // buildId vs buildId, or buildId vs old date marker → treat as update.
+            return remoteLabel();
+        }
+        // Both dates: fall through to uploadDate compare below.
+    } else if (!remote.version.isEmpty() && local.version.isEmpty()) {
+        return remoteLabel();
+    }
+
+    // 2) Classic uploadDate compare (Ryuu listing date - can lag behind real patches).
+    if (!remote.uploadDate.isEmpty()) {
+        if (local.uploadDate.isEmpty())
+            return remoteLabel();
+
+        const QDateTime remoteDt = QDateTime::fromString(remote.uploadDate, Qt::ISODate);
+        const QDateTime localDt = QDateTime::fromString(local.uploadDate, Qt::ISODate);
+        bool newer = false;
+        if (remoteDt.isValid() && localDt.isValid())
+            newer = remoteDt > localDt;
+        else
+            newer = remote.uploadDate > local.uploadDate;
+        if (newer)
+            return remoteLabel();
+    }
+
+    // 3) Date-only version compare when uploadDate missing/equal.
+    if (!remote.version.isEmpty() && !local.version.isEmpty() && remote.version != local.version) {
+        const QDate remoteDay = QDate::fromString(remote.version.left(10), Qt::ISODate);
+        const QDate localDay = QDate::fromString(local.version.left(10), Qt::ISODate);
+        if (remoteDay.isValid() && localDay.isValid() && remoteDay > localDay)
+            return remoteLabel();
+    }
+
+    return std::nullopt;
 }
 
 arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(const arachnel::core::LibraryGame& local) const

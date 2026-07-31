@@ -3,6 +3,7 @@
 #include "http_client.h"
 #include "online_fix_embed.h"
 
+#include <QDebug>
 #include <QDir>
 #include <QDirIterator>
 #include <QElapsedTimer>
@@ -308,9 +309,9 @@ void adoptStagingManifests(const QString& staging, LuaParsed& parsed)
         mid.toLongLong(&ok2);
         if (!ok1 || !ok2)
             continue;
-        // Lua active setManifestid wins; otherwise take relay file (needed for -manifestfile).
-        if (!parsed.manifests.contains(depotId))
-            parsed.manifests.insert(depotId, mid);
+        // Staging *.manifest bytes are authoritative for anonymous -manifestfile downloads.
+        // Lua setManifestid is often stale vs the zip (and useless without the file).
+        parsed.manifests.insert(depotId, mid);
     }
 }
 
@@ -388,7 +389,7 @@ bool processIoBytes(qint64 pid, qint64* readOut, qint64* writeOut);
 qint64 dirByteSize(const QString& path);
 
 void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& parsed,
-              const QString& dest, const QString& depotOs, const QString& staging,
+              const QString& dest, const QString& depotOs, const QString& staging, bool forceUpdate,
               const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
               const std::function<bool()>& shouldCancel)
 {
@@ -445,6 +446,8 @@ void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& 
                          dest,
                          QStringLiteral("-os"),
                          depotOs};
+        if (forceUpdate)
+            args << QStringLiteral("-validate");
         if (parsed.manifests.contains(depotId)) {
             const QString mid = parsed.manifests.value(depotId);
             args << QStringLiteral("-manifest") << mid;
@@ -784,7 +787,7 @@ InstallPipelineResult runInstallPipeline(
         const QString lua = fetchLua(appid, settings, staging.path(), onProgress);
         LuaParsed parsed = parseLua(lua);
         // Local *.manifest from Ryuu are required: anonymous Steam returns 401 without
-        // -manifestfile. Prefer active (uncommented) setManifestid from lua when present.
+        // -manifestfile. Staging filenames override any lua setManifestid pins.
         adoptStagingManifests(staging.path(), parsed);
         filterPrimaryDepots(appid, parsed, settings.includeDlc);
         if (!steam.isEmpty()) {
@@ -802,8 +805,9 @@ InstallPipelineResult runInstallPipeline(
             depotOs = QStringLiteral("windows");
 #endif
 
-        emitProgress(onProgress, 1, QStringLiteral("Downloading..."));
-        runDdmod(pluginRoot, appid, parsed, installPath, depotOs, staging.path(), onProgress,
+        emitProgress(onProgress, 1,
+                     force ? QStringLiteral("Updating…") : QStringLiteral("Downloading..."));
+        runDdmod(pluginRoot, appid, parsed, installPath, depotOs, staging.path(), force, onProgress,
                  shouldCancel);
 
         QJsonObject settingsJson;
@@ -825,6 +829,11 @@ InstallPipelineResult runInstallPipeline(
         QJsonObject payload{{QStringLiteral("appid"), appid},
                             {QStringLiteral("mode"), QStringLiteral("ddmod")},
                             {QStringLiteral("launch"), launch}};
+        QJsonObject manifestsObj;
+        for (auto it = parsed.manifests.begin(); it != parsed.manifests.end(); ++it)
+            manifestsObj.insert(it.key(), it.value());
+        if (!manifestsObj.isEmpty())
+            payload.insert(QStringLiteral("manifests"), manifestsObj);
         if (fix.embedded) {
             QJsonObject of;
             of.insert(QStringLiteral("embedded"), true);
@@ -836,6 +845,8 @@ InstallPipelineResult runInstallPipeline(
         if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate))
             marker.write(QJsonDocument(payload).toJson(QJsonDocument::Indented));
 
+        qInfo().noquote() << "[steamidra] installed" << appid << "force" << force
+                          << "manifests" << parsed.manifests.keys().join(QLatin1Char(','));
         emitProgress(onProgress, 100, QStringLiteral("Installed"), QStringLiteral("completed"));
         result.ok = true;
         result.installPath = installPath;
