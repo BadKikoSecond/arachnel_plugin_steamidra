@@ -288,15 +288,17 @@ void adoptStagingManifests(const QString& staging, LuaParsed& parsed)
 
 void filterPrimaryDepots(const QString& appid, LuaParsed& parsed, bool includeDlc)
 {
-    // Keep appid itself out of depot download list; keep keyed depots.
     QMap<QString, QString> depots = parsed.depots;
+    // App unlock key is not a content depot - downloading it needs no local manifest and fails.
+    depots.remove(appid);
     if (!includeDlc) {
-        // Prefer all keyed depots - DLC exclusion is soft.
-        Q_UNUSED(appid);
+        // Soft: keep all remaining keyed depots (DLC filtering needs richer metadata).
     }
     if (depots.isEmpty() && !parsed.manifests.isEmpty()) {
-        for (auto it = parsed.manifests.begin(); it != parsed.manifests.end(); ++it)
-            depots.insert(it.key(), QString());
+        for (auto it = parsed.manifests.begin(); it != parsed.manifests.end(); ++it) {
+            if (it.key() != appid)
+                depots.insert(it.key(), QString());
+        }
     }
     parsed.depots = depots;
 }
@@ -306,28 +308,7 @@ void ensureInjectBestEffort(const QString& steam, const QString& pluginRoot)
     if (steam.isEmpty() || !QDir(steam).exists())
         return;
     QDir().mkpath(steam + QStringLiteral("/config/stplug-in"));
-#if defined(Q_OS_WIN)
-    const QStringList lumas = {
-        pluginRoot + QStringLiteral("/third_party/LumaCore"),
-        pluginRoot + QStringLiteral("/third_party/windows/LumaCore"),
-    };
-    const QStringList wanted = {QStringLiteral("dwmapi.dll"), QStringLiteral("xinput1_4.dll"),
-                                QStringLiteral("lumacore.dll"), QStringLiteral("lumacorepayload.dll")};
-    for (const QString& root : lumas) {
-        if (!QDir(root).exists())
-            continue;
-        int copied = 0;
-        QDirIterator it(root, wanted, QDir::Files, QDirIterator::Subdirectories);
-        while (it.hasNext()) {
-            it.next();
-            if (QFile::copy(it.filePath(), steam + QLatin1Char('/') + it.fileName())
-                || QFileInfo::exists(steam + QLatin1Char('/') + it.fileName()))
-                ++copied;
-        }
-        if (copied > 0)
-            return;
-    }
-#else
+#if !defined(Q_OS_WIN)
     const QStringList sls = {
         pluginRoot + QStringLiteral("/third_party/SLSsteam"),
         pluginRoot + QStringLiteral("/third_party/linux/SLSsteam"),
@@ -340,6 +321,8 @@ void ensureInjectBestEffort(const QString& steam, const QString& pluginRoot)
             return;
         }
     }
+#else
+    Q_UNUSED(pluginRoot);
 #endif
 }
 
@@ -390,7 +373,7 @@ void depotkitProgressThunk(const depotkit_progress* p, void* user)
 }
 
 void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& dest,
-                 const QString& staging, bool forceUpdate,
+                 const QString& staging, const QString& depotOs, bool forceUpdate,
                  const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
                  const std::function<bool()>& shouldCancel)
 {
@@ -399,33 +382,88 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
     QStringList depotIds = parsed.depots.keys();
     if (depotIds.isEmpty())
         depotIds = parsed.manifests.keys();
+    depotIds.removeAll(appid);
     if (depotIds.isEmpty())
         throw std::runtime_error("No depot IDs - cannot download");
 
-    // Keep QString storage alive for C string pointers passed into depotkit.
-    std::vector<QByteArray> pathBytes;
-    std::vector<QByteArray> keyBytes;
-    pathBytes.reserve(static_cast<size_t>(depotIds.size()));
-    keyBytes.reserve(static_cast<size_t>(depotIds.size()));
-    std::vector<depotkit_depot> depots;
-    depots.reserve(static_cast<size_t>(depotIds.size()));
+    uint32_t wantFlags = 1u; // windows
+    if (depotOs.compare(QStringLiteral("linux"), Qt::CaseInsensitive) == 0)
+        wantFlags = 2u;
+    else if (depotOs.compare(QStringLiteral("macos"), Qt::CaseInsensitive) == 0
+             || depotOs.compare(QStringLiteral("osx"), Qt::CaseInsensitive) == 0)
+        wantFlags = 4u;
+#if !defined(Q_OS_WIN)
+    if (depotOs.isEmpty() || depotOs.compare(QStringLiteral("auto"), Qt::CaseInsensitive) == 0
+        || depotOs.compare(QStringLiteral("windows"), Qt::CaseInsensitive) == 0) {
+        // Linux hosts still usually want Windows depots for Proton.
+        wantFlags = 1u;
+    }
+#endif
+
+    struct Cand {
+        QString depotId;
+        QString key;
+        QString manifestPath;
+        uint32_t plat = 0;
+    };
+    std::vector<Cand> cands;
+    cands.reserve(static_cast<size_t>(depotIds.size()));
 
     for (const QString& depotId : depotIds) {
         const QString key = parsed.depots.value(depotId);
         if (key.size() != 64)
-            throw std::runtime_error(
-                QStringLiteral("Missing depot key for %1").arg(depotId).toStdString());
+            continue; // unlock-only / incomplete
         const QString mf =
             findStagingManifest(staging, depotId, parsed.manifests.value(depotId));
         if (mf.isEmpty())
-            throw std::runtime_error(
-                QStringLiteral("Missing local manifest for depot %1 (anonymous CDN needs it)")
-                    .arg(depotId)
-                    .toStdString());
-        pathBytes.push_back(QDir::toNativeSeparators(mf).toUtf8());
-        keyBytes.push_back(key.toLower().toUtf8());
+            continue; // anonymous CDN cannot fetch without local manifest
+        Cand c;
+        c.depotId = depotId;
+        c.key = key.toLower();
+        c.manifestPath = mf;
+        const QByteArray mfUtf8 = QDir::toNativeSeparators(mf).toUtf8();
+        const QByteArray keyUtf8 = c.key.toUtf8();
+        uint32_t flags = 0;
+        if (depotkit_manifest_platform_hint(mfUtf8.constData(), keyUtf8.constData(), &flags)
+            == DEPOTKIT_OK)
+            c.plat = flags;
+        cands.push_back(std::move(c));
+    }
+
+    if (cands.empty())
+        throw std::runtime_error(
+            "No downloadable depots with local manifests (anonymous CDN needs them)");
+
+    std::vector<Cand> matched;
+    for (const Cand& c : cands) {
+        if (c.plat == 0 || (c.plat & wantFlags))
+            matched.push_back(c);
+    }
+    // If nothing matched the OS hint (weird manifests), fall back to all with files.
+    if (matched.empty())
+        matched = cands;
+    // Prefer exclusive OS matches when we have mixed multi-depot packages.
+    std::vector<Cand> exclusive;
+    for (const Cand& c : matched) {
+        if (c.plat == wantFlags)
+            exclusive.push_back(c);
+    }
+    if (!exclusive.empty())
+        matched = exclusive;
+
+    // Keep QString storage alive for C string pointers passed into depotkit.
+    std::vector<QByteArray> pathBytes;
+    std::vector<QByteArray> keyBytes;
+    pathBytes.reserve(matched.size());
+    keyBytes.reserve(matched.size());
+    std::vector<depotkit_depot> depots;
+    depots.reserve(matched.size());
+
+    for (const Cand& c : matched) {
+        pathBytes.push_back(QDir::toNativeSeparators(c.manifestPath).toUtf8());
+        keyBytes.push_back(c.key.toUtf8());
         depotkit_depot d{};
-        d.depot_id = depotId.toUInt();
+        d.depot_id = c.depotId.toUInt();
         d.manifest_path = pathBytes.back().constData();
         d.key_hex = keyBytes.back().constData();
         depots.push_back(d);
@@ -455,7 +493,8 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
         throw std::runtime_error("Cancelled");
     }
 
-    emitProgress(onProgress, 1, QStringLiteral("Steam CDN…"));
+    emitProgress(onProgress, 1,
+                 QStringLiteral("Steam CDN · %1 depot(s)…").arg(depots.size()));
     const depotkit_result rc = depotkit_download(&req, depotkitProgressThunk, &bridge, ctrl);
     depotkit_control_destroy(ctrl);
 
@@ -666,8 +705,11 @@ InstallPipelineResult runInstallPipeline(
 
         emitProgress(onProgress, 1,
                      force ? QStringLiteral("Updating…") : QStringLiteral("Downloading..."));
-        Q_UNUSED(settings.depotOs); // kept for future OS depot filtering in depotkit
-        runDepotkit(appid, parsed, installPath, staging.path(), force, onProgress, shouldCancel);
+        QString depotOs = settings.depotOs.trimmed();
+        if (depotOs.isEmpty() || depotOs.compare(QStringLiteral("auto"), Qt::CaseInsensitive) == 0)
+            depotOs = QStringLiteral("windows");
+        runDepotkit(appid, parsed, installPath, staging.path(), depotOs, force, onProgress,
+                    shouldCancel);
 
         QJsonObject settingsJson;
         settingsJson.insert(QStringLiteral("autoEmbedOnlineFix"), settings.autoEmbedOnlineFix);

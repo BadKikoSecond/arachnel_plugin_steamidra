@@ -53,8 +53,8 @@ PY
     rm -rf "$TMP"
   fi
 elif [[ "$OS" == "windows" ]]; then
-  mkdir -p "$DEST/LumaCore"
-  echo "Place LumaCore release DLLs under third_party/windows/LumaCore/ (or let worker download at runtime)."
+  mkdir -p "$DEST"
+  echo "Nothing required under third_party/windows (depotkit is linked; no LumaCore)."
 else
   echo "Usage: $0 linux|windows"; exit 2
 fi

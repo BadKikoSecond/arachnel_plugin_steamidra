@@ -2,7 +2,7 @@
 
 User-facing name: **Steam**. The internal id remains `steamidra` so existing installations and settings keep working.
 
-GPL-3 source plugin for [Arachnel](https://github.com/BadKiko/Arachnel): Steam depot installs via linked **[depotkit](https://github.com/BadKiko/depotkit)**, with **LumaCore** (Windows) / **SLSsteam** (Linux) when Steam is present.
+GPL-3 source plugin for [Arachnel](https://github.com/BadKiko/Arachnel): Steam depot installs via linked **[depotkit](https://github.com/BadKiko/depotkit)**, with optional **SLSsteam** on Linux when Steam is present.
 
 Inspired by [SteaMidra / SFF](https://github.com/Midrags/SFF) (GPL-3). This repo does **not** vendor SFF Python modules.
 
@@ -47,11 +47,10 @@ package, and creates a Release. The toolchain is pinned in
 | Component | Linux `.arach` | Windows `.arach` |
 |-----------|----------------|------------------|
 | depotkit (static in plugin) | yes | yes |
-| SLSsteam | yes | — |
-| LumaCore | — | yes (or downloaded on first use) |
+| SLSsteam | optional | — |
 | Online Fix kit | yes | yes |
 
-No DepotDownloaderMod / portable .NET anymore.
+No DepotDownloaderMod / .NET / LumaCore.
 
 ## Requirements
 
@@ -76,7 +75,7 @@ export DEPOTKIT_DIR=~/path/to/depotkit
 | Key | Meaning |
 |-----|---------|
 | `preferMode` | Legacy; ignored. |
-| `depotOs` | Reserved for future OS depot filtering (currently unused). |
+| `depotOs` | `windows` (default) / `linux` / `macos` - which platform depots to keep. |
 | `libraryFolder` | Fallback install root if `--target` is omitted (never Steam `steamapps/common`) |
 | `includeDlc` | Also download DLC depots (default `false`) |
 | `hubcapApiKey` | Optional Hubcap `smm…` key for richer library dates |
@@ -107,7 +106,7 @@ Binaries are harvested into `online_fix_kit/` (not shipped in git):
 
 ## Modes
 
-**depotkit** — download depots with the linked CDN client. Writes ACF + SLS/Luma unlock when Steam exists.
+**depotkit** — download depots with the linked CDN client.
 
 ## Limits
 

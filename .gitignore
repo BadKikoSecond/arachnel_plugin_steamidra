@@ -11,12 +11,12 @@ catalog/.cache/
 
 # Vendored large/binary trees (fetch via tools/fetch_third_party.*)
 third_party/linux/SLSsteam/*.so
-third_party/windows/LumaCore/*.dll
 
-# Legacy DDMod / .NET (no longer used; ignore if still on disk)
+# Legacy (no longer used; ignore if still on disk)
 third_party/**/DDMod/
 third_party/**/dotnet/
 third_party/DDMod/
+third_party/**/LumaCore/
 
 # Local GitLab Runner (must not be committed)
 /config.toml

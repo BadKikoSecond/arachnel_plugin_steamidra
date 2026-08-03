@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 
-# Optional: LumaCore / other injectors (depotkit is linked at build time).
+# Optional third_party prep (depotkit is linked at build time).
 if (-not (Test-Path (Join-Path $Root "third_party\windows"))) {
     Write-Host "Preparing third_party (windows)…"
     & (Join-Path $Root "tools\fetch_third_party.ps1")
