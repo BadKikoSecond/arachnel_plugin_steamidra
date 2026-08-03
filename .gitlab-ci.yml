@@ -92,7 +92,8 @@ build:linux:
   timeout: 2h
   before_script:
     - apt-get update
-    - apt-get install -y --no-install-recommends ca-certificates cmake curl file g++ git ninja-build p7zip-full unrar python3 python3-pip python3-venv unzip zip
+    # curl CLI != libcurl headers; depotkit needs libcurl + OpenSSL on Linux.
+    - apt-get install -y --no-install-recommends ca-certificates cmake curl file g++ git ninja-build p7zip-full pkg-config unrar python3 python3-pip python3-venv unzip zip libcurl4-openssl-dev libssl-dev zlib1g-dev
   script:
     - bash scripts/ci/build-plugin.sh
   artifacts:
