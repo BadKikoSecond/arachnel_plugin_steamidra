@@ -60,10 +60,6 @@ required=(
   "${MERGED}/plugin.json"
   "${MERGED}/steamidra_plugin.dll"
   "${MERGED}/libsteamidra_plugin.so"
-  "${MERGED}/third_party/windows/DDMod/DepotDownloaderMod.dll"
-  "${MERGED}/third_party/windows/dotnet/dotnet.exe"
-  "${MERGED}/third_party/linux/DDMod/DepotDownloaderMod.dll"
-  "${MERGED}/third_party/linux/dotnet/dotnet"
 )
 for path in "${required[@]}"; do
   [[ -f "${path}" ]] || { echo "Universal bundle missing: ${path}" >&2; exit 1; }

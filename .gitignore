@@ -10,22 +10,16 @@ catalog/.cache/
 # into steam.arach (required for Online Fix embeds on Linux). Keep them committed.
 
 # Vendored large/binary trees (fetch via tools/fetch_third_party.*)
-third_party/linux/dotnet/
-third_party/windows/dotnet/
 third_party/linux/SLSsteam/*.so
 third_party/windows/LumaCore/*.dll
-third_party/linux/DDMod/*.dll
-third_party/windows/DDMod/*.dll
-third_party/windows/DDMod/*.exe
 
-# Shared DDMod is vendored for CI (RAR extract needs unrar).
-!third_party/DDMod/
-!third_party/DDMod/**
-
+# Legacy DDMod / .NET (no longer used; ignore if still on disk)
+third_party/**/DDMod/
+third_party/**/dotnet/
+third_party/DDMod/
 
 # Local GitLab Runner (must not be committed)
 /config.toml
-
 
 # Local build trees
 build-*/

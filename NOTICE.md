@@ -20,16 +20,13 @@ Copyright (c) AceSLS
 License: see upstream repository  
 Bundled under `third_party/linux/SLSsteam/` and installed into `~/.local/share/SLSsteam/` (Linux).
 
-## DepotDownloaderMod
+## depotkit
 
-License: GPL-2  
-Shipped under `third_party/*/DDMod/` inside the `.arach` package.
+Copyright (c) depotkit contributors  
+License: MIT  
+https://github.com/BadKiko/depotkit  
 
-## .NET Runtime
-
-Copyright (c) Microsoft Corporation  
-License: MIT / .NET Library License  
-Portable runtime under `third_party/*/dotnet/` for running DepotDownloaderMod without a system-wide install.
+Statically linked Steam CDN depot downloader. See upstream NOTICE for SteamRE/SteamKit protocol notes.
 
 ## Hubcap / Steam
 

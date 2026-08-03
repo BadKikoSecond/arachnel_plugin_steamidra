@@ -102,7 +102,7 @@ QString SteamidraPlugin::version() const
         if (!ver.isEmpty())
             return ver;
     }
-    return QStringLiteral("0.5.1");
+    return QStringLiteral("0.6.0");
 }
 
 QStringList SteamidraPlugin::capabilities() const

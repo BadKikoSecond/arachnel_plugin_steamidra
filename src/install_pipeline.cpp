@@ -3,10 +3,11 @@
 #include "http_client.h"
 #include "online_fix_embed.h"
 
+#include <depotkit.h>
+
 #include <QDebug>
 #include <QDir>
 #include <QDirIterator>
-#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -17,11 +18,15 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTemporaryDir>
-#include <QThread>
 
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #if defined(Q_OS_WIN)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
 #  include <windows.h>
 #endif
 
@@ -49,40 +54,6 @@ bool steamLooksValid(const QString& path)
     return QFileInfo::exists(path + QStringLiteral("/steam.exe"))
            || QFileInfo::exists(path + QStringLiteral("/steam.sh"))
            || QDir(path + QStringLiteral("/steamapps")).exists();
-}
-
-QString findDdmod(const QString& pluginRoot)
-{
-    const QStringList cands = {
-        pluginRoot + QStringLiteral("/third_party/DDMod/DepotDownloaderMod.dll"),
-        pluginRoot + QStringLiteral("/third_party/windows/DDMod/DepotDownloaderMod.dll"),
-        pluginRoot + QStringLiteral("/third_party/linux/DDMod/DepotDownloaderMod.dll"),
-    };
-    for (const QString& c : cands) {
-        if (QFileInfo::exists(c))
-            return c;
-    }
-    return {};
-}
-
-QString findDotnet(const QString& pluginRoot)
-{
-#if defined(Q_OS_WIN)
-    const QStringList cands = {
-        pluginRoot + QStringLiteral("/third_party/dotnet/dotnet.exe"),
-        pluginRoot + QStringLiteral("/third_party/windows/dotnet/dotnet.exe"),
-    };
-#else
-    const QStringList cands = {
-        pluginRoot + QStringLiteral("/third_party/dotnet/dotnet"),
-        pluginRoot + QStringLiteral("/third_party/linux/dotnet/dotnet"),
-    };
-#endif
-    for (const QString& c : cands) {
-        if (QFileInfo::exists(c))
-            return c;
-    }
-    return QStandardPaths::findExecutable(QStringLiteral("dotnet"));
 }
 
 bool extractZipToDir(const QString& zipPath, const QString& destDir)
@@ -132,7 +103,7 @@ LuaParsed parseLua(const QString& text)
         QRegularExpression::CaseInsensitiveOption);
 
     // Ryuu / Hubcap often leave stale setManifestid lines commented with `--`.
-    // Matching those pins DepotDownloader to an old build (e.g. Meccha 3.0.0 vs 3.3.0).
+    // Matching those pins an old build (e.g. Meccha 3.0.0 vs 3.3.0).
     const QStringList lines = text.split(QLatin1Char('\n'));
     for (QString line : lines) {
         const int comment = line.indexOf(QStringLiteral("--"));
@@ -320,8 +291,7 @@ void filterPrimaryDepots(const QString& appid, LuaParsed& parsed, bool includeDl
     // Keep appid itself out of depot download list; keep keyed depots.
     QMap<QString, QString> depots = parsed.depots;
     if (!includeDlc) {
-        // Heuristic: keep depots whose id is close to appid or all keyed depots (DDMod needs keys).
-        // Prefer all keyed depots — DLC exclusion is soft.
+        // Prefer all keyed depots - DLC exclusion is soft.
         Q_UNUSED(appid);
     }
     if (depots.isEmpty() && !parsed.manifests.isEmpty()) {
@@ -329,18 +299,6 @@ void filterPrimaryDepots(const QString& appid, LuaParsed& parsed, bool includeDl
             depots.insert(it.key(), QString());
     }
     parsed.depots = depots;
-}
-
-void clearTempManifestPollution(const QStringList& depotIds)
-{
-    const QString tmp = QDir::tempPath();
-    for (const QString& depotId : depotIds) {
-        QFile::remove(tmp + QStringLiteral("/arachnel_dd_%1.manifest").arg(depotId));
-        for (const QString& name :
-             QDir(tmp).entryList({depotId + QStringLiteral("_*.manifest")}, QDir::Files)) {
-            QFile::remove(tmp + QLatin1Char('/') + name);
-        }
-    }
 }
 
 void ensureInjectBestEffort(const QString& steam, const QString& pluginRoot)
@@ -385,179 +343,129 @@ void ensureInjectBestEffort(const QString& steam, const QString& pluginRoot)
 #endif
 }
 
-bool processIoBytes(qint64 pid, qint64* readOut, qint64* writeOut);
 qint64 dirByteSize(const QString& path);
 
-void runDdmod(const QString& pluginRoot, const QString& appid, const LuaParsed& parsed,
-              const QString& dest, const QString& depotOs, const QString& staging, bool forceUpdate,
-              const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
-              const std::function<bool()>& shouldCancel)
+QString findStagingManifest(const QString& staging, const QString& depotId, const QString& manifestId)
 {
-    const QString dll = findDdmod(pluginRoot);
-    const QString dotnet = findDotnet(pluginRoot);
-    if (dll.isEmpty())
-        throw std::runtime_error("DepotDownloaderMod.dll missing");
-    if (dotnet.isEmpty())
-        throw std::runtime_error("Bundled .NET runtime missing");
+    if (!manifestId.isEmpty()) {
+        const QString exact =
+            staging + QLatin1Char('/') + depotId + QLatin1Char('_') + manifestId
+            + QStringLiteral(".manifest");
+        if (QFileInfo::exists(exact))
+            return exact;
+    }
+    const QStringList matches =
+        QDir(staging).entryList({depotId + QStringLiteral("_*.manifest")}, QDir::Files, QDir::Name);
+    if (!matches.isEmpty())
+        return staging + QLatin1Char('/') + matches.first();
+    return {};
+}
 
+struct DepotkitProgressBridge {
+    std::function<void(const arachnel::core::OwnedDownloadProgress&)> onProgress;
+    std::function<bool()> shouldCancel;
+    depotkit_control* ctrl = nullptr;
+};
+
+void depotkitProgressThunk(const depotkit_progress* p, void* user)
+{
+    auto* bridge = static_cast<DepotkitProgressBridge*>(user);
+    if (!bridge || !p)
+        return;
+    if (bridge->shouldCancel && bridge->shouldCancel() && bridge->ctrl)
+        depotkit_cancel(bridge->ctrl);
+
+    int pct = 0;
+    if (p->bytes_total > 0)
+        pct = qBound(1, 99, int((p->bytes_done * 100) / p->bytes_total));
+    if (p->phase == DEPOTKIT_PHASE_DONE)
+        pct = 99;
+    else if (p->phase == DEPOTKIT_PHASE_ERROR || p->phase == DEPOTKIT_PHASE_CANCELLED)
+        pct = qMax(1, pct);
+
+    const QString detail = p->detail ? QString::fromUtf8(p->detail) : QStringLiteral("Downloading...");
+    emitProgress(bridge->onProgress, pct, detail, QStringLiteral("downloading"),
+                 static_cast<qint64>(p->bytes_done), static_cast<qint64>(p->bytes_total),
+                 static_cast<int>(p->rate_bps));
+}
+
+void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& dest,
+                 const QString& staging, bool forceUpdate,
+                 const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
+                 const std::function<bool()>& shouldCancel)
+{
     QDir().mkpath(dest);
-    const QString keysTmp = staging + QStringLiteral("/depotkeys.vdf");
-    {
-        QFile kf(keysTmp);
-        if (!kf.open(QIODevice::WriteOnly | QIODevice::Truncate))
-            throw std::runtime_error("Cannot write depot keys file");
-        for (auto it = parsed.depots.begin(); it != parsed.depots.end(); ++it)
-            kf.write(QStringLiteral("%1;%2\n").arg(it.key(), it.value()).toUtf8());
+
+    QStringList depotIds = parsed.depots.keys();
+    if (depotIds.isEmpty())
+        depotIds = parsed.manifests.keys();
+    if (depotIds.isEmpty())
+        throw std::runtime_error("No depot IDs - cannot download");
+
+    // Keep QString storage alive for C string pointers passed into depotkit.
+    std::vector<QByteArray> pathBytes;
+    std::vector<QByteArray> keyBytes;
+    pathBytes.reserve(static_cast<size_t>(depotIds.size()));
+    keyBytes.reserve(static_cast<size_t>(depotIds.size()));
+    std::vector<depotkit_depot> depots;
+    depots.reserve(static_cast<size_t>(depotIds.size()));
+
+    for (const QString& depotId : depotIds) {
+        const QString key = parsed.depots.value(depotId);
+        if (key.size() != 64)
+            throw std::runtime_error(
+                QStringLiteral("Missing depot key for %1").arg(depotId).toStdString());
+        const QString mf =
+            findStagingManifest(staging, depotId, parsed.manifests.value(depotId));
+        if (mf.isEmpty())
+            throw std::runtime_error(
+                QStringLiteral("Missing local manifest for depot %1 (anonymous CDN needs it)")
+                    .arg(depotId)
+                    .toStdString());
+        pathBytes.push_back(QDir::toNativeSeparators(mf).toUtf8());
+        keyBytes.push_back(key.toLower().toUtf8());
+        depotkit_depot d{};
+        d.depot_id = depotId.toUInt();
+        d.manifest_path = pathBytes.back().constData();
+        d.key_hex = keyBytes.back().constData();
+        depots.push_back(d);
     }
 
-    QStringList depots = parsed.depots.keys();
-    if (depots.isEmpty())
-        depots = parsed.manifests.keys();
-    if (depots.isEmpty())
-        throw std::runtime_error("No depot IDs — cannot run DepotDownloaderMod");
+    const QByteArray installDir = QDir::toNativeSeparators(dest).toUtf8();
+    depotkit_request req{};
+    req.app_id = appid.toUInt();
+    req.depots = depots.data();
+    req.depot_count = depots.size();
+    req.install_dir = installDir.constData();
+    req.max_downloads = 64;
+    req.validate = forceUpdate ? 1 : 0;
+    req.cell_id = 0;
 
-    // DepotDownloaderMod may auto-bind leftover %TEMP%/<depot>_*.manifest → anonymous 401.
-    clearTempManifestPollution(depots);
+    depotkit_control* ctrl = depotkit_control_create();
+    if (!ctrl)
+        throw std::runtime_error("depotkit_control_create failed");
 
-    const int depotCount = qMax(1, depots.size());
-    qint64 completedWritten = 0;
-    qint64 totalHint = 0;
-    QElapsedTimer sizeTimer;
-    sizeTimer.start();
+    DepotkitProgressBridge bridge;
+    bridge.onProgress = onProgress;
+    bridge.shouldCancel = shouldCancel;
+    bridge.ctrl = ctrl;
 
-    for (int i = 0; i < depots.size(); ++i) {
-        if (shouldCancel && shouldCancel())
-            throw std::runtime_error("Cancelled");
-        const QString depotId = depots.at(i);
-        const int basePct = qMax(1, int(99.0 * double(i) / double(depotCount)));
-        emitProgress(onProgress, basePct, QStringLiteral("Downloading depot %1…").arg(depotId),
-                     QStringLiteral("downloading"), completedWritten, totalHint);
+    if (shouldCancel && shouldCancel()) {
+        depotkit_control_destroy(ctrl);
+        throw std::runtime_error("Cancelled");
+    }
 
-        QStringList args{dll,
-                         QStringLiteral("-app"),
-                         appid,
-                         QStringLiteral("-depot"),
-                         depotId,
-                         QStringLiteral("-depotkeys"),
-                         keysTmp,
-                         QStringLiteral("-max-downloads"),
-                         QStringLiteral("64"),
-                         QStringLiteral("-dir"),
-                         dest,
-                         QStringLiteral("-os"),
-                         depotOs};
-        if (forceUpdate)
-            args << QStringLiteral("-validate");
-        if (parsed.manifests.contains(depotId)) {
-            const QString mid = parsed.manifests.value(depotId);
-            args << QStringLiteral("-manifest") << mid;
-            const QString stagingMf =
-                staging + QLatin1Char('/') + depotId + QLatin1Char('_') + mid
-                + QStringLiteral(".manifest");
-            if (QFileInfo::exists(stagingMf))
-                args << QStringLiteral("-manifestfile") << stagingMf;
-        }
+    emitProgress(onProgress, 1, QStringLiteral("Steam CDN…"));
+    const depotkit_result rc = depotkit_download(&req, depotkitProgressThunk, &bridge, ctrl);
+    depotkit_control_destroy(ctrl);
 
-        QProcess proc;
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        env.insert(QStringLiteral("DOTNET_ROOT"), QFileInfo(dotnet).absolutePath());
-        proc.setProcessEnvironment(env);
-        proc.setProcessChannelMode(QProcess::MergedChannels);
-        proc.start(dotnet, args);
-        if (!proc.waitForStarted(30000))
-            throw std::runtime_error("Failed to start DepotDownloaderMod");
-
-        qint64 readStart = 0, writeStart = 0;
-        const bool ioOk = processIoBytes(proc.processId(), &readStart, &writeStart);
-        qint64 procWrittenMax = 0;
-        double depotPeakLocal = 0.0;
-        QElapsedTimer emitTimer;
-        emitTimer.start();
-
-        static const QRegularExpression pctRe(QStringLiteral(R"(^\s*(\d+(?:\.\d+)?)\s*%)"));
-        QByteArray log;
-        while (proc.state() != QProcess::NotRunning) {
-            if (shouldCancel && shouldCancel()) {
-                proc.kill();
-                throw std::runtime_error("Cancelled");
-            }
-            proc.waitForReadyRead(200);
-            const QByteArray chunk = proc.readAll();
-            if (!chunk.isEmpty())
-                log += chunk;
-            for (const QByteArray& line : chunk.split('\n')) {
-                const auto m = pctRe.match(QString::fromUtf8(line));
-                if (m.hasMatch())
-                    depotPeakLocal = qMax(depotPeakLocal, qMin(100.0, m.captured(1).toDouble()));
-            }
-
-            if (emitTimer.elapsed() < 400)
-                continue;
-            emitTimer.restart();
-
-            if (ioOk) {
-                qint64 readNow = 0, writeNow = 0;
-                if (processIoBytes(proc.processId(), &readNow, &writeNow)) {
-                    Q_UNUSED(readNow);
-                    procWrittenMax = qMax(procWrittenMax, qMax<qint64>(0, writeNow - writeStart));
-                }
-            }
-            // Logical size after SetLength = good total; do not use as downloaded.
-            // Never max(total, downloaded) - that collapsed total≈downloaded and stuck at 99%.
-            if (sizeTimer.elapsed() >= 1000 || totalHint <= 0) {
-                totalHint = qMax(totalHint, dirByteSize(dest));
-                sizeTimer.restart();
-            }
-            const qint64 downloaded = completedWritten + procWrittenMax;
-            int overall =
-                qBound(1, 99, int(99.0 * (double(i) + depotPeakLocal / 100.0) / double(depotCount)));
-            if (totalHint >= 64LL * 1024 * 1024 && downloaded > 0 && totalHint > downloaded
-                && (totalHint - downloaded)
-                       >= qMax<qint64>(1024LL * 1024, totalHint / 50)) {
-                const int ratioPct = qBound(1, 99, int(downloaded * 100 / totalHint));
-                overall = qMax(overall, ratioPct);
-            }
-            emitProgress(onProgress, overall, QStringLiteral("Downloading..."),
-                         QStringLiteral("downloading"), downloaded, totalHint);
-        }
-        log += proc.readAll();
-        if (ioOk) {
-            qint64 readNow = 0, writeNow = 0;
-            if (processIoBytes(proc.processId(), &readNow, &writeNow))
-                procWrittenMax = qMax(procWrittenMax, qMax<qint64>(0, writeNow - writeStart));
-        }
-        completedWritten += procWrittenMax;
-        totalHint = qMax(totalHint, dirByteSize(dest));
-
-        if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
-            const QString full = QString::fromUtf8(log);
-            QString err;
-            for (const QString& line : full.split(QLatin1Char('\n'))) {
-                const QString t = line.trimmed();
-                if (t.contains(QStringLiteral("401"), Qt::CaseInsensitive)
-                    || t.contains(QStringLiteral("Unable"), Qt::CaseInsensitive)
-                    || t.contains(QStringLiteral("Error"), Qt::CaseInsensitive)
-                    || t.contains(QStringLiteral("failed"), Qt::CaseInsensitive)
-                    || t.contains(QStringLiteral("Aborting"), Qt::CaseInsensitive)) {
-                    err += t + QLatin1Char(' ');
-                }
-            }
-            if (err.isEmpty())
-                err = full.trimmed();
-            err = err.simplified().right(600);
-            if (err.isEmpty())
-                err = QStringLiteral("exit %1 (no output — often missing -manifestfile / AV lock)")
-                          .arg(proc.exitCode());
-            throw std::runtime_error(
-                QStringLiteral("DepotDownloader failed for depot %1: %2")
-                    .arg(depotId, err)
-                    .toStdString());
-        }
-
-        emitProgress(onProgress,
-                     qBound(1, 99, int(99.0 * double(i + 1) / double(depotCount))),
-                     QStringLiteral("Downloading..."), QStringLiteral("downloading"),
-                     completedWritten, totalHint);
+    if (rc == DEPOTKIT_ERR_CANCELLED || (shouldCancel && shouldCancel()))
+        throw std::runtime_error("Cancelled");
+    if (rc != DEPOTKIT_OK) {
+        throw std::runtime_error(
+            QStringLiteral("depotkit failed: %1")
+                .arg(QString::fromUtf8(depotkit_strerror(rc)))
+                .toStdString());
     }
 }
 
@@ -570,47 +478,6 @@ qint64 dirByteSize(const QString& path)
         n += it.fileInfo().size();
     }
     return n;
-}
-
-/** Actual bytes written by DepotDownloader (SetLength prealloc does not inflate this). */
-bool processIoBytes(qint64 pid, qint64* readOut, qint64* writeOut)
-{
-    if (pid <= 0)
-        return false;
-#if defined(Q_OS_WIN)
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
-    if (!h)
-        return false;
-    IO_COUNTERS counters{};
-    const BOOL ok = GetProcessIoCounters(h, &counters);
-    CloseHandle(h);
-    if (!ok)
-        return false;
-    if (readOut)
-        *readOut = static_cast<qint64>(counters.ReadTransferCount);
-    if (writeOut)
-        *writeOut = static_cast<qint64>(counters.WriteTransferCount);
-    return true;
-#else
-    QFile f(QStringLiteral("/proc/%1/io").arg(pid));
-    if (!f.open(QIODevice::ReadOnly))
-        return false;
-    qint64 r = -1, w = -1;
-    while (!f.atEnd()) {
-        const QByteArray line = f.readLine().trimmed();
-        if (line.startsWith("read_bytes:"))
-            r = line.mid(11).trimmed().toLongLong();
-        else if (line.startsWith("write_bytes:"))
-            w = line.mid(12).trimmed().toLongLong();
-    }
-    if (r < 0 || w < 0)
-        return false;
-    if (readOut)
-        *readOut = r;
-    if (writeOut)
-        *writeOut = w;
-    return true;
-#endif
 }
 
 bool alreadyInstalled(const QString& path, const QString& appid)
@@ -797,18 +664,10 @@ InstallPipelineResult runInstallPipeline(
                 luaOut.write(lua.toUtf8());
         }
 
-        QString depotOs = settings.depotOs;
-        if (depotOs.isEmpty())
-            depotOs = QStringLiteral("windows");
-#if !defined(Q_OS_WIN)
-        if (depotOs == QStringLiteral("auto"))
-            depotOs = QStringLiteral("windows");
-#endif
-
         emitProgress(onProgress, 1,
                      force ? QStringLiteral("Updating…") : QStringLiteral("Downloading..."));
-        runDdmod(pluginRoot, appid, parsed, installPath, depotOs, staging.path(), force, onProgress,
-                 shouldCancel);
+        Q_UNUSED(settings.depotOs); // kept for future OS depot filtering in depotkit
+        runDepotkit(appid, parsed, installPath, staging.path(), force, onProgress, shouldCancel);
 
         QJsonObject settingsJson;
         settingsJson.insert(QStringLiteral("autoEmbedOnlineFix"), settings.autoEmbedOnlineFix);
@@ -827,7 +686,7 @@ InstallPipelineResult runInstallPipeline(
         }
         QFile marker(installPath + QStringLiteral("/.arachnel-steamidra"));
         QJsonObject payload{{QStringLiteral("appid"), appid},
-                            {QStringLiteral("mode"), QStringLiteral("ddmod")},
+                                {QStringLiteral("mode"), QStringLiteral("depotkit")},
                             {QStringLiteral("launch"), launch}};
         QJsonObject manifestsObj;
         for (auto it = parsed.manifests.begin(); it != parsed.manifests.end(); ++it)
@@ -850,7 +709,7 @@ InstallPipelineResult runInstallPipeline(
         emitProgress(onProgress, 100, QStringLiteral("Installed"), QStringLiteral("completed"));
         result.ok = true;
         result.installPath = installPath;
-        result.mode = QStringLiteral("ddmod");
+        result.mode = QStringLiteral("depotkit");
         result.launch = launch;
         return result;
     } catch (const std::exception& ex) {

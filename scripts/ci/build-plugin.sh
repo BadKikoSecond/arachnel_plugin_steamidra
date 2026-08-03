@@ -19,6 +19,13 @@ if [[ ! -f "${SDK_DIR}/cmake/ArachnelPluginSdk.cmake" ]]; then
     https://github.com/BadKiko/Arachnel.git "${SDK_DIR}"
 fi
 
+DEPOTKIT_DIR="${DEPOTKIT_DIR:-${ROOT}/.ci/depotkit}"
+if [[ ! -f "${DEPOTKIT_DIR}/CMakeLists.txt" ]]; then
+  rm -rf "${DEPOTKIT_DIR}"
+  git clone --depth 1 --branch "${DEPOTKIT_REF:-main}" \
+    "${DEPOTKIT_GIT_URL:-https://github.com/BadKiko/depotkit.git}" "${DEPOTKIT_DIR}"
+fi
+
 if [[ ! -f "${QT_PATH}/lib/cmake/Qt6/Qt6Config.cmake" ]]; then
   AQT_VENV="${ROOT}/.ci/aqt-venv"
   [[ -x "${AQT_VENV}/bin/aqt" ]] || {
@@ -36,7 +43,8 @@ bash tools/fetch_third_party.sh linux
 cmake -S "${ROOT}" -B "${BUILD}" -G Ninja \
   -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
   -DCMAKE_PREFIX_PATH="${QT_PATH}" \
-  -DARACHNEL_SDK_DIR="${SDK_DIR}"
+  -DARACHNEL_SDK_DIR="${SDK_DIR}" \
+  -DDEPOTKIT_DIR="${DEPOTKIT_DIR}"
 cmake --build "${BUILD}" --target steamidra_arach -j"$(nproc)"
 
 mkdir -p "${DIST}"

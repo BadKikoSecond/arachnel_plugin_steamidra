@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Fetch/vendor OS-specific third_party bits for self-contained SteaMidra builds.
+# Depot download uses linked depotkit - no DepotDownloaderMod / .NET runtime.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OS="${1:-linux}"
 DEST="$ROOT/third_party/$OS"
-mkdir -p "$DEST/DDMod" "$DEST/dotnet"
 
 echo "==> third_party/$OS"
 
@@ -12,7 +12,6 @@ if [[ "$OS" == "linux" ]]; then
   mkdir -p "$DEST/SLSsteam"
   if [[ ! -f "$DEST/SLSsteam/SLSsteam.so" ]]; then
     echo "Downloading AceSLS SLSsteam…"
-    API="https://api.github.com/repos/AceSLS/SLSsteam/releases/latest"
     URL="$(python3 - <<'PY'
 import json,urllib.request
 req=urllib.request.Request("https://api.github.com/repos/AceSLS/SLSsteam/releases/latest",
@@ -32,8 +31,6 @@ PY
     TMP="$(mktemp -d)"
     mkdir -p "$TMP/out"
     curl -fL --retry 5 --retry-all-errors -o "$TMP/sls.bin" "$URL"
-    # Prefer 7z: `file` reports "7-zip archive", which falsely matches `grep zip`
-    # and then unzip fails on SLSsteam-Any.7z.
     if ! 7z x "$TMP/sls.bin" "-o$TMP/out" -y >/dev/null; then
       if file "$TMP/sls.bin" | grep -qiE 'Zip archive|zip compressed data'; then
         unzip -qo "$TMP/sls.bin" -d "$TMP/out"
@@ -55,49 +52,11 @@ PY
     done
     rm -rf "$TMP"
   fi
-  if [[ ! -x "$DEST/dotnet/dotnet" ]]; then
-    curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install-steamidra.sh
-    bash /tmp/dotnet-install-steamidra.sh --channel 9.0 --runtime dotnet --install-dir "$DEST/dotnet"
-  fi
 elif [[ "$OS" == "windows" ]]; then
   mkdir -p "$DEST/LumaCore"
-  if [[ ! -x "$DEST/dotnet/dotnet.exe" ]] && [[ ! -x "$DEST/dotnet/dotnet" ]]; then
-    curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install-steamidra.sh
-    # Cross-fetch Windows runtime from Linux hosts when packaging for Win
-    bash /tmp/dotnet-install-steamidra.sh --channel 9.0 --runtime dotnet \
-      --os win --arch x64 --install-dir "$DEST/dotnet"
-  fi
   echo "Place LumaCore release DLLs under third_party/windows/LumaCore/ (or let worker download at runtime)."
 else
   echo "Usage: $0 linux|windows"; exit 2
-fi
-
-if [[ ! -f "$DEST/DDMod/DepotDownloaderMod.dll" ]]; then
-  if [[ -f "$ROOT/third_party/DDMod/DepotDownloaderMod.dll" ]]; then
-    cp -a "$ROOT/third_party/DDMod/"* "$DEST/DDMod/"
-  elif [[ -f "$ROOT/third_party/linux/DDMod/DepotDownloaderMod.dll" ]]; then
-    cp -a "$ROOT/third_party/linux/DDMod/"* "$DEST/DDMod/"
-  else
-    echo "Downloading DepotDownloaderMod 3.4.0.2…"
-    TMP_DD="$(mktemp -d)"
-    mkdir -p "$TMP_DD/out"
-    curl -fL --retry 5 --retry-all-errors \
-      -o "$TMP_DD/Release.rar" \
-      "https://github.com/SteamAutoCracks/DepotDownloaderMod/releases/download/DepotDownloaderMod_3.4.0.2/Release.rar"
-    # p7zip often lacks RAR codecs ("Unsupported Method"); prefer unrar.
-    if command -v unrar >/dev/null 2>&1; then
-      unrar x -o+ "$TMP_DD/Release.rar" "$TMP_DD/out/" >/dev/null
-    elif 7z x "$TMP_DD/Release.rar" "-o$TMP_DD/out" -y >/dev/null; then
-      :
-    else
-      echo "Failed to extract DepotDownloaderMod RAR (install unrar or p7zip-rar)"
-      exit 1
-    fi
-    DD_DLL="$(find "$TMP_DD/out" -type f -name DepotDownloaderMod.dll -print -quit)"
-    [[ -n "$DD_DLL" ]] || { echo "DepotDownloaderMod.dll missing in release"; find "$TMP_DD/out" | head -n 40; exit 1; }
-    cp -a "$(dirname "$DD_DLL")/." "$DEST/DDMod/"
-    rm -rf "$TMP_DD"
-  fi
 fi
 
 echo "OK $DEST"

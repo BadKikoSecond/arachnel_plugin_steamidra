@@ -1,16 +1,16 @@
 #Requires -Version 5.1
 param(
     [string]$BuildDir = "build-win",
-    [string]$ArachnelSdkDir = $(if ($env:ARACHNEL_SDK_DIR) { $env:ARACHNEL_SDK_DIR } else { "" })
+    [string]$ArachnelSdkDir = $(if ($env:ARACHNEL_SDK_DIR) { $env:ARACHNEL_SDK_DIR } else { "" }),
+    [string]$DepotkitDir = $(if ($env:DEPOTKIT_DIR) { $env:DEPOTKIT_DIR } else { "" })
 )
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 
-$dd = Join-Path $Root "third_party\windows\DDMod\DepotDownloaderMod.dll"
-$dotnet = Join-Path $Root "third_party\windows\dotnet\dotnet.exe"
-if (-not (Test-Path $dd) -or -not (Test-Path $dotnet)) {
-    Write-Host "Fetching third_party (windows)…"
+# Optional: LumaCore / other injectors (depotkit is linked at build time).
+if (-not (Test-Path (Join-Path $Root "third_party\windows"))) {
+    Write-Host "Preparing third_party (windows)…"
     & (Join-Path $Root "tools\fetch_third_party.ps1")
 }
 
@@ -51,6 +51,21 @@ if (-not $ArachnelSdkDir -or -not (Test-Path (Join-Path $ArachnelSdkDir "cmake\A
     Write-Error "Set ARACHNEL_SDK_DIR to an Arachnel checkout (contains cmake/ArachnelPluginSdk.cmake)."
 }
 
+if (-not $DepotkitDir) {
+    foreach ($candidate in @(
+            (Join-Path $Root "..\depotkit"),
+            "D:\PetWork\depotkit"
+        )) {
+        if (Test-Path (Join-Path $candidate "CMakeLists.txt")) {
+            $DepotkitDir = (Resolve-Path $candidate).Path
+            break
+        }
+    }
+}
+if (-not $DepotkitDir -or -not (Test-Path (Join-Path $DepotkitDir "CMakeLists.txt"))) {
+    Write-Error "Set DEPOTKIT_DIR to a depotkit checkout (https://github.com/BadKiko/depotkit)."
+}
+
 $qtPrefix = Find-QtPrefix
 if (-not $qtPrefix) {
     Write-Error "Qt 6 kit not found. Set CMAKE_PREFIX_PATH, e.g. D:\Qt\6.11.1\mingw_64"
@@ -62,7 +77,8 @@ if (-not (Test-Path $buildPath)) {
     cmake -S $Root -B $buildPath -G Ninja `
         -DCMAKE_BUILD_TYPE=RelWithDebInfo `
         -DCMAKE_PREFIX_PATH="$qtPrefix" `
-        -DARACHNEL_SDK_DIR="$ArachnelSdkDir"
+        -DARACHNEL_SDK_DIR="$ArachnelSdkDir" `
+        -DDEPOTKIT_DIR="$DepotkitDir"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
