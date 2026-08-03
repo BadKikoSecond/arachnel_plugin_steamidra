@@ -484,8 +484,10 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
     req.depot_count = depots.size();
     req.install_dir = installDir.constData();
     req.max_downloads = 48;
-    req.validate = forceUpdate ? 1 : 0;
+    // Always SHA1-check existing files. Size-only skip treats SetEndOfFile stubs as done.
+    req.validate = 1;
     req.cell_id = 0;
+    (void)forceUpdate;
 
     const bool ownsCtrl = externalCtrl == nullptr;
     depotkit_control* ctrl = externalCtrl ? externalCtrl : depotkit_control_create();
@@ -547,8 +549,8 @@ bool alreadyInstalled(const QString& path, const QString& appid)
     const QString mode = o.value(QStringLiteral("mode")).toString();
     // Only trust a finished CDN install marker. Size/exe heuristics and
     // "already-installed" markers from incomplete trees caused false Play.
-    return mode == QStringLiteral("depotkit")
-           || mode == QStringLiteral("DepotDownloaderMod");
+    return mode == QStringLiteral("depotkit") || mode == QStringLiteral("DepotDownloaderMod")
+           || mode == QStringLiteral("ddmod");
 }
 
 QString sanitizeInstallDir(const QString& title, const QString& appid)
@@ -677,15 +679,28 @@ InstallPipelineResult runInstallPipeline(
                 launch.insert(QStringLiteral("type"), QStringLiteral("steam"));
                 launch.insert(QStringLiteral("uri"), QStringLiteral("steam://rungameid/%1").arg(appid));
             }
+            QString keptMode = QStringLiteral("depotkit");
+            {
+                QFile existing(installPath + QStringLiteral("/.arachnel-steamidra"));
+                if (existing.open(QIODevice::ReadOnly)) {
+                    const QString mode =
+                        QJsonDocument::fromJson(existing.readAll())
+                            .object()
+                            .value(QStringLiteral("mode"))
+                            .toString();
+                    if (!mode.isEmpty())
+                        keptMode = mode;
+                }
+            }
             QFile marker(installPath + QStringLiteral("/.arachnel-steamidra"));
             QJsonObject payload{{QStringLiteral("appid"), appid},
-                                {QStringLiteral("mode"), QStringLiteral("already-installed")},
+                                {QStringLiteral("mode"), keptMode},
                                 {QStringLiteral("launch"), launch}};
             if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate))
                 marker.write(QJsonDocument(payload).toJson(QJsonDocument::Indented));
             result.ok = true;
             result.installPath = installPath;
-            result.mode = QStringLiteral("already-installed");
+            result.mode = keptMode;
             result.launch = launch;
             result.skippedDownload = true;
             if (fix.embedded) {
