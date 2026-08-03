@@ -50,6 +50,11 @@ public:
 
     void cancelOwnedDownload(const QString& jobId) const override;
 
+    /** Sync on-disk catalog and return raw UTF-8 JSON (no in-memory row mirror). */
+    QByteArray catalogJsonUtf8() const;
+
+    void releaseCatalogMemory() const;
+
 private:
     QString settingsPath() const;
     QString catalogCachePath() const;

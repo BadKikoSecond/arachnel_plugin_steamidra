@@ -148,9 +148,17 @@ arachnel::core::CatalogEntry catalogEntryFromJson(const QJsonObject& obj)
     arachnel::core::CatalogEntry e;
     e.id = obj.value(QStringLiteral("id")).toString();
     e.title = obj.value(QStringLiteral("title")).toString();
-    e.coverUrl = obj.value(QStringLiteral("coverUrl")).toString();
     e.sourceId = QStringLiteral("steamidra");
     e.steamAppId = obj.value(QStringLiteral("steamAppId")).toString();
+    {
+        const QString feedCover = obj.value(QStringLiteral("coverUrl")).toString().trimmed();
+        if (feedCover.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive)
+            || feedCover.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)) {
+            e.remoteCoverUrl = feedCover;
+        } else if (feedCover.startsWith(QStringLiteral("file:"))) {
+            e.coverUrl = feedCover;
+        }
+    }
     e.description = obj.value(QStringLiteral("description")).toString();
     e.genres = obj.value(QStringLiteral("genres")).toString();
     e.sizeLabel = obj.value(QStringLiteral("sizeLabel")).toString();
@@ -172,9 +180,11 @@ arachnel::core::CatalogEntry catalogEntryFromJson(const QJsonObject& obj)
     e.itemKind = arachnel::core::CatalogItemKind::Game;
     if (e.id.isEmpty() && !e.steamAppId.isEmpty())
         e.id = QStringLiteral("steam-%1").arg(e.steamAppId);
-    if (e.coverUrl.isEmpty() && !e.steamAppId.isEmpty()) {
-        e.coverUrl = QStringLiteral("https://cdn.akamai.steamstatic.com/steam/apps/%1/header.jpg")
-                         .arg(e.steamAppId);
+    // Last-resort remote hint only - never invent display https into coverUrl.
+    if (e.remoteCoverUrl.isEmpty() && !e.steamAppId.isEmpty()) {
+        e.remoteCoverUrl =
+            QStringLiteral("https://cdn.akamai.steamstatic.com/steam/apps/%1/header.jpg")
+                .arg(e.steamAppId);
     }
     // TEMP: hide catalog add-ons (Online-Fix repair zips, etc.) in the download sheet.
     e.addons.clear();

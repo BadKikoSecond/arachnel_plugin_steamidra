@@ -39,8 +39,9 @@ int arachnel_plugin_catalog_json(arachnel::core::ISourcePlugin* plugin, char** o
         return -1;
     *out_utf8 = nullptr;
     *out_len = 0;
-    const QByteArray bytes =
-        arachnel::core::serializePluginCatalogJson(plugin->catalog());
+    auto* steam = dynamic_cast<steamidra::SteamidraPlugin*>(plugin);
+    const QByteArray bytes = steam ? steam->catalogJsonUtf8()
+                                   : arachnel::core::serializePluginCatalogJson(plugin->catalog());
     char* buf = static_cast<char*>(std::malloc(static_cast<size_t>(bytes.size()) + 1));
     if (!buf)
         return -2;

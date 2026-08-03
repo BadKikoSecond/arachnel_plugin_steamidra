@@ -20,6 +20,9 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
                                const QString& pluginRoot, const QJsonObject& settingsJson,
                                bool force = false);
 
+/** Best-effort repair before launch (registry seed + Overlay=false without FreeTP/.hash). */
+void repairOnlineFixBeforeLaunch(const QString& installPath, const QString& appid);
+
 QString findLaunchExeForInstall(const QString& installPath);
 
 } // namespace steamidra

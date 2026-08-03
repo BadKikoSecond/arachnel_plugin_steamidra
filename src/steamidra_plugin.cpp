@@ -2,6 +2,7 @@
 
 #include "catalog_sync.h"
 #include "install_pipeline.h"
+#include "online_fix_embed.h"
 #include "plugin_settings.h"
 
 #include "install_analysis.h"
@@ -93,7 +94,15 @@ QString SteamidraPlugin::description() const
 
 QString SteamidraPlugin::version() const
 {
-    return QStringLiteral("0.4.7");
+    const QString manifest = m_rootPath + QStringLiteral("/plugin.json");
+    QFile file(manifest);
+    if (file.open(QIODevice::ReadOnly)) {
+        const QJsonObject obj = QJsonDocument::fromJson(file.readAll()).object();
+        const QString ver = obj.value(QStringLiteral("version")).toString().trimmed();
+        if (!ver.isEmpty())
+            return ver;
+    }
+    return QStringLiteral("0.5.1");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -126,9 +135,44 @@ void SteamidraPlugin::resetCatalogCache()
     QFile::remove(catalogCachePath());
 }
 
+void SteamidraPlugin::releaseCatalogMemory() const
+{
+    QMutexLocker lock(&m_catalogMutex);
+    m_catalog.clear();
+    m_catalog.squeeze();
+    m_catalogLoaded = false;
+    m_catalogLoadedAt = {};
+}
+
+QByteArray SteamidraPlugin::catalogJsonUtf8() const
+{
+    const QString localCache = catalogCachePath();
+    bool forceResync = false;
+    {
+        QMutexLocker lock(&m_catalogMutex);
+        forceResync = m_forceCatalogResync;
+        m_forceCatalogResync = false;
+        if (forceResync)
+            releaseCatalogMemory();
+    }
+
+    const PluginSettings settings = loadPluginSettings(settingsPath());
+    const QString synced = syncManifestCatalog(settings, localCache, forceResync);
+    QString path = synced;
+    if (path.isEmpty() || !QFileInfo::exists(path))
+        path = localCache;
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return {};
+
+    releaseCatalogMemory();
+    return file.readAll();
+}
+
 void SteamidraPlugin::ensureCatalogSeeded() const
 {
-    constexpr qint64 kMemoryTtlMs = 5 * 60 * 1000;
+    constexpr qint64 kMemoryTtlMs = 60 * 1000;
     {
         QMutexLocker lock(&m_catalogMutex);
         if (m_catalogLoaded && !m_catalog.isEmpty() && !m_forceCatalogResync
@@ -175,43 +219,33 @@ QVector<arachnel::core::CatalogEntry> SteamidraPlugin::search(const QString& que
 {
     const QString q = query.trimmed();
     if (q.isEmpty())
-        return catalog();
+        return {};
 
-    ensureCatalogSeeded();
-    QVector<arachnel::core::CatalogEntry> all;
-    {
-        QMutexLocker lock(&m_catalogMutex);
-        all = m_catalog;
-    }
-
-    if (q.contains(QRegularExpression(QStringLiteral("^\\d+$")))) {
-        QVector<arachnel::core::CatalogEntry> hit;
-        for (const auto& e : all) {
-            if (e.steamAppId == q)
-                hit.append(e);
-        }
-        if (!hit.isEmpty())
-            return hit;
+    if (QRegularExpression(QStringLiteral("^\\d+$")).match(q).hasMatch()) {
         const QJsonObject game = steamAppDetailsJson(q);
         if (!game.isEmpty())
             return {catalogEntryFromJson(game)};
         return {};
     }
 
-    const QString ql = q.toLower();
+    ensureCatalogSeeded();
     QVector<arachnel::core::CatalogEntry> out;
-    for (const auto& e : all) {
-        if (e.title.toLower().contains(ql) || e.steamAppId == q)
-            out.append(e);
-        if (out.size() >= 80)
-            break;
+    {
+        QMutexLocker lock(&m_catalogMutex);
+        const QString ql = q.toLower();
+        for (const auto& e : m_catalog) {
+            if (e.title.toLower().contains(ql) || e.steamAppId == q)
+                out.append(e);
+            if (out.size() >= 80)
+                break;
+        }
     }
+    releaseCatalogMemory();
     return out;
 }
 
 std::optional<arachnel::core::CatalogEntry> SteamidraPlugin::entryById(const QString& entryId) const
 {
-    ensureCatalogSeeded();
     {
         QMutexLocker lock(&m_catalogMutex);
         for (const auto& e : m_catalog) {
@@ -341,6 +375,15 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(const arachnel::core::Lib
     arachnel::core::LaunchInfo info;
     info.workingDirectory = local.installPath;
 
+    QString appId = local.steamAppId;
+    if (appId.isEmpty() && local.id.startsWith(QStringLiteral("steam-")))
+        appId = local.id.mid(6);
+    if (appId.isEmpty())
+        appId = local.magnetUri;
+    if (appId.startsWith(QStringLiteral("steam://app/")))
+        appId = appId.mid(QStringLiteral("steam://app/").size());
+    repairOnlineFixBeforeLaunch(local.installPath, appId);
+
     const QString markerPath = local.installPath + QStringLiteral("/.arachnel-steamidra");
     if (QFileInfo::exists(markerPath)) {
         QFile f(markerPath);
@@ -388,13 +431,6 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(const arachnel::core::Lib
         return info;
     }
 
-    QString appId = local.steamAppId;
-    if (appId.isEmpty() && local.id.startsWith(QStringLiteral("steam-")))
-        appId = local.id.mid(6);
-    if (appId.isEmpty())
-        appId = local.magnetUri;
-    if (appId.startsWith(QStringLiteral("steam://app/")))
-        appId = appId.mid(QStringLiteral("steam://app/").size());
     if (!appId.isEmpty()) {
         const QString steamExe = steamExecutablePath();
         if (!steamExe.isEmpty()) {
