@@ -29,11 +29,13 @@ def main() -> int:
 
     cpp_path = root / "src" / "steamidra_plugin.cpp"
     cpp = cpp_path.read_text(encoding="utf-8")
+    # version() reads plugin.json first; keep the fallback QStringLiteral in sync.
     updated, count = re.subn(
-        r'(SteamidraPlugin::version\(\) const\s*\{\s*return QStringLiteral\(")[^"]+("\);)',
-        rf"\g<1>{version}\g<2>",
+        r'(QString SteamidraPlugin::version\(\) const\s*\{.*?)(return QStringLiteral\(")[^"]+("\);)(\s*\})',
+        rf"\g<1>\g<2>{version}\g<3>\g<4>",
         cpp,
         count=1,
+        flags=re.DOTALL,
     )
     if count != 1:
         print("could not update C++ version", file=sys.stderr)
