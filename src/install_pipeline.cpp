@@ -326,8 +326,6 @@ void ensureInjectBestEffort(const QString& steam, const QString& pluginRoot)
 #endif
 }
 
-qint64 dirByteSize(const QString& path);
-
 QString findStagingManifest(const QString& staging, const QString& depotId, const QString& manifestId)
 {
     if (!manifestId.isEmpty()) {
@@ -521,38 +519,6 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
     }
 }
 
-qint64 dirByteSize(const QString& path)
-{
-    qint64 n = 0;
-    QDirIterator it(path, QDir::Files, QDirIterator::Subdirectories);
-    while (it.hasNext()) {
-        it.next();
-        n += it.fileInfo().size();
-    }
-    return n;
-}
-
-bool alreadyInstalled(const QString& path, const QString& appid)
-{
-    if (!QDir(path).exists())
-        return false;
-    const QString marker = path + QStringLiteral("/.arachnel-steamidra");
-    if (!QFileInfo::exists(marker))
-        return false;
-    QFile f(marker);
-    if (!f.open(QIODevice::ReadOnly))
-        return false;
-    const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
-    const QString id = o.value(QStringLiteral("appid")).toString();
-    if (!id.isEmpty() && id != appid)
-        return false;
-    const QString mode = o.value(QStringLiteral("mode")).toString();
-    // Only trust a finished CDN install marker. Size/exe heuristics and
-    // "already-installed" markers from incomplete trees caused false Play.
-    return mode == QStringLiteral("depotkit") || mode == QStringLiteral("DepotDownloaderMod")
-           || mode == QStringLiteral("ddmod");
-}
-
 QString sanitizeInstallDir(const QString& title, const QString& appid)
 {
     QString s;
@@ -658,58 +624,6 @@ InstallPipelineResult runInstallPipeline(
                     + QStringLiteral("/ArachnelGames");
                 installPath = base + QStringLiteral("/%1-%2").arg(appid, installdir);
             }
-        }
-
-        if (!force && alreadyInstalled(installPath, appid)) {
-            const qint64 size = dirByteSize(installPath);
-            emitProgress(onProgress, 100,
-                         QStringLiteral("Already installed · %1 MB").arg(size / (1024 * 1024)),
-                         QStringLiteral("completed"), size, size, 0);
-            QJsonObject settingsJson;
-            settingsJson.insert(QStringLiteral("autoEmbedOnlineFix"), settings.autoEmbedOnlineFix);
-            settingsJson.insert(QStringLiteral("onlineFixSourceDir"), settings.onlineFixSourceDir);
-            const OnlineFixResult fix =
-                embedOnlineFix(installPath, appid, pluginRoot, settingsJson, false);
-            QString launchPath = findLaunchExeForInstall(installPath);
-            QJsonObject launch;
-            if (!launchPath.isEmpty()) {
-                launch.insert(QStringLiteral("type"), QStringLiteral("exe"));
-                launch.insert(QStringLiteral("path"), launchPath);
-            } else {
-                launch.insert(QStringLiteral("type"), QStringLiteral("steam"));
-                launch.insert(QStringLiteral("uri"), QStringLiteral("steam://rungameid/%1").arg(appid));
-            }
-            QString keptMode = QStringLiteral("depotkit");
-            {
-                QFile existing(installPath + QStringLiteral("/.arachnel-steamidra"));
-                if (existing.open(QIODevice::ReadOnly)) {
-                    const QString mode =
-                        QJsonDocument::fromJson(existing.readAll())
-                            .object()
-                            .value(QStringLiteral("mode"))
-                            .toString();
-                    if (!mode.isEmpty())
-                        keptMode = mode;
-                }
-            }
-            QFile marker(installPath + QStringLiteral("/.arachnel-steamidra"));
-            QJsonObject payload{{QStringLiteral("appid"), appid},
-                                {QStringLiteral("mode"), keptMode},
-                                {QStringLiteral("launch"), launch}};
-            if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate))
-                marker.write(QJsonDocument(payload).toJson(QJsonDocument::Indented));
-            result.ok = true;
-            result.installPath = installPath;
-            result.mode = keptMode;
-            result.launch = launch;
-            result.skippedDownload = true;
-            if (fix.embedded) {
-                QJsonObject of;
-                of.insert(QStringLiteral("embedded"), true);
-                of.insert(QStringLiteral("epic"), fix.epic);
-                result.onlineFix = of;
-            }
-            return result;
         }
 
         ensureInjectBestEffort(steam, pluginRoot);
