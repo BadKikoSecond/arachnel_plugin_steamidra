@@ -366,16 +366,24 @@ void depotkitProgressThunk(const depotkit_progress* p, void* user)
     else if (p->phase == DEPOTKIT_PHASE_ERROR || p->phase == DEPOTKIT_PHASE_CANCELLED)
         pct = qMax(1, pct);
 
-    const QString detail = p->detail ? QString::fromUtf8(p->detail) : QStringLiteral("Downloading...");
-    emitProgress(bridge->onProgress, pct, detail, QStringLiteral("downloading"),
-                 static_cast<qint64>(p->bytes_done), static_cast<qint64>(p->bytes_total),
-                 static_cast<int>(p->rate_bps));
+    QString status = QStringLiteral("downloading");
+    if (p->phase == DEPOTKIT_PHASE_PAUSED)
+        status = QStringLiteral("paused");
+    else if (p->phase == DEPOTKIT_PHASE_CONNECTING || p->phase == DEPOTKIT_PHASE_PLANNING)
+        status = QStringLiteral("starting");
+
+    const QString detail = p->detail ? QString::fromUtf8(p->detail)
+                                     : (status == QStringLiteral("paused") ? QStringLiteral("Paused")
+                                                                           : QStringLiteral("Downloading..."));
+    const int bps = (p->phase == DEPOTKIT_PHASE_PAUSED) ? 0 : static_cast<int>(p->rate_bps);
+    emitProgress(bridge->onProgress, pct, detail, status, static_cast<qint64>(p->bytes_done),
+                 static_cast<qint64>(p->bytes_total), bps);
 }
 
 void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& dest,
                  const QString& staging, const QString& depotOs, bool forceUpdate,
                  const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
-                 const std::function<bool()>& shouldCancel)
+                 const std::function<bool()>& shouldCancel, depotkit_control* externalCtrl)
 {
     QDir().mkpath(dest);
 
@@ -475,11 +483,12 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
     req.depots = depots.data();
     req.depot_count = depots.size();
     req.install_dir = installDir.constData();
-    req.max_downloads = 64;
+    req.max_downloads = 48;
     req.validate = forceUpdate ? 1 : 0;
     req.cell_id = 0;
 
-    depotkit_control* ctrl = depotkit_control_create();
+    const bool ownsCtrl = externalCtrl == nullptr;
+    depotkit_control* ctrl = externalCtrl ? externalCtrl : depotkit_control_create();
     if (!ctrl)
         throw std::runtime_error("depotkit_control_create failed");
 
@@ -489,14 +498,16 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
     bridge.ctrl = ctrl;
 
     if (shouldCancel && shouldCancel()) {
-        depotkit_control_destroy(ctrl);
+        if (ownsCtrl)
+            depotkit_control_destroy(ctrl);
         throw std::runtime_error("Cancelled");
     }
 
     emitProgress(onProgress, 1,
                  QStringLiteral("Steam CDN · %1 depot(s)…").arg(depots.size()));
     const depotkit_result rc = depotkit_download(&req, depotkitProgressThunk, &bridge, ctrl);
-    depotkit_control_destroy(ctrl);
+    if (ownsCtrl)
+        depotkit_control_destroy(ctrl);
 
     if (rc == DEPOTKIT_ERR_CANCELLED || (shouldCancel && shouldCancel()))
         throw std::runtime_error("Cancelled");
@@ -524,17 +535,20 @@ bool alreadyInstalled(const QString& path, const QString& appid)
     if (!QDir(path).exists())
         return false;
     const QString marker = path + QStringLiteral("/.arachnel-steamidra");
-    if (QFileInfo::exists(marker)) {
-        QFile f(marker);
-        if (f.open(QIODevice::ReadOnly)) {
-            const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
-            const QString id = o.value(QStringLiteral("appid")).toString();
-            if (id.isEmpty() || id == appid)
-                return dirByteSize(path) > 80LL * 1024 * 1024;
-        }
-    }
-    return dirByteSize(path) > 80LL * 1024 * 1024
-           && !findLaunchExeForInstall(path).isEmpty();
+    if (!QFileInfo::exists(marker))
+        return false;
+    QFile f(marker);
+    if (!f.open(QIODevice::ReadOnly))
+        return false;
+    const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+    const QString id = o.value(QStringLiteral("appid")).toString();
+    if (!id.isEmpty() && id != appid)
+        return false;
+    const QString mode = o.value(QStringLiteral("mode")).toString();
+    // Only trust a finished CDN install marker. Size/exe heuristics and
+    // "already-installed" markers from incomplete trees caused false Play.
+    return mode == QStringLiteral("depotkit")
+           || mode == QStringLiteral("DepotDownloaderMod");
 }
 
 QString sanitizeInstallDir(const QString& title, const QString& appid)
@@ -626,7 +640,7 @@ InstallPipelineResult runInstallPipeline(
     const QString& pluginRoot, const QString& appid, const QString& title, const QString& targetPath,
     const PluginSettings& settings, bool force,
     const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
-    const std::function<bool()>& shouldCancel)
+    const std::function<bool()>& shouldCancel, depotkit_control* downloadCtrl)
 {
     InstallPipelineResult result;
     try {
@@ -709,7 +723,7 @@ InstallPipelineResult runInstallPipeline(
         if (depotOs.isEmpty() || depotOs.compare(QStringLiteral("auto"), Qt::CaseInsensitive) == 0)
             depotOs = QStringLiteral("windows");
         runDepotkit(appid, parsed, installPath, staging.path(), depotOs, force, onProgress,
-                    shouldCancel);
+                    shouldCancel, downloadCtrl);
 
         QJsonObject settingsJson;
         settingsJson.insert(QStringLiteral("autoEmbedOnlineFix"), settings.autoEmbedOnlineFix);

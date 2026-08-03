@@ -4,6 +4,8 @@
 
 #include "plugin_interface.h"
 
+#include <depotkit.h>
+
 #include <QJsonObject>
 #include <QString>
 #include <functional>
@@ -24,7 +26,7 @@ InstallPipelineResult runInstallPipeline(
     const QString& pluginRoot, const QString& appid, const QString& title, const QString& targetPath,
     const PluginSettings& settings, bool force,
     const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
-    const std::function<bool()>& shouldCancel);
+    const std::function<bool()>& shouldCancel, depotkit_control* downloadCtrl = nullptr);
 
 bool installAddonZip(const QString& zipPath, const QString& destPath, QString* errorOut);
 

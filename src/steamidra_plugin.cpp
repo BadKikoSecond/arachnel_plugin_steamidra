@@ -102,7 +102,7 @@ QString SteamidraPlugin::version() const
         if (!ver.isEmpty())
             return ver;
     }
-    return QStringLiteral("0.6.1");
+    return QStringLiteral("0.6.2");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -477,13 +477,29 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         onProgress(p);
     }
 
+    depotkit_control* ctrl = depotkit_control_create();
+    if (!ctrl) {
+        result.error = QStringLiteral("depotkit_control_create failed");
+        return result;
+    }
+    {
+        QMutexLocker lock(&m_downloadCtrlMutex);
+        m_downloadControls.insert(ctx.jobId, ctrl);
+    }
+
     const PluginSettings settings = loadPluginSettings(settingsPath());
     const bool forceUpdate =
         ctx.installMode.compare(QStringLiteral("update"), Qt::CaseInsensitive) == 0
         || ctx.installMode.compare(QStringLiteral("force"), Qt::CaseInsensitive) == 0;
     const InstallPipelineResult pipe =
         runInstallPipeline(m_rootPath, appId, ctx.title, ctx.targetPath, settings, forceUpdate,
-                           onProgress, cancelled);
+                           onProgress, cancelled, ctrl);
+
+    {
+        QMutexLocker lock(&m_downloadCtrlMutex);
+        m_downloadControls.remove(ctx.jobId);
+    }
+    depotkit_control_destroy(ctrl);
 
     if (cancelled()) {
         result.error = QStringLiteral("Cancelled");
@@ -502,6 +518,21 @@ void SteamidraPlugin::cancelOwnedDownload(const QString& jobId) const
 {
     QMutexLocker lock(&m_cancelMutex);
     m_cancelledJobs.insert(jobId);
+    QMutexLocker ctrlLock(&m_downloadCtrlMutex);
+    if (depotkit_control* ctrl = m_downloadControls.value(jobId, nullptr))
+        depotkit_cancel(ctrl);
+}
+
+void SteamidraPlugin::setOwnedDownloadPaused(const QString& jobId, bool paused) const
+{
+    QMutexLocker lock(&m_downloadCtrlMutex);
+    depotkit_control* ctrl = m_downloadControls.value(jobId, nullptr);
+    if (!ctrl)
+        return;
+    if (paused)
+        depotkit_pause(ctrl);
+    else
+        depotkit_resume(ctrl);
 }
 
 } // namespace steamidra

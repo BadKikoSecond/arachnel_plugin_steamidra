@@ -2,7 +2,11 @@
 
 #include "plugin_interface.h"
 
+#include <depotkit.h>
+
 #include <QDateTime>
+#include <QHash>
+#include <QMutex>
 #include <QRecursiveMutex>
 #include <QSet>
 #include <QString>
@@ -49,6 +53,7 @@ public:
         const override;
 
     void cancelOwnedDownload(const QString& jobId) const override;
+    void setOwnedDownloadPaused(const QString& jobId, bool paused) const override;
 
     /** Sync on-disk catalog and return raw UTF-8 JSON (no in-memory row mirror). */
     QByteArray catalogJsonUtf8() const;
@@ -68,6 +73,8 @@ private:
     mutable QRecursiveMutex m_catalogMutex;
     mutable QMutex m_cancelMutex;
     mutable QSet<QString> m_cancelledJobs;
+    mutable QMutex m_downloadCtrlMutex;
+    mutable QHash<QString, depotkit_control*> m_downloadControls;
 };
 
 } // namespace steamidra
