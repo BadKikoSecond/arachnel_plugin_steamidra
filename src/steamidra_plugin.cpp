@@ -102,7 +102,7 @@ QString SteamidraPlugin::version() const
         if (!ver.isEmpty())
             return ver;
     }
-    return QStringLiteral("0.6.10");
+    return QStringLiteral("0.6.11");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -156,8 +156,12 @@ QByteArray SteamidraPlugin::catalogJsonUtf8() const
         QMutexLocker lock(&m_catalogMutex);
         forceResync = m_forceCatalogResync;
         m_forceCatalogResync = false;
-        if (forceResync)
-            releaseCatalogMemory();
+        if (forceResync) {
+            m_catalog.clear();
+            m_catalog.squeeze();
+            m_catalogLoaded = false;
+            m_catalogLoadedAt = {};
+        }
     }
 
     const PluginSettings settings = loadPluginSettings(settingsPath());
@@ -170,6 +174,8 @@ QByteArray SteamidraPlugin::catalogJsonUtf8() const
     if (!file.open(QIODevice::ReadOnly))
         return {};
 
+    // Drop the in-memory mirror after serving JSON so UI threads do not stall on
+    // QVector<CatalogEntry> copies while a catalog worker is active.
     releaseCatalogMemory();
     return file.readAll();
 }

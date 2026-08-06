@@ -2202,12 +2202,31 @@ def find_game_exe(install_path: Path) -> Path | None:
         "createdump",
         "steamfix_bootstrap",
     )
+    # Exact / suffix tool binaries (Craft The World Editor.exe, dedicated servers, …)
+    skip_stem = (
+        "editor",
+        "dedicated",
+        "dedicatedserver",
+        "server",
+        "unrealversionselector",
+    )
     deprioritize = ("gamelauncher", "launcher", "bootstrap", "start", "play")
+
+    def is_tool(path: Path) -> bool:
+        name = path.name.lower()
+        stem = path.stem.lower()
+        if any(s in name for s in skip_sub):
+            return True
+        if stem in skip_stem or stem.endswith("editor") or stem.endswith("server"):
+            return True
+        if "dedicatedserver" in stem:
+            return True
+        return False
 
     def score(path: Path) -> tuple:
         name = path.name.lower()
         stem = path.stem.lower()
-        if any(s in name for s in skip_sub):
+        if is_tool(path):
             return (99, 0, 0, name)
         depth = len(path.relative_to(root).parts)
         name_bonus = 0
@@ -2248,11 +2267,10 @@ def find_game_exe(install_path: Path) -> Path | None:
 
     exes.sort(key=score)
     for e in exes:
-        name = e.name.lower()
-        if any(s in name for s in skip_sub):
+        if is_tool(e):
             continue
-            return e
-    return exes[0]
+        return e
+    return None
 
 
 # Partial downloads are usually far smaller; skip DDMod verify theater above this.
