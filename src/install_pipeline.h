@@ -24,7 +24,7 @@ struct InstallPipelineResult {
 
 InstallPipelineResult runInstallPipeline(
     const QString& pluginRoot, const QString& appid, const QString& title, const QString& targetPath,
-    const PluginSettings& settings, bool force,
+    const PluginSettings& settings, bool force, const QStringList& selectedAddonIds,
     const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
     const std::function<bool()>& shouldCancel, depotkit_control* downloadCtrl = nullptr);
 

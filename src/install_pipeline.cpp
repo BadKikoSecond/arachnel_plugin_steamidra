@@ -13,9 +13,11 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QHash>
 #include <QMap>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QSet>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
@@ -257,11 +259,12 @@ QString fetchLua(const QString& appid, const PluginSettings& settings, const QSt
             !QDir(staging).entryList({QStringLiteral("*.manifest")}, QDir::Files).isEmpty();
         if (hasMf || !probe.depots.isEmpty() || !probe.manifests.isEmpty())
             return luaText;
-        errors.append(QStringLiteral("relay: lua without depots/manifests"));
+        errors.append(QStringLiteral(
+            "no depot manifests yet (provider listed the game but CDN package is empty)"));
     }
 
     throw std::runtime_error(
-        QStringLiteral("Relay could not prepare app %1 (%2). Check https://ryuu.badkiko.ru")
+        QStringLiteral("Cannot install app %1 yet: %2")
             .arg(appid, errors.join(QStringLiteral("; ")))
             .toStdString());
 }
@@ -286,14 +289,76 @@ void adoptStagingManifests(const QString& staging, LuaParsed& parsed)
     }
 }
 
-void filterPrimaryDepots(const QString& appid, LuaParsed& parsed, bool includeDlc)
+void filterPrimaryDepots(const QString& appid, LuaParsed& parsed, bool includeAllDlc,
+                         const QSet<QString>& selectedDlcAppIds)
 {
     QMap<QString, QString> depots = parsed.depots;
     // App unlock key is not a content depot - downloading it needs no local manifest and fails.
     depots.remove(appid);
-    if (!includeDlc) {
-        // Soft: keep all remaining keyed depots (DLC filtering needs richer metadata).
+
+    QHash<QString, QString> depotToDlc;
+    QString err;
+    const QByteArray raw = httpGetJsonBytes(
+        QStringLiteral("https://api.steamcmd.net/v1/info/%1").arg(appid), 45000, {}, &err);
+    if (!raw.isEmpty()) {
+        const QJsonObject root = QJsonDocument::fromJson(raw).object();
+        const QJsonObject app =
+            root.value(QStringLiteral("data")).toObject().value(appid).toObject();
+        const QJsonObject depotsObj = app.value(QStringLiteral("depots")).toObject();
+        for (auto it = depotsObj.begin(); it != depotsObj.end(); ++it) {
+            if (it.key().isEmpty() || !it.key().at(0).isDigit() || !it.value().isObject())
+                continue;
+            const QJsonValue dlcVal = it.value().toObject().value(QStringLiteral("dlcappid"));
+            const QString dlcId = dlcVal.toVariant().toString().trimmed();
+            if (dlcId.isEmpty() || dlcId == QStringLiteral("0"))
+                continue;
+            depotToDlc.insert(it.key(), dlcId);
+        }
     }
+
+    auto keepDepot = [&](const QString& depotId) -> bool {
+        const QString dlcId = depotToDlc.value(depotId);
+        if (!dlcId.isEmpty())
+            return includeAllDlc || selectedDlcAppIds.contains(dlcId);
+        if (includeAllDlc || selectedDlcAppIds.isEmpty()) {
+            // No steamcmd map: drop far depots when selection is empty (Isaac 3353471).
+            if (!includeAllDlc && selectedDlcAppIds.isEmpty()) {
+                bool okApp = false;
+                bool okDepot = false;
+                const qint64 app = appid.toLongLong(&okApp);
+                const qint64 depot = depotId.toLongLong(&okDepot);
+                if (okApp && okDepot && !(depot >= app && depot < app + 100))
+                    return false;
+            }
+            return true;
+        }
+        // Selection set: keep unmapped base-band depots only.
+        bool okApp = false;
+        bool okDepot = false;
+        const qint64 app = appid.toLongLong(&okApp);
+        const qint64 depot = depotId.toLongLong(&okDepot);
+        if (okApp && okDepot && depot >= app && depot < app + 100)
+            return true;
+        return selectedDlcAppIds.contains(depotId);
+    };
+
+    if (!includeAllDlc) {
+        QMap<QString, QString> keep;
+        for (auto it = depots.begin(); it != depots.end(); ++it) {
+            if (keepDepot(it.key()))
+                keep.insert(it.key(), it.value());
+        }
+        depots = keep;
+        QMap<QString, QString> manifests;
+        for (auto it = parsed.manifests.begin(); it != parsed.manifests.end(); ++it) {
+            if (it.key() == appid)
+                continue;
+            if (keepDepot(it.key()))
+                manifests.insert(it.key(), it.value());
+        }
+        parsed.manifests = manifests;
+    }
+
     if (depots.isEmpty() && !parsed.manifests.isEmpty()) {
         for (auto it = parsed.manifests.begin(); it != parsed.manifests.end(); ++it) {
             if (it.key() != appid)
@@ -301,6 +366,21 @@ void filterPrimaryDepots(const QString& appid, LuaParsed& parsed, bool includeDl
         }
     }
     parsed.depots = depots;
+}
+
+QSet<QString> selectedDlcAppIds(const QStringList& selectedAddonIds)
+{
+    QSet<QString> out;
+    for (QString id : selectedAddonIds) {
+        id = id.trimmed();
+        if (id.startsWith(QStringLiteral("steam-")))
+            id = id.mid(6);
+        bool ok = false;
+        id.toLongLong(&ok);
+        if (ok && !id.isEmpty())
+            out.insert(id);
+    }
+    return out;
 }
 
 void ensureInjectBestEffort(const QString& steam, const QString& pluginRoot)
@@ -448,14 +528,15 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
     // If nothing matched the OS hint (weird manifests), fall back to all with files.
     if (matched.empty())
         matched = cands;
-    // Prefer exclusive OS matches when we have mixed multi-depot packages.
-    std::vector<Cand> exclusive;
-    for (const Cand& c : matched) {
-        if (c.plat == wantFlags)
-            exclusive.push_back(c);
-    }
-    if (!exclusive.empty())
-        matched = exclusive;
+    // Do not prefer "exclusive" OS matches. That dropped Isaac DLC depots whose
+    // platform hint is multi-bit or unknown while base 250902 is exclusive windows.
+
+    QStringList matchedIds;
+    matchedIds.reserve(static_cast<int>(matched.size()));
+    for (const Cand& c : matched)
+        matchedIds.append(c.depotId);
+    qInfo().noquote() << "[steamidra] depotkit matched" << matchedIds.join(QLatin1Char(','))
+                      << "wantOs" << depotOs << "cands" << int(cands.size());
 
     // Keep QString storage alive for C string pointers passed into depotkit.
     std::vector<QByteArray> pathBytes;
@@ -606,7 +687,7 @@ bool installAddonZip(const QString& zipPath, const QString& destPath, QString* e
 
 InstallPipelineResult runInstallPipeline(
     const QString& pluginRoot, const QString& appid, const QString& title, const QString& targetPath,
-    const PluginSettings& settings, bool force,
+    const PluginSettings& settings, bool force, const QStringList& selectedAddonIds,
     const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
     const std::function<bool()>& shouldCancel, depotkit_control* downloadCtrl)
 {
@@ -638,13 +719,21 @@ InstallPipelineResult runInstallPipeline(
         // Local *.manifest from Ryuu are required: anonymous Steam returns 401 without
         // -manifestfile. Staging filenames override any lua setManifestid pins.
         adoptStagingManifests(staging.path(), parsed);
-        filterPrimaryDepots(appid, parsed, settings.includeDlc);
+        const QSet<QString> selectedDlc = selectedDlcAppIds(selectedAddonIds);
+        // Any selected DLC → keep all lua depots. steamcmd dlcappid maps are incomplete
+        // (Isaac kept only 250902-250911 and skipped Afterbirth/etc.).
+        const bool downloadAllDlc = settings.includeDlc || !selectedDlc.isEmpty();
+        filterPrimaryDepots(appid, parsed, downloadAllDlc, selectedDlc);
         if (!steam.isEmpty()) {
             QDir().mkpath(steam + QStringLiteral("/config/stplug-in"));
             QFile luaOut(steam + QStringLiteral("/config/stplug-in/%1.lua").arg(appid));
             if (luaOut.open(QIODevice::WriteOnly | QIODevice::Truncate))
                 luaOut.write(lua.toUtf8());
         }
+
+        qInfo().noquote() << "[steamidra] depots" << parsed.depots.keys().join(QLatin1Char(','))
+                          << "selectedDlc" << selectedDlc.values().join(QLatin1Char(','))
+                          << "downloadAllDlc" << downloadAllDlc;
 
         emitProgress(onProgress, 1,
                      force ? QStringLiteral("Updating…") : QStringLiteral("Downloading..."));
@@ -657,6 +746,8 @@ InstallPipelineResult runInstallPipeline(
         QJsonObject settingsJson;
         settingsJson.insert(QStringLiteral("autoEmbedOnlineFix"), settings.autoEmbedOnlineFix);
         settingsJson.insert(QStringLiteral("onlineFixSourceDir"), settings.onlineFixSourceDir);
+        settingsJson.insert(QStringLiteral("hasWorkshop"), true);
+        settingsJson.insert(QStringLiteral("unlockAllDlc"), downloadAllDlc);
         const OnlineFixResult fix =
             embedOnlineFix(installPath, appid, pluginRoot, settingsJson, false);
 
@@ -671,8 +762,12 @@ InstallPipelineResult runInstallPipeline(
         }
         QFile marker(installPath + QStringLiteral("/.arachnel-steamidra"));
         QJsonObject payload{{QStringLiteral("appid"), appid},
-                                {QStringLiteral("mode"), QStringLiteral("depotkit")},
+                            {QStringLiteral("mode"), QStringLiteral("depotkit")},
                             {QStringLiteral("launch"), launch}};
+        QJsonArray selectedDlcArr;
+        for (const QString& id : selectedDlc)
+            selectedDlcArr.append(id);
+        payload.insert(QStringLiteral("selectedDlc"), selectedDlcArr);
         QJsonObject manifestsObj;
         for (auto it = parsed.manifests.begin(); it != parsed.manifests.end(); ++it)
             manifestsObj.insert(it.key(), it.value());

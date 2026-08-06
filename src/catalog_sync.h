@@ -15,6 +15,9 @@ QVector<arachnel::core::CatalogEntry> loadCatalogEntriesFromFile(const QString& 
 
 arachnel::core::CatalogEntry catalogEntryFromJson(const QJsonObject& obj);
 
+/** Fill Steam Store DLC rows from relay GET /v1/app/{appid}/dlcs (blocking). */
+void enrichCatalogEntryWithRelayDlcs(arachnel::core::CatalogEntry& entry, const PluginSettings& settings);
+
 QJsonObject steamAppDetailsJson(const QString& appid);
 
 } // namespace steamidra

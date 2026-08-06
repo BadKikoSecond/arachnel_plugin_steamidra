@@ -55,6 +55,12 @@ fi
 
 [[ ! -f "${LIN}/libsteamidra_plugin.so" ]] || \
   cp -a "${LIN}/libsteamidra_plugin.so" "${MERGED}/"
+# Linux-only: jammy-era libcurl beside the .so (matches AppImage OpenSSL 3.0).
+[[ ! -f "${LIN}/libcurl.so.4" ]] || cp -a "${LIN}/libcurl.so.4" "${MERGED}/"
+if command -v patchelf >/dev/null 2>&1 && [[ -f "${MERGED}/libsteamidra_plugin.so" ]]; then
+  patchelf --set-rpath '$ORIGIN' "${MERGED}/libsteamidra_plugin.so" || true
+  [[ ! -f "${MERGED}/libcurl.so.4" ]] || patchelf --set-rpath '$ORIGIN' "${MERGED}/libcurl.so.4" || true
+fi
 
 required=(
   "${MERGED}/plugin.json"

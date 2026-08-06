@@ -55,6 +55,9 @@ public:
     void cancelOwnedDownload(const QString& jobId) const override;
     void setOwnedDownloadPaused(const QString& jobId, bool paused) const override;
 
+    bool applySelectedDlc(const arachnel::core::LibraryGame& local,
+                          const QStringList& enabledAddonIds) const override;
+
     /** Sync on-disk catalog and return raw UTF-8 JSON (no in-memory row mirror). */
     QByteArray catalogJsonUtf8() const;
 

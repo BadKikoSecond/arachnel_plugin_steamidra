@@ -6,6 +6,7 @@
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QProcess>
 #include <QSaveFile>
 #include <QSet>
@@ -23,6 +24,9 @@
 
 namespace steamidra {
 namespace {
+
+QString kitDir(const QString& pluginRoot, const QJsonObject& settings);
+QString pickOverlayExe(const QString& target);
 
 QString kitDir(const QString& pluginRoot, const QJsonObject& settings)
 {
@@ -301,7 +305,8 @@ void stripWrongArchOverlay(const QString& target, bool want32)
     }
 }
 
-void writeSteamFixIni(const QString& path, const QString& appid, bool workshop, bool overlay)
+void writeSteamFixIni(const QString& path, const QString& appid, bool workshop, bool overlay,
+                      bool unlockAllDlc = true)
 {
     QSaveFile f(path);
     if (!f.open(QIODevice::WriteOnly))
@@ -312,10 +317,20 @@ void writeSteamFixIni(const QString& path, const QString& appid, bool workshop, 
     t += "FakeAppId=480\r\n#Language=english\r\nBuildId=0\r\n\r\n";
     t += "[Misc]\r\nOverlay=";
     t += overlay ? "true" : "false";
-    t += "\r\nFilterLobby=false\r\n\r\n";
-    t += "[Interfaces]\r\nApps=true\r\nFriends=true\r\nUser=true\r\nInventory=true\r\n";
+    t += "\r\nFilterLobby=false\r\n";
+    if (workshop)
+        t += "FakeWorkshop=true\r\n";
+    // SteamFix32/64: UnlockAllDLC is the real "own everything" switch; [DLC] 0=dlc alone
+    // is not enough for Isaac Repentance+ (needs Afterbirth ownership).
+    t += "UnlockAllDLC=";
+    t += unlockAllDlc ? "true" : "false";
+    t += "\r\n";
+    t += "\r\n[Interfaces]\r\nApps=true\r\nFriends=true\r\nUser=true\r\nInventory=true\r\n";
     t += "Stats=true\r\nStorage=true\r\nUtils=true\r\n";
-    t += workshop ? "Workshop=true\r\n\r\n[DLC]\r\n0=dlc\r\n" : "Workshop=false\r\n\r\n[DLC]\r\n";
+    t += workshop ? "Workshop=true\r\n" : "Workshop=false\r\n";
+    t += "\r\n[DLC]\r\n";
+    if (unlockAllDlc)
+        t += "0=dlc\r\n";
     f.write(t);
     f.commit();
 }
@@ -347,41 +362,54 @@ void seedSteamFixRegistry(const QString& realAppId)
             L"Software\\Valve\\Steam\\Apps\\" + realAppId.toStdWString();
         setRegDword(HKEY_CURRENT_USER, sub.c_str(), L"Installed", 1);
     }
+    // Isaac Repentance+ checks Afterbirth via Apps\<dlc>\Installed - seed known DLC ids.
+    if (realAppId == QLatin1String("250900")) {
+        for (const wchar_t* dlc : {L"401920", L"570660", L"1426300", L"3353470", L"322660"}) {
+            const std::wstring sub = std::wstring(L"Software\\Valve\\Steam\\Apps\\") + dlc;
+            setRegDword(HKEY_CURRENT_USER, sub.c_str(), L"Installed", 1);
+        }
+    }
     setRegDword(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"RunningAppID", 480);
 }
 #else
 void seedSteamFixRegistry(const QString&) {}
 #endif
 
-void ensureFreetpAckFolder(const QString& target)
+/** SteamFix opens freetp.org via `cmd.exe /c start "link" "%s"` when FreeTP/.hash
+ *  is missing or was copied from another path (4-byte path-bound ack). Overlay=false
+ *  does NOT stop that. Planting a no-op cmd.exe next to the game wins CreateProcess
+ *  search order (app dir before System32) on Windows and under Proton/Wine, so the
+ *  promo never reaches the real shell. The game still writes a path-local .hash on
+ *  first launch. Never replace Wine prefix system32/cmd.exe. */
+bool plantFreetpCmdStub(const QString& target, const QString& kit)
 {
+    const QString src = kit + QStringLiteral("/cmd_stub.exe");
+    if (!QFileInfo::exists(src) || target.isEmpty() || !QDir(target).exists())
+        return false;
+    return copyFileBestEffort(src, target + QStringLiteral("/cmd.exe"));
+}
+
+void ensureFreetpAckFolder(const QString& target, const QString& kit)
+{
+    if (target.isEmpty() || !QDir(target).exists())
+        return;
+
     QDir().mkpath(target + QStringLiteral("/FreeTP/UserData"));
     QFile anon(target + QStringLiteral("/FreeTP/UserData/AnonFolderSave.txt"));
     if (!anon.exists() && anon.open(QIODevice::WriteOnly))
         anon.close();
 
-    const QString hashPath = target + QStringLiteral("/FreeTP/.hash");
-    const QFileInfo hashInfo(hashPath);
-    const bool hashOk = hashInfo.isFile() && hashInfo.size() == 4;
-    if (hashOk)
-        return;
+    plantFreetpCmdStub(target, kit);
 
-    // Without a path-local FreeTP/.hash, Overlay=true opens the SteamFix promo /
-    // registry dialog. Prefer a quiet overlay until the game primes .hash itself.
-    const QString iniPath = target + QStringLiteral("/SteamFix.ini");
-    QFile ini(iniPath);
-    if (!ini.open(QIODevice::ReadOnly))
-        return;
-    QByteArray text = ini.readAll();
-    ini.close();
-    if (!text.contains("Overlay=true"))
-        return;
-    text.replace("Overlay=true", "Overlay=false");
-    QSaveFile out(iniPath);
-    if (!out.open(QIODevice::WriteOnly))
-        return;
-    out.write(text);
-    out.commit();
+    // CreateProcess searches the main exe directory - plant there too when needed.
+    const QString launchExe = pickOverlayExe(target);
+    if (!launchExe.isEmpty()) {
+        const QString exeDir = QFileInfo(launchExe).absolutePath();
+        if (QFileInfo(exeDir).absoluteFilePath() != QFileInfo(target).absoluteFilePath()) {
+            QDir().mkpath(exeDir + QStringLiteral("/FreeTP/UserData"));
+            plantFreetpCmdStub(exeDir, kit);
+        }
+    }
 }
 
 quint16 resolveOverlayArch(const QString& target, const QString& launchExe)
@@ -767,9 +795,16 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
 
     bool usedEpic = false;
     seedSteamFixRegistry(appid);
+    const bool workshop = settingsJson.contains(QStringLiteral("hasWorkshop"))
+                              ? settingsJson.value(QStringLiteral("hasWorkshop")).toBool(true)
+                              : true;
+    const bool unlockAllDlc = settingsJson.contains(QStringLiteral("unlockAllDlc"))
+                                  ? settingsJson.value(QStringLiteral("unlockAllDlc")).toBool(true)
+                                  : true;
     for (const QString& target : targets) {
-        // Overlay stays off until FreeTP/.hash is primed (see ensureFreetpAckFolder).
-        writeSteamFixIni(target + QStringLiteral("/SteamFix.ini"), appid, false, false);
+        // Overlay=true is fine once cmd.exe stub is planted (see ensureFreetpAckFolder).
+        writeSteamFixIni(target + QStringLiteral("/SteamFix.ini"), appid, workshop, true,
+                         unlockAllDlc);
 
         QString launchExe = findLaunchExeForInstall(target.isEmpty() ? installPath : target);
         if (launchExe.isEmpty())
@@ -820,7 +855,7 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
             ensureEpicBesideEos(installPath, kit);
             usedEpic = true;
         }
-        ensureFreetpAckFolder(target);
+        ensureFreetpAckFolder(target, kit);
         r.targets.append(target);
     }
 
@@ -852,7 +887,8 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
     return r;
 }
 
-void repairOnlineFixBeforeLaunch(const QString& installPath, const QString& appid)
+void repairOnlineFixBeforeLaunch(const QString& installPath, const QString& appid,
+                                 const QString& pluginRoot)
 {
     if (installPath.isEmpty() || !QDir(installPath).exists())
         return;
@@ -870,15 +906,68 @@ void repairOnlineFixBeforeLaunch(const QString& installPath, const QString& appi
     }
 
     seedSteamFixRegistry(appid);
+    const QString kit = kitDir(pluginRoot, {});
     for (const QString& target : findOverlayTargets(installPath)) {
         if (!QFileInfo::exists(target + QStringLiteral("/SteamFix.ini"))
             && !QFileInfo::exists(target + QStringLiteral("/SteamFix64.dll"))
             && !QFileInfo::exists(target + QStringLiteral("/winmm.dll")))
             continue;
-        ensureFreetpAckFolder(target);
+        ensureFreetpAckFolder(target, kit);
         if (!QFileInfo::exists(target + QStringLiteral("/steam_appid.txt")))
             writeSteamAppIdFile(target);
     }
+}
+
+bool applyDlcUnlocks(const QString& installPath, const QString& appid,
+                     const QStringList& enabledDlcAppIds)
+{
+    if (installPath.isEmpty() || !QDir(installPath).exists() || appid.isEmpty())
+        return false;
+
+    const bool unlockAll = !enabledDlcAppIds.isEmpty();
+    bool wrote = false;
+    QStringList targets = findOverlayTargets(installPath);
+    if (targets.isEmpty())
+        targets.append(installPath);
+    for (const QString& target : targets) {
+        const QString ini = target + QStringLiteral("/SteamFix.ini");
+        if (!QFileInfo::exists(ini)
+            && !QFileInfo::exists(target + QStringLiteral("/SteamFix64.dll"))
+            && !QFileInfo::exists(target + QStringLiteral("/SteamFix32.dll"))
+            && !QFileInfo::exists(target + QStringLiteral("/winmm.dll")))
+            continue;
+        bool workshop = true;
+        bool overlay = false;
+        QFile existing(ini);
+        if (existing.open(QIODevice::ReadOnly)) {
+            const QByteArray body = existing.readAll();
+            workshop = body.contains("Workshop=true") || !body.contains("Workshop=false");
+            overlay = body.contains("Overlay=true");
+            existing.close();
+        }
+        writeSteamFixIni(ini, appid, workshop, overlay, unlockAll);
+        wrote = true;
+    }
+
+    const QString markerPath = installPath + QStringLiteral("/.arachnel-steamidra");
+    QJsonObject payload;
+    QFile marker(markerPath);
+    if (marker.exists() && marker.open(QIODevice::ReadOnly)) {
+        payload = QJsonDocument::fromJson(marker.readAll()).object();
+        marker.close();
+    }
+    payload.insert(QStringLiteral("appid"), appid);
+    QJsonArray selected;
+    for (const QString& id : enabledDlcAppIds) {
+        if (!id.isEmpty())
+            selected.append(id);
+    }
+    payload.insert(QStringLiteral("selectedDlc"), selected);
+    if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        marker.write(QJsonDocument(payload).toJson(QJsonDocument::Indented));
+        wrote = true;
+    }
+    return wrote;
 }
 
 } // namespace steamidra

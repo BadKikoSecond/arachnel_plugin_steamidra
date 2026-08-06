@@ -102,7 +102,7 @@ QString SteamidraPlugin::version() const
         if (!ver.isEmpty())
             return ver;
     }
-    return QStringLiteral("0.6.4");
+    return QStringLiteral("0.6.9");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -129,9 +129,13 @@ void SteamidraPlugin::resetCatalogCache()
 {
     QMutexLocker lock(&m_catalogMutex);
     m_catalogLoaded = false;
-    m_catalog.clear();
     m_catalogLoadedAt = {};
     m_forceCatalogResync = true;
+    // Avoid CatalogEntry::~ across DSO when the host interposes a different SDK layout.
+    if (!m_catalog.isEmpty()) {
+        auto* abandoned = new QVector<arachnel::core::CatalogEntry>();
+        m_catalog.swap(*abandoned);
+    }
     QFile::remove(catalogCachePath());
 }
 
@@ -246,22 +250,31 @@ QVector<arachnel::core::CatalogEntry> SteamidraPlugin::search(const QString& que
 
 std::optional<arachnel::core::CatalogEntry> SteamidraPlugin::entryById(const QString& entryId) const
 {
+    std::optional<arachnel::core::CatalogEntry> entry;
     {
         QMutexLocker lock(&m_catalogMutex);
         for (const auto& e : m_catalog) {
-            if (e.id == entryId)
-                return e;
+            if (e.id == entryId) {
+                entry = e;
+                break;
+            }
         }
     }
-    QString appId = entryId;
-    if (appId.startsWith(QStringLiteral("steam-")))
-        appId = appId.mid(6);
-    if (appId.isEmpty())
-        return std::nullopt;
-    const QJsonObject game = steamAppDetailsJson(appId);
-    if (game.isEmpty())
-        return std::nullopt;
-    return catalogEntryFromJson(game);
+    if (!entry) {
+        QString appId = entryId;
+        if (appId.startsWith(QStringLiteral("steam-")))
+            appId = appId.mid(6);
+        if (appId.isEmpty())
+            return std::nullopt;
+        const QJsonObject game = steamAppDetailsJson(appId);
+        if (game.isEmpty())
+            return std::nullopt;
+        entry = catalogEntryFromJson(game);
+    }
+    // List rows keep addons empty on purpose - fill from relay before Arachnel shows the picker.
+    const PluginSettings settings = loadPluginSettings(settingsPath());
+    enrichCatalogEntryWithRelayDlcs(*entry, settings);
+    return entry;
 }
 
 arachnel::core::InstallResult SteamidraPlugin::installFromDownload(
@@ -382,7 +395,7 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(const arachnel::core::Lib
         appId = local.magnetUri;
     if (appId.startsWith(QStringLiteral("steam://app/")))
         appId = appId.mid(QStringLiteral("steam://app/").size());
-    repairOnlineFixBeforeLaunch(local.installPath, appId);
+    repairOnlineFixBeforeLaunch(local.installPath, appId, m_rootPath);
 
     const QString markerPath = local.installPath + QStringLiteral("/.arachnel-steamidra");
     if (QFileInfo::exists(markerPath)) {
@@ -493,7 +506,7 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         || ctx.installMode.compare(QStringLiteral("force"), Qt::CaseInsensitive) == 0;
     const InstallPipelineResult pipe =
         runInstallPipeline(m_rootPath, appId, ctx.title, ctx.targetPath, settings, forceUpdate,
-                           onProgress, cancelled, ctrl);
+                           ctx.selectedAddonIds, onProgress, cancelled, ctrl);
 
     {
         QMutexLocker lock(&m_downloadCtrlMutex);
@@ -533,6 +546,17 @@ void SteamidraPlugin::setOwnedDownloadPaused(const QString& jobId, bool paused) 
         depotkit_pause(ctrl);
     else
         depotkit_resume(ctrl);
+}
+
+bool SteamidraPlugin::applySelectedDlc(const arachnel::core::LibraryGame& local,
+                                       const QStringList& enabledAddonIds) const
+{
+    QString appId = local.steamAppId;
+    if (appId.isEmpty() && local.id.startsWith(QStringLiteral("steam-")))
+        appId = local.id.mid(6);
+    if (appId.isEmpty() || local.installPath.isEmpty())
+        return false;
+    return applyDlcUnlocks(local.installPath, appId, enabledAddonIds);
 }
 
 } // namespace steamidra

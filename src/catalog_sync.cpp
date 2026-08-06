@@ -10,6 +10,8 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMap>
+#include <QSet>
 #include <QUrl>
 
 namespace steamidra {
@@ -31,18 +33,59 @@ arachnel::core::CatalogComponent addonFromJson(const QJsonObject& obj, const QSt
     const QString title = obj.value(QStringLiteral("title")).toString();
     component.title = title;
     component.id = obj.value(QStringLiteral("id")).toString();
-    if (component.id.isEmpty())
-        component.id = arachnel::core::slugifyCatalogId(title, QStringLiteral("steamidra-addon"));
-    component.fileSize = obj.value(QStringLiteral("fileSize")).toString();
+    if (component.id.isEmpty()) {
+        const QString appid = obj.value(QStringLiteral("appid")).toString();
+        if (!appid.isEmpty())
+            component.id = QStringLiteral("steam-%1").arg(appid);
+        else
+            component.id = arachnel::core::slugifyCatalogId(title, QStringLiteral("steamidra-addon"));
+    }
+    component.fileSize = obj.value(QStringLiteral("sizeLabel")).toString().trimmed();
+    if (component.fileSize.isEmpty())
+        component.fileSize = obj.value(QStringLiteral("fileSize")).toString().trimmed();
+    if (component.fileSize.isEmpty()) {
+        const QJsonValue rawBytes = obj.value(QStringLiteral("sizeBytes"));
+        qint64 bytes = 0;
+        if (rawBytes.isDouble())
+            bytes = static_cast<qint64>(rawBytes.toDouble());
+        else if (rawBytes.isString())
+            bytes = rawBytes.toString().toLongLong();
+        if (bytes > 0) {
+            static const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+            double value = static_cast<double>(bytes);
+            int unit = 0;
+            while (value >= 1024.0 && unit < 4) {
+                value /= 1024.0;
+                ++unit;
+            }
+            component.fileSize = unit == 0
+                                     ? QStringLiteral("%1 %2").arg(static_cast<qint64>(value)).arg(
+                                           QString::fromUtf8(units[unit]))
+                                     : QStringLiteral("%1 %2")
+                                           .arg(value, 0, 'f', 1)
+                                           .arg(QString::fromUtf8(units[unit]));
+        }
+    }
     component.uploadDate = obj.value(QStringLiteral("uploadDate")).toString();
+    component.coverUrl = obj.value(QStringLiteral("coverUrl")).toString();
+    component.contentAvailable = obj.value(QStringLiteral("contentAvailable")).toBool(true);
     component.kind = itemKindFromString(obj.value(QStringLiteral("kind")).toString());
+    if (component.kind == arachnel::core::CatalogItemKind::Game
+        && (obj.value(QStringLiteral("kind")).toString().isEmpty()
+            || component.id.startsWith(QStringLiteral("steam-"))))
+        component.kind = arachnel::core::CatalogItemKind::Dlc;
     const QString delivery = obj.value(QStringLiteral("delivery")).toString().trimmed().toLower();
-    component.delivery = delivery == QStringLiteral("direct")
+    component.delivery = delivery == QStringLiteral("direct") || delivery.isEmpty()
                              ? arachnel::core::ComponentDelivery::Direct
                              : arachnel::core::ComponentDelivery::Magnet;
     component.referer = obj.value(QStringLiteral("referer")).toString();
     component.getfileUrl = obj.value(QStringLiteral("getfileUrl")).toString();
     component.optional = obj.value(QStringLiteral("optional")).toBool(true);
+    for (const QJsonValue& shot : obj.value(QStringLiteral("screenshotUrls")).toArray()) {
+        const QString url = shot.toString().trimmed();
+        if (!url.isEmpty())
+            component.screenshotUrls.append(url);
+    }
     const QJsonArray uris = obj.value(QStringLiteral("uris")).toArray();
     for (const QJsonValue& uri : uris) {
         const QString value = uri.toString();
@@ -55,6 +98,44 @@ arachnel::core::CatalogComponent addonFromJson(const QJsonObject& obj, const QSt
     if (component.id == parentId)
         component.id += QStringLiteral("-component");
     return component;
+}
+
+struct RelayDlcPayload {
+    QVector<arachnel::core::CatalogComponent> addons;
+    bool hasWorkshop = false;
+    bool ok = false;
+};
+
+RelayDlcPayload fetchRelayDlcs(const PluginSettings& settings, const QString& appid)
+{
+    RelayDlcPayload out;
+    if (appid.isEmpty())
+        return out;
+    QString base = settings.relayBaseUrl.trimmed();
+    if (base.endsWith(QLatin1Char('/')))
+        base.chop(1);
+    if (base.isEmpty())
+        base = QString::fromUtf8(kDefaultRelayBase);
+    const QString url = base + QStringLiteral("/v1/app/%1/dlcs").arg(appid);
+    QMap<QString, QString> headers;
+    if (!settings.relayClientToken.isEmpty())
+        headers.insert(QStringLiteral("X-Arachnel-Token"), settings.relayClientToken);
+    QString err;
+    const QByteArray raw = httpGet(url, 30000, headers, &err);
+    if (raw.isEmpty())
+        return out;
+    const QJsonObject root = QJsonDocument::fromJson(raw).object();
+    const QJsonArray dlcs = root.value(QStringLiteral("dlcs")).toArray();
+    const QString parentId = QStringLiteral("steam-%1").arg(appid);
+    out.addons.reserve(dlcs.size());
+    for (const QJsonValue& v : dlcs) {
+        if (!v.isObject())
+            continue;
+        out.addons.append(addonFromJson(v.toObject(), parentId));
+    }
+    out.hasWorkshop = root.value(QStringLiteral("hasWorkshop")).toBool(false);
+    out.ok = true;
+    return out;
 }
 
 QJsonObject normalizeCatalogGame(const QJsonObject& raw)
@@ -75,6 +156,14 @@ QJsonObject normalizeCatalogGame(const QJsonObject& raw)
         return {};
     if (raw.contains(QStringLiteral("hasManifest")) && !raw.value(QStringLiteral("hasManifest")).toBool(true))
         return {};
+    {
+        const QString type = raw.value(QStringLiteral("type")).toString().trimmed().toLower();
+        if (type == QStringLiteral("dlc") || type == QStringLiteral("music")
+            || type == QStringLiteral("demo") || type == QStringLiteral("mod")
+            || type == QStringLiteral("video")) {
+            return {};
+        }
+    }
 
     const QString upload = raw.value(QStringLiteral("uploadDate")).toString().trimmed();
     QString version = raw.value(QStringLiteral("version")).toString().trimmed();
@@ -111,10 +200,42 @@ QJsonObject normalizeCatalogGame(const QJsonObject& raw)
     entry.insert(QStringLiteral("needsOnlineFix"), needsFix);
     entry.insert(QStringLiteral("installKind"), installKind);
     entry.insert(QStringLiteral("sourceId"), QStringLiteral("steamidra"));
-    // TEMP: hide catalog add-ons (Online-Fix repair zips, etc.) until the flow is ready.
-    // if (raw.value(QStringLiteral("addons")).isArray())
-    //     entry.insert(QStringLiteral("addons"), raw.value(QStringLiteral("addons")));
+    // Keep relay DLC metadata so Arachnel can show "N add-ons" and enrich via /dlcs.
+    if (raw.value(QStringLiteral("dlcCount")).isDouble())
+        entry.insert(QStringLiteral("dlcCount"), raw.value(QStringLiteral("dlcCount")).toInt());
+    else if (raw.value(QStringLiteral("dlc")).isArray())
+        entry.insert(QStringLiteral("dlcCount"), raw.value(QStringLiteral("dlc")).toArray().size());
+    if (raw.value(QStringLiteral("dlc")).isArray())
+        entry.insert(QStringLiteral("dlc"), raw.value(QStringLiteral("dlc")).toArray());
+    if (raw.value(QStringLiteral("hasWorkshop")).isBool())
+        entry.insert(QStringLiteral("hasWorkshop"), raw.value(QStringLiteral("hasWorkshop")).toBool());
+    // Online-Fix zip addons stay hidden until that flow is ready.
     return entry;
+}
+
+void collectReferencedDlcAppIds(const QJsonObject& raw, QSet<QString>* out)
+{
+    if (!out)
+        return;
+    const auto addId = [out](QString id) {
+        id = id.trimmed();
+        if (id.startsWith(QStringLiteral("steam-")))
+            id = id.mid(6);
+        if (!id.isEmpty())
+            out->insert(id);
+    };
+    const QJsonValue dlcVal = raw.value(QStringLiteral("dlc"));
+    if (dlcVal.isArray()) {
+        for (const QJsonValue& d : dlcVal.toArray()) {
+            if (d.isString())
+                addId(d.toString());
+            else if (d.isDouble())
+                addId(QString::number(d.toInteger()));
+        }
+    } else if (dlcVal.isString()) {
+        for (const QString& part : dlcVal.toString().split(QLatin1Char(',')))
+            addId(part);
+    }
 }
 
 QJsonArray parseCatalogPayload(const QJsonDocument& doc)
@@ -131,14 +252,28 @@ QJsonArray parseCatalogPayload(const QJsonDocument& doc)
             rows = root.value(QStringLiteral("downloads")).toArray();
     }
     QJsonArray games;
+    QSet<QString> referencedDlc;
     for (const QJsonValue& v : rows) {
         if (!v.isObject())
             continue;
-        const QJsonObject n = normalizeCatalogGame(v.toObject());
+        const QJsonObject raw = v.toObject();
+        collectReferencedDlcAppIds(raw, &referencedDlc);
+        const QJsonObject n = normalizeCatalogGame(raw);
         if (!n.isEmpty())
             games.append(n);
     }
-    return games;
+    if (referencedDlc.isEmpty())
+        return games;
+
+    QJsonArray filtered;
+    for (const QJsonValue& v : games) {
+        const QJsonObject o = v.toObject();
+        const QString appid = o.value(QStringLiteral("steamAppId")).toString();
+        if (!appid.isEmpty() && referencedDlc.contains(appid))
+            continue;
+        filtered.append(o);
+    }
+    return filtered;
 }
 
 } // namespace
@@ -186,9 +321,29 @@ arachnel::core::CatalogEntry catalogEntryFromJson(const QJsonObject& obj)
             QStringLiteral("https://cdn.akamai.steamstatic.com/steam/apps/%1/header.jpg")
                 .arg(e.steamAppId);
     }
-    // TEMP: hide catalog add-ons (Online-Fix repair zips, etc.) in the download sheet.
+    // Keep list rows light: dlcCount for badge; full rows load via /dlcs in entryById.
+    e.dlcCount = obj.value(QStringLiteral("dlcCount")).toInt(0);
+    if (e.dlcCount <= 0 && obj.value(QStringLiteral("dlc")).isArray())
+        e.dlcCount = obj.value(QStringLiteral("dlc")).toArray().size();
+    e.hasWorkshop = obj.value(QStringLiteral("hasWorkshop")).toBool(false);
     e.addons.clear();
     return e;
+}
+
+void enrichCatalogEntryWithRelayDlcs(arachnel::core::CatalogEntry& entry, const PluginSettings& settings)
+{
+    QString appid = entry.steamAppId.trimmed();
+    if (appid.isEmpty() && entry.id.startsWith(QStringLiteral("steam-")))
+        appid = entry.id.mid(6);
+    if (appid.isEmpty())
+        return;
+    const RelayDlcPayload payload = fetchRelayDlcs(settings, appid);
+    if (!payload.ok)
+        return;
+    entry.addons = payload.addons;
+    entry.hasWorkshop = payload.hasWorkshop;
+    if (!payload.addons.isEmpty())
+        entry.dlcCount = payload.addons.size();
 }
 
 QVector<arachnel::core::CatalogEntry> loadCatalogEntriesFromFile(const QString& path)
@@ -236,7 +391,7 @@ QString syncManifestCatalog(const PluginSettings& settings, const QString& cache
     }
 
     QString err;
-    const QByteArray payload = httpGet(url, 300000, {}, &err);
+    const QByteArray payload = httpGet(url, 90000, {}, &err);
     if (payload.isEmpty())
         return QFileInfo::exists(cachePath) ? cachePath : QString();
 
