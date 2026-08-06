@@ -46,6 +46,7 @@ cmake -S "${ROOT}" -B "${BUILD}" -G Ninja \
   -DARACHNEL_SDK_DIR="${SDK_DIR}" \
   -DDEPOTKIT_DIR="${DEPOTKIT_DIR}"
 cmake --build "${BUILD}" --target steamidra_arach -j"$(nproc)"
+bash "${ROOT}/scripts/ci/check-linux-runtime.sh" "${BUILD}/plugin-bundle/libsteamidra_plugin.so"
 
 mkdir -p "${DIST}"
 cp -f "${BUILD}/dist/steamidra.arach" "${DIST}/steam.arach"

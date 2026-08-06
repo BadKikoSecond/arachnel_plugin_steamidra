@@ -59,8 +59,8 @@ if(UNIX AND NOT APPLE)
     target_link_options(steamidra_plugin PRIVATE "LINKER:-Bsymbolic")
 endif()
 
-# Do not bake CI Qt paths into the .so. Linux CI also ships curl/OpenSSL next to
-# the plugin with RUNPATH=$ORIGIN (see scripts/ci/bundle-linux-plugin-deps.sh).
+# Do not bake CI Qt paths into the .so. Linux CI bundles non-base runtime deps
+# next to the plugin with RUNPATH=$ORIGIN (see scripts/ci/linux-runtime-bundle.sh).
 set_target_properties(steamidra_plugin PROPERTIES
     OUTPUT_NAME "steamidra_plugin"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin-bundle"
@@ -72,9 +72,9 @@ set_target_properties(steamidra_plugin PROPERTIES
 )
 if(UNIX AND NOT APPLE)
     add_custom_command(TARGET steamidra_plugin POST_BUILD
-        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/bundle-linux-plugin-deps.sh"
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/linux-runtime-bundle.sh"
                 "$<TARGET_FILE:steamidra_plugin>"
-        COMMENT "Bundle curl/OpenSSL and set RUNPATH=\$ORIGIN"
+        COMMENT "Bundle Linux runtime deps and set RUNPATH=\$ORIGIN"
         VERBATIM)
 endif()
 if(MINGW)

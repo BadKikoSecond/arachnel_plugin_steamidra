@@ -53,13 +53,17 @@ if [[ ! -f "${MERGED}/online_fix_kit/SteamFix64.dll" ]]; then
   echo "WARNING: universal bundle missing online_fix_kit/SteamFix64.dll" >&2
 fi
 
-[[ ! -f "${LIN}/libsteamidra_plugin.so" ]] || \
-  cp -a "${LIN}/libsteamidra_plugin.so" "${MERGED}/"
-# Linux-only: jammy-era libcurl beside the .so (matches AppImage OpenSSL 3.0).
-[[ ! -f "${LIN}/libcurl.so.4" ]] || cp -a "${LIN}/libcurl.so.4" "${MERGED}/"
+shopt -s nullglob
+for so in "${LIN}"/lib*.so*; do
+  [[ -f "${so}" ]] || continue
+  cp -a "${so}" "${MERGED}/"
+done
 if command -v patchelf >/dev/null 2>&1 && [[ -f "${MERGED}/libsteamidra_plugin.so" ]]; then
   patchelf --set-rpath '$ORIGIN' "${MERGED}/libsteamidra_plugin.so" || true
-  [[ ! -f "${MERGED}/libcurl.so.4" ]] || patchelf --set-rpath '$ORIGIN' "${MERGED}/libcurl.so.4" || true
+  for so in "${MERGED}"/lib*.so*; do
+    [[ -f "${so}" ]] || continue
+    patchelf --set-rpath '$ORIGIN' "${so}" || true
+  done
 fi
 
 required=(
