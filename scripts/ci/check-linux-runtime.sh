@@ -112,9 +112,8 @@ while IFS= read -r dir; do
   fi
 done < <(runtime_lib_dirs_for_missing $(awk '/=> not found/ {print $1}' <<<"${ldd_output}"))
 
-if [[ -n "${runtime_ld_path}" ]]; then
-  export LD_LIBRARY_PATH="${runtime_ld_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-fi
+# Plugin dir first so Qt (from launcher/.ci) can resolve bundled peers (gssapi, etc.).
+export LD_LIBRARY_PATH="${DIR}${runtime_ld_path:+:${runtime_ld_path}}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 python3 - "${SO}" <<'PY'
 import ctypes
