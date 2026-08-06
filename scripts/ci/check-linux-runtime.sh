@@ -30,6 +30,34 @@ is_allowed_system_lib() {
   esac
 }
 
+is_runtime_provided_lib() {
+  local name="$1"
+  case "${name}" in
+    libQt6*.so.*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+runtime_lib_dirs_for_missing() {
+  local missing_libs=("$@")
+  local -a dirs=()
+  shopt -s nullglob globstar
+  for lib in "${missing_libs[@]}"; do
+    is_runtime_provided_lib "${lib}" || continue
+    for match in "${PWD}"/.ci/qt/**/"${lib}"; do
+      [[ -f "${match}" ]] || continue
+      local dir
+      dir="$(dirname "${match}")"
+      [[ " ${dirs[*]} " == *" ${dir} "* ]] || dirs+=("${dir}")
+    done
+  done
+  printf '%s\n' "${dirs[@]}"
+}
+
 rpath="$(readelf -d "${SO}" | awk -F'[][]' '/RUNPATH|RPATH/ { print $2; exit }')"
 if [[ "${rpath}" != *'$ORIGIN'* ]]; then
   echo "RUNPATH check failed for ${SO}: expected \$ORIGIN, got '${rpath:-<empty>}'" >&2
@@ -43,6 +71,7 @@ missing=()
 while IFS= read -r line; do
   [[ "${line}" == *"=> not found"* ]] || continue
   lib="$(awk '{print $1}' <<<"${line}")"
+  is_runtime_provided_lib "${lib}" && continue
   [[ -n "${lib}" ]] && missing+=("${lib}")
 done <<< "${ldd_output}"
 if [[ "${#missing[@]}" -gt 0 ]]; then
@@ -59,7 +88,7 @@ while IFS= read -r line; do
   if [[ -f "${DIR}/${lib}" ]]; then
     continue
   fi
-  if [[ "${lib}" == libQt6*.so.* ]]; then
+  if is_runtime_provided_lib "${lib}"; then
     continue
   fi
   if is_allowed_system_lib "${lib}"; then
@@ -71,6 +100,20 @@ if [[ "${#violations[@]}" -gt 0 ]]; then
   printf 'non-bundled runtime deps detected:\n' >&2
   printf '  %s\n' "${violations[@]}" >&2
   exit 1
+fi
+
+runtime_ld_path=""
+while IFS= read -r dir; do
+  [[ -n "${dir}" ]] || continue
+  if [[ -z "${runtime_ld_path}" ]]; then
+    runtime_ld_path="${dir}"
+  else
+    runtime_ld_path="${runtime_ld_path}:${dir}"
+  fi
+done < <(runtime_lib_dirs_for_missing $(awk '/=> not found/ {print $1}' <<<"${ldd_output}"))
+
+if [[ -n "${runtime_ld_path}" ]]; then
+  export LD_LIBRARY_PATH="${runtime_ld_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
 python3 - "${SO}" <<'PY'
