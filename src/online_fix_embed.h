@@ -32,6 +32,6 @@ bool applyDlcUnlocks(const QString& installPath, const QString& appid,
 void repairOnlineFixBeforeLaunch(const QString& installPath, const QString& appid,
                                  const QString& pluginRoot);
 
-QString findLaunchExeForInstall(const QString& installPath);
+QString findLaunchExeHeuristic(const QString& installPath);
 
 } // namespace steamidra

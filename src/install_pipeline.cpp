@@ -2,6 +2,7 @@
 
 #include "http_client.h"
 #include "online_fix_embed.h"
+#include "steam_launch.h"
 
 #include <depotkit.h>
 
@@ -751,11 +752,17 @@ InstallPipelineResult runInstallPipeline(
         const OnlineFixResult fix =
             embedOnlineFix(installPath, appid, pluginRoot, settingsJson, false);
 
-        QString launchPath = findLaunchExeForInstall(installPath);
+        const ResolvedLaunchExe resolved = resolveInstallLaunch(installPath, appid);
         QJsonObject launch;
-        if (!launchPath.isEmpty()) {
+        if (!resolved.path.isEmpty()) {
             launch.insert(QStringLiteral("type"), QStringLiteral("exe"));
-            launch.insert(QStringLiteral("path"), launchPath);
+            launch.insert(QStringLiteral("path"), resolved.path);
+            if (!resolved.workingDirectory.isEmpty())
+                launch.insert(QStringLiteral("workingDirectory"), resolved.workingDirectory);
+            if (!resolved.arguments.isEmpty())
+                launch.insert(QStringLiteral("arguments"),
+                              QJsonArray::fromStringList(resolved.arguments));
+            launch.insert(QStringLiteral("source"), resolved.source);
         } else {
             launch.insert(QStringLiteral("type"), QStringLiteral("steam"));
             launch.insert(QStringLiteral("uri"), QStringLiteral("steam://rungameid/%1").arg(appid));

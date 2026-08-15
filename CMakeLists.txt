@@ -48,6 +48,7 @@ add_library(steamidra_plugin SHARED
     src/plugin_settings.cpp
     src/catalog_sync.cpp
     src/online_fix_embed.cpp
+    src/steam_launch.cpp
     src/install_pipeline.cpp
 )
 
@@ -143,6 +144,7 @@ add_executable(steamidra_smoke
     src/plugin_settings.cpp
     src/catalog_sync.cpp
     src/online_fix_embed.cpp
+    src/steam_launch.cpp
     tools/smoke_cpp_runtime.cpp
 )
 target_include_directories(steamidra_smoke PRIVATE src)

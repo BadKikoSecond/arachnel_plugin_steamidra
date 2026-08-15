@@ -1,5 +1,7 @@
 #include "online_fix_embed.h"
 
+#include "steam_launch.h"
+
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
@@ -608,6 +610,37 @@ QStringList findUnityRoots(const QString& root)
     return out;
 }
 
+// Godot / custom: steam_api*.dll next to game.exe (and often a .pck). Embed must land
+// beside the exe - planting at install root leaves winmm unloaded (Machine Party).
+QStringList findSteamApiGameDirs(const QString& root)
+{
+    QStringList out;
+    QDirIterator it(root,
+                    {QStringLiteral("steam_api64.dll"), QStringLiteral("steam_api.dll")},
+                    QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        if (skipOverlayPath(it.filePath()))
+            continue;
+        const QString parent = it.fileInfo().absolutePath();
+        QDir dir(parent);
+        bool hasGame = false;
+        for (const QFileInfo& fi : dir.entryInfoList({QStringLiteral("*.exe")}, QDir::Files)) {
+            const QString lower = fi.fileName().toLower();
+            if (lower == QStringLiteral("cmd.exe") || lower.contains(QStringLiteral("unins"))
+                || lower.contains(QStringLiteral("crash")) || lower.contains(QStringLiteral("redist")))
+                continue;
+            hasGame = true;
+            break;
+        }
+        if (!hasGame && !dir.entryList({QStringLiteral("*.pck")}, QDir::Files).isEmpty())
+            hasGame = true;
+        if (hasGame && !out.contains(parent))
+            out.append(parent);
+    }
+    return out;
+}
+
 QStringList findOverlayTargets(const QString& installRoot)
 {
     QStringList ue = findUeShippingDirs(installRoot);
@@ -624,6 +657,17 @@ QStringList findOverlayTargets(const QString& installRoot)
     const QStringList unity = findUnityRoots(installRoot);
     if (!unity.isEmpty())
         return {unity.first()};
+    const QStringList steamApiDirs = findSteamApiGameDirs(installRoot);
+    if (!steamApiDirs.isEmpty()) {
+        // Prefer Godot-style (exe + .pck) over bare steam_api folders.
+        QStringList ranked = steamApiDirs;
+        std::sort(ranked.begin(), ranked.end(), [](const QString& a, const QString& b) {
+            const int sa = QDir(a).entryList({QStringLiteral("*.pck")}, QDir::Files).isEmpty() ? 0 : 1;
+            const int sb = QDir(b).entryList({QStringLiteral("*.pck")}, QDir::Files).isEmpty() ? 0 : 1;
+            return sa > sb;
+        });
+        return {ranked.first()};
+    }
     return {installRoot};
 }
 
@@ -693,7 +737,7 @@ bool isClassicSteamworksLayout(const QString& root)
 
 } // namespace
 
-QString findLaunchExeForInstall(const QString& installPath)
+QString findLaunchExeHeuristic(const QString& installPath)
 {
     const QStringList targets = findOverlayTargets(installPath);
     if (!targets.isEmpty()) {
@@ -709,8 +753,9 @@ QString findLaunchExeForInstall(const QString& installPath)
         if (skipOverlayPath(it.filePath()))
             continue;
         const QString lower = it.fileName().toLower();
-        if (lower.contains(QStringLiteral("crash")) || lower.contains(QStringLiteral("unins"))
-            || lower.contains(QStringLiteral("redist")) || lower.contains(QStringLiteral("prereq")))
+        if (lower == QStringLiteral("cmd.exe") || lower.contains(QStringLiteral("crash"))
+            || lower.contains(QStringLiteral("unins")) || lower.contains(QStringLiteral("redist"))
+            || lower.contains(QStringLiteral("prereq")))
             continue;
         qint64 score = it.fileInfo().size();
         const bool hasOverlay = QFileInfo::exists(it.fileInfo().absolutePath() + QStringLiteral("/SteamFix64.dll"))
@@ -806,9 +851,9 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
         writeSteamFixIni(target + QStringLiteral("/SteamFix.ini"), appid, workshop, true,
                          unlockAllDlc);
 
-        QString launchExe = findLaunchExeForInstall(target.isEmpty() ? installPath : target);
+        QString launchExe = findLaunchExeHeuristic(target.isEmpty() ? installPath : target);
         if (launchExe.isEmpty())
-            launchExe = findLaunchExeForInstall(installPath);
+            launchExe = findLaunchExeHeuristic(installPath);
         // SteamStub runs before winmm - unpack so FakeAppId/SteamFix can take over.
         if (!launchExe.isEmpty())
             tryUnpackSteamStub(launchExe, kit);
@@ -869,11 +914,16 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
         payload = QJsonDocument::fromJson(marker.readAll()).object();
         marker.close();
     }
-    const QString launchExe = findLaunchExeForInstall(installPath);
-    if (!launchExe.isEmpty()) {
+    const ResolvedLaunchExe resolved = resolveInstallLaunch(installPath, appid);
+    if (!resolved.path.isEmpty()) {
         QJsonObject launch;
         launch.insert(QStringLiteral("type"), QStringLiteral("exe"));
-        launch.insert(QStringLiteral("path"), launchExe);
+        launch.insert(QStringLiteral("path"), resolved.path);
+        if (!resolved.workingDirectory.isEmpty())
+            launch.insert(QStringLiteral("workingDirectory"), resolved.workingDirectory);
+        if (!resolved.arguments.isEmpty())
+            launch.insert(QStringLiteral("arguments"), QJsonArray::fromStringList(resolved.arguments));
+        launch.insert(QStringLiteral("source"), resolved.source);
         payload.insert(QStringLiteral("launch"), launch);
     }
     QJsonObject of;

@@ -4,6 +4,7 @@
 #include "install_pipeline.h"
 #include "online_fix_embed.h"
 #include "plugin_settings.h"
+#include "steam_launch.h"
 
 #include "install_analysis.h"
 #include "install_kind.h"
@@ -403,52 +404,83 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(const arachnel::core::Lib
         appId = appId.mid(QStringLiteral("steam://app/").size());
     repairOnlineFixBeforeLaunch(local.installPath, appId, m_rootPath);
 
-    const QString markerPath = local.installPath + QStringLiteral("/.arachnel-steamidra");
-    if (QFileInfo::exists(markerPath)) {
-        QFile f(markerPath);
-        if (f.open(QIODevice::ReadOnly)) {
-            const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
-            const QJsonObject launch = root.value(QStringLiteral("launch")).toObject();
-            const QString type = launch.value(QStringLiteral("type")).toString();
-            if (type == QStringLiteral("exe")) {
-                const QString path = launch.value(QStringLiteral("path")).toString();
-                if (QFileInfo::exists(path)) {
-                    info.executable = path;
-                    info.workingDirectory = QFileInfo(path).absolutePath();
-                    return info;
-                }
-            }
-        }
-    }
+    auto applyResolved = [&](const ResolvedLaunchExe& resolved) {
+        if (resolved.path.isEmpty())
+            return false;
+        info.executable = resolved.path;
+        info.workingDirectory = resolved.workingDirectory.isEmpty()
+                                    ? QFileInfo(resolved.path).absolutePath()
+                                    : resolved.workingDirectory;
+        info.arguments = resolved.arguments;
+        return true;
+    };
 
-    // Prefer shipping / SteamFix-adjacent exe
-    QString best;
-    qint64 bestScore = -1;
-    QDirIterator it(local.installPath, {QStringLiteral("*.exe")}, QDir::Files,
-                    QDirIterator::Subdirectories);
-    while (it.hasNext()) {
-        it.next();
-        const QString lower = it.fileName().toLower();
-        if (lower.contains(QStringLiteral("crash")) || lower.contains(QStringLiteral("unins"))
-            || lower.contains(QStringLiteral("redist")))
-            continue;
-        qint64 score = it.fileInfo().size();
-        const QString parent = it.fileInfo().absolutePath();
-        if (QFileInfo::exists(parent + QStringLiteral("/SteamFix64.dll"))
-            || QFileInfo::exists(parent + QStringLiteral("/winmm.dll")))
-            score += 500LL * 1024 * 1024;
-        if (lower.contains(QStringLiteral("shipping")))
-            score += 200LL * 1024 * 1024;
-        if (score > bestScore) {
-            bestScore = score;
-            best = it.filePath();
+    auto tryMarker = [&](bool steamSourceOnly) {
+        const QString markerPath = local.installPath + QStringLiteral("/.arachnel-steamidra");
+        if (!QFileInfo::exists(markerPath))
+            return false;
+        QFile f(markerPath);
+        if (!f.open(QIODevice::ReadOnly))
+            return false;
+        const QJsonObject launch =
+            QJsonDocument::fromJson(f.readAll()).object().value(QStringLiteral("launch")).toObject();
+        if (launch.value(QStringLiteral("type")).toString() != QStringLiteral("exe"))
+            return false;
+        if (steamSourceOnly
+            && launch.value(QStringLiteral("source")).toString() != QStringLiteral("steam"))
+            return false;
+        const QString path = launch.value(QStringLiteral("path")).toString();
+        const QString base = QFileInfo(path).fileName();
+        if (base.compare(QStringLiteral("cmd.exe"), Qt::CaseInsensitive) == 0
+            || !QFileInfo::exists(path))
+            return false;
+        info.executable = path;
+        const QString wd = launch.value(QStringLiteral("workingDirectory")).toString();
+        info.workingDirectory =
+            !wd.isEmpty() && QDir(wd).exists() ? wd : QFileInfo(path).absolutePath();
+        const QJsonArray args = launch.value(QStringLiteral("arguments")).toArray();
+        for (const QJsonValue& v : args) {
+            const QString a = v.toString().trimmed();
+            if (!a.isEmpty())
+                info.arguments.append(a);
         }
-    }
-    if (!best.isEmpty()) {
-        info.executable = best;
-        info.workingDirectory = QFileInfo(best).absolutePath();
+        return true;
+    };
+
+    // Cached Steam config.launch from install/embed - skip network.
+    if (tryMarker(true))
+        return info;
+
+    const ResolvedLaunchExe resolved = resolveInstallLaunch(local.installPath, appId);
+    if (applyResolved(resolved)) {
+        // Refresh marker so later launches skip the steamcmd round-trip.
+        const QString markerPath = local.installPath + QStringLiteral("/.arachnel-steamidra");
+        QJsonObject payload;
+        QFile marker(markerPath);
+        if (marker.exists() && marker.open(QIODevice::ReadOnly)) {
+            payload = QJsonDocument::fromJson(marker.readAll()).object();
+            marker.close();
+        }
+        QJsonObject launch;
+        launch.insert(QStringLiteral("type"), QStringLiteral("exe"));
+        launch.insert(QStringLiteral("path"), resolved.path);
+        if (!resolved.workingDirectory.isEmpty())
+            launch.insert(QStringLiteral("workingDirectory"), resolved.workingDirectory);
+        if (!resolved.arguments.isEmpty())
+            launch.insert(QStringLiteral("arguments"),
+                          QJsonArray::fromStringList(resolved.arguments));
+        launch.insert(QStringLiteral("source"), resolved.source);
+        payload.insert(QStringLiteral("launch"), launch);
+        if (!appId.isEmpty())
+            payload.insert(QStringLiteral("appid"), appId);
+        if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            marker.write(QJsonDocument(payload).toJson(QJsonDocument::Indented));
         return info;
     }
+
+    // Legacy heuristic markers (may still be wrong; last resort before steam://).
+    if (tryMarker(false))
+        return info;
 
     if (!appId.isEmpty()) {
         const QString steamExe = steamExecutablePath();
