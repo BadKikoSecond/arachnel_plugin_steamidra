@@ -725,8 +725,10 @@ bool skipOverlayPath(const QString& path)
 
 bool gameNeedsEpicFix(const QString& root)
 {
-    // EpicFix64 only helps x64 EOS. Win32 EOSSDK (Isaac etc.) must not block embed
-    // or receive an x64 EpicFix beside a 32-bit exe.
+    // FreeTP policy: EpicFix only for RedpointEOS (Meccha etc.).
+    // Plain EOSSDK*.dll alone (Pratfall) gets SteamFix/OnlineFix without EpicFix -
+    // forcing EpicFix opens freetp.org and can black-screen.
+    // EpicFix64 is x64-only; Win32 Redpoint/EOSSDK must not receive it.
     QDirIterator it(root, QDirIterator::Subdirectories);
     while (it.hasNext()) {
         it.next();
@@ -742,16 +744,6 @@ bool gameNeedsEpicFix(const QString& root)
             const quint16 m = peMachine(it.filePath());
             if (m == kPeAmd64 || m == 0)
                 return true;
-            continue;
-        }
-        if (name.startsWith(QStringLiteral("EOSSDK"), Qt::CaseInsensitive)
-            && name.endsWith(QStringLiteral(".dll"), Qt::CaseInsensitive)) {
-            if (name.contains(QStringLiteral("Win32"), Qt::CaseInsensitive))
-                continue;
-            const quint16 m = peMachine(it.filePath());
-            if (m == kPeI386)
-                continue;
-            return true;
         }
     }
     return false;
