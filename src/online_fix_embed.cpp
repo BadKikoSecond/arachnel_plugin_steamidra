@@ -582,7 +582,7 @@ void stripWrongArchOverlay(const QString& target, bool want32)
     }
 }
 
-void writeSteamFixIni(const QString& path, const QString& appid, bool workshop, bool overlay,
+void writeSteamFixIni(const QString& path, const QString& appid, bool workshop, bool overlay = true,
                       bool unlockAllDlc = true)
 {
     QSaveFile f(path);
@@ -857,19 +857,6 @@ QString resolveEpicFixDir(const QString& kit, const QString& pluginRoot)
             return dir;
     }
     return {};
-}
-
-bool gameHasSteamApi(const QString& root)
-{
-    QDirIterator it(root,
-                    {QStringLiteral("steam_api64.dll"), QStringLiteral("steam_api.dll")},
-                    QDir::Files, QDirIterator::Subdirectories);
-    while (it.hasNext()) {
-        it.next();
-        if (!skipOverlayPath(it.filePath()))
-            return true;
-    }
-    return false;
 }
 
 QStringList findUeShippingDirs(const QString& root)
