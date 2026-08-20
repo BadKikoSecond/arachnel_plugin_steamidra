@@ -2,7 +2,7 @@
 
 User-facing name: **Steam**. The internal id remains `steamidra` so existing installations and settings keep working.
 
-GPL-3 source plugin for [Arachnel](https://github.com/BadKiko/Arachnel): **self-contained** Steam depot installs via bundled **DepotDownloaderMod** + **.NET 9**, with **LumaCore** (Windows) / **SLSsteam** (Linux) when Steam is present.
+GPL-3 source plugin for [Arachnel](https://github.com/BadKiko/Arachnel): Steam depot installs via linked **[depotkit](https://github.com/BadKiko/depotkit)**, with optional **SLSsteam** on Linux when Steam is present.
 
 Inspired by [SteaMidra / SFF](https://github.com/Midrags/SFF) (GPL-3). This repo does **not** vendor SFF Python modules.
 
@@ -34,8 +34,8 @@ GitLab: **CI/CD → Schedules** → cron `0 4 * * *` on branch `master`, set `CA
 Push a semantic version tag to build and publish a universal `steam.arach`:
 
 ```bash
-git tag v0.3.10
-git push origin v0.3.10
+git tag v0.6.0
+git push origin v0.6.0
 ```
 
 GitLab builds Windows and Linux bundles, merges their platform runtimes, uploads the
@@ -46,31 +46,26 @@ package, and creates a Release. The toolchain is pinned in
 
 | Component | Linux `.arach` | Windows `.arach` |
 |-----------|----------------|------------------|
-| DepotDownloaderMod | yes | yes |
-| Portable .NET 9 | yes | yes |
-| SLSsteam | yes | — |
-| LumaCore | — | yes (or downloaded on first use) |
+| depotkit (static in plugin) | yes | yes |
+| SLSsteam | optional | — |
+| Online Fix kit | yes | yes |
 
-Fetch before release builds:
-
-```bash
-./tools/fetch_third_party.sh linux
-# optional cross-prep:
-./tools/fetch_third_party.sh windows
-```
+No DepotDownloaderMod / .NET / LumaCore.
 
 ## Requirements
 
 - CMake 3.20+, C++20, Qt 6.8+ (Core, Network), Ninja
-- Arachnel checkout (`ARACHNEL_SDK_DIR`) — **no Python required at runtime**
+- Arachnel checkout (`ARACHNEL_SDK_DIR`)
+- [depotkit](https://github.com/BadKiko/depotkit) checkout (`DEPOTKIT_DIR`, default `../depotkit`)
 - **Steam optional** for download; recommended for library / Proton launch
 
-Runtime is fully self-contained: DepotDownloaderMod + .NET 9 + Online Fix kit are bundled. Python is only used in CI/dev for catalog rebuild tools.
+Python is only used in CI/dev for catalog rebuild tools.
 
 ## Build & install
 
 ```bash
-export ARACHNEL_SDK_DIR=~/path/to/Arachnel   # or D:\Work\Arachnel
+export ARACHNEL_SDK_DIR=~/path/to/Arachnel
+export DEPOTKIT_DIR=~/path/to/depotkit
 ./tools/fetch_third_party.sh linux           # or tools\fetch_third_party.ps1 on Windows
 ./run.sh                                     # or .\run.ps1
 ```
@@ -79,8 +74,8 @@ export ARACHNEL_SDK_DIR=~/path/to/Arachnel   # or D:\Work\Arachnel
 
 | Key | Meaning |
 |-----|---------|
-| `preferMode` | Legacy; installs always use DDMod. |
-| `depotOs` | `windows` (default) or `linux`. Linux hosts use Windows depots for Proton. |
+| `preferMode` | Legacy; ignored. |
+| `depotOs` | `windows` (default) / `linux` / `macos` - which platform depots to keep. |
 | `libraryFolder` | Fallback install root if `--target` is omitted (never Steam `steamapps/common`) |
 | `includeDlc` | Also download DLC depots (default `false`) |
 | `hubcapApiKey` | Optional Hubcap `smm…` key for richer library dates |
@@ -134,14 +129,14 @@ Defender note: loose `SteamFix32.dll` is not shipped in the default Windows plug
 
 ## Modes
 
-**ddmod** — download depots with bundled DDMod. Writes ACF + SLS/Luma unlock when Steam exists.
+**depotkit** — download depots with the linked CDN client.
 
 ## Limits
 
-Needs a **depot key + manifest**. Catalog lists only titles with a known packaged manifest.
+Needs a **depot key + local manifest**. Catalog lists only titles with a known packaged manifest.
 
 ## License
 
 GPL-3.0-or-later — [LICENSE](LICENSE). Third-party: [NOTICE.md](NOTICE.md).
 
-Requires Arachnel **plugin API v3** (`owns_download`).
+Requires Arachnel **plugin API v4** (`owns_download`).

@@ -101,17 +101,23 @@ if find "${MERGED}/online_fix_kit" -type f \
   exit 1
 fi
 
-[[ ! -f "${LIN}/libsteamidra_plugin.so" ]] || \
-  cp -a "${LIN}/libsteamidra_plugin.so" "${MERGED}/"
+shopt -s nullglob
+for so in "${LIN}"/lib*.so*; do
+  [[ -f "${so}" ]] || continue
+  cp -a "${so}" "${MERGED}/"
+done
+if command -v patchelf >/dev/null 2>&1 && [[ -f "${MERGED}/libsteamidra_plugin.so" ]]; then
+  patchelf --set-rpath '$ORIGIN' "${MERGED}/libsteamidra_plugin.so" || true
+  for so in "${MERGED}"/lib*.so*; do
+    [[ -f "${so}" ]] || continue
+    patchelf --set-rpath '$ORIGIN' "${so}" || true
+  done
+fi
 
 required=(
   "${MERGED}/plugin.json"
   "${MERGED}/steamidra_plugin.dll"
   "${MERGED}/libsteamidra_plugin.so"
-  "${MERGED}/third_party/windows/DDMod/DepotDownloaderMod.dll"
-  "${MERGED}/third_party/windows/dotnet/dotnet.exe"
-  "${MERGED}/third_party/linux/DDMod/DepotDownloaderMod.dll"
-  "${MERGED}/third_party/linux/dotnet/dotnet"
 )
 for path in "${required[@]}"; do
   [[ -f "${path}" ]] || { echo "Universal bundle missing: ${path}" >&2; exit 1; }

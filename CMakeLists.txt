@@ -23,6 +23,24 @@ find_package(Qt6 REQUIRED COMPONENTS Core Network)
 include(${ARACHNEL_SDK_DIR}/cmake/ArachnelPluginSdk.cmake)
 arachnel_plugin_sdk_init(${ARACHNEL_SDK_DIR})
 
+# Native Steam CDN downloader (statically linked into the plugin).
+if(NOT DEFINED DEPOTKIT_DIR)
+    if(DEFINED ENV{DEPOTKIT_DIR})
+        set(DEPOTKIT_DIR "$ENV{DEPOTKIT_DIR}")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../depotkit/CMakeLists.txt")
+        set(DEPOTKIT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../depotkit")
+    elseif(EXISTS "D:/PetWork/depotkit/CMakeLists.txt")
+        set(DEPOTKIT_DIR "D:/PetWork/depotkit")
+    endif()
+endif()
+if(NOT DEPOTKIT_DIR OR NOT EXISTS "${DEPOTKIT_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "depotkit not found. Set DEPOTKIT_DIR to the depotkit checkout.")
+endif()
+cmake_path(ABSOLUTE_PATH DEPOTKIT_DIR NORMALIZE)
+set(DEPOTKIT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(DEPOTKIT_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+add_subdirectory("${DEPOTKIT_DIR}" "${CMAKE_BINARY_DIR}/_deps/depotkit" EXCLUDE_FROM_ALL)
+
 add_library(steamidra_plugin SHARED
     src/plugin_entry.cpp
     src/steamidra_plugin.cpp
@@ -30,17 +48,36 @@ add_library(steamidra_plugin SHARED
     src/plugin_settings.cpp
     src/catalog_sync.cpp
     src/online_fix_embed.cpp
+    src/steam_launch.cpp
     src/install_pipeline.cpp
 )
 
 target_include_directories(steamidra_plugin PRIVATE src)
-target_link_libraries(steamidra_plugin PRIVATE arachnel_plugin_sdk Qt6::Core Qt6::Network)
+target_link_libraries(steamidra_plugin PRIVATE arachnel_plugin_sdk Qt6::Core Qt6::Network depotkit)
 
+# Prefer this DSO's CatalogEntry special members over host interposition (Linux).
+if(UNIX AND NOT APPLE)
+    target_link_options(steamidra_plugin PRIVATE "LINKER:-Bsymbolic")
+endif()
+
+# Do not bake CI Qt paths into the .so. Linux CI bundles non-base runtime deps
+# next to the plugin with RUNPATH=$ORIGIN (see scripts/ci/linux-runtime-bundle.sh).
 set_target_properties(steamidra_plugin PROPERTIES
     OUTPUT_NAME "steamidra_plugin"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin-bundle"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin-bundle"
+    BUILD_RPATH ""
+    INSTALL_RPATH ""
+    SKIP_BUILD_RPATH TRUE
+    BUILD_WITH_INSTALL_RPATH FALSE
 )
+if(UNIX AND NOT APPLE)
+    add_custom_command(TARGET steamidra_plugin POST_BUILD
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/ci/linux-runtime-bundle.sh"
+                "$<TARGET_FILE:steamidra_plugin>"
+        COMMENT "Bundle Linux runtime deps and set RUNPATH=\$ORIGIN"
+        VERBATIM)
+endif()
 if(MINGW)
     set_target_properties(steamidra_plugin PROPERTIES PREFIX "")
 elseif(MSVC)
@@ -95,7 +132,7 @@ add_custom_command(TARGET steamidra_plugin POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/_staging_steamidra_arach"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_ARACH_STAGING}"
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${_PLUGIN_BUNDLE_DIR}" "${_ARACH_STAGING}"
-    COMMENT "Stage steamidra config + OS third_party (${_TP_OS}) — no Python worker"
+    COMMENT "Stage steamidra config + OS third_party (${_TP_OS}) — depotkit linked in"
 )
 
 arachnel_package_plugin_arach(steamidra_plugin steamidra "${_ARACH_STAGING}" "${_ARACH}")
@@ -108,6 +145,7 @@ add_executable(steamidra_smoke
     src/plugin_settings.cpp
     src/catalog_sync.cpp
     src/online_fix_embed.cpp
+    src/steam_launch.cpp
     tools/smoke_cpp_runtime.cpp
 )
 target_include_directories(steamidra_smoke PRIVATE src)

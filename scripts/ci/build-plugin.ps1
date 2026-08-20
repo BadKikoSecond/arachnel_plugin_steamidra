@@ -8,6 +8,7 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 
 $BuildPath = Join-Path $Root $BuildDir
 $SdkDir = if ($env:ARACHNEL_SDK_DIR) { $env:ARACHNEL_SDK_DIR } else { Join-Path $Root ".ci\arachnel-sdk" }
+$DepotkitDir = if ($env:DEPOTKIT_DIR) { $env:DEPOTKIT_DIR } else { Join-Path $Root ".ci\depotkit" }
 $QtRoot = if ($env:QT_INSTALL_DIR) { $env:QT_INSTALL_DIR } else { Join-Path $Root ".ci\qt" }
 $QtVersion = $env:QT_VERSION
 $QtArch = $env:QT_WINDOWS_ARCH
@@ -27,6 +28,14 @@ if ($env:CI_COMMIT_TAG) {
 
 if (-not (Test-Path (Join-Path $SdkDir "cmake\ArachnelPluginSdk.cmake"))) {
     git clone --depth 1 --branch $env:ARACHNEL_SDK_REF https://github.com/BadKiko/Arachnel.git $SdkDir
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+$depotkitUrl = if ($env:DEPOTKIT_GIT_URL) { $env:DEPOTKIT_GIT_URL } else { "https://github.com/BadKiko/depotkit.git" }
+$depotkitRef = if ($env:DEPOTKIT_REF) { $env:DEPOTKIT_REF } else { "main" }
+if (-not (Test-Path (Join-Path $DepotkitDir "CMakeLists.txt"))) {
+    if (Test-Path $DepotkitDir) { Remove-Item -Recurse -Force $DepotkitDir }
+    git clone --depth 1 --branch $depotkitRef $depotkitUrl $DepotkitDir
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
@@ -76,6 +85,7 @@ $configureArgs = @(
     "-B", $BuildPath,
     "-DCMAKE_PREFIX_PATH=$QtPrefix",
     "-DARACHNEL_SDK_DIR=$SdkDir",
+    "-DDEPOTKIT_DIR=$DepotkitDir",
     "-DCMAKE_BUILD_TYPE=Release"
 )
 

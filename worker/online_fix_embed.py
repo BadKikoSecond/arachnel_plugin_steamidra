@@ -511,6 +511,36 @@ def find_overlay_targets(install_root: Path) -> list[Path]:
     if unity:
         return [unity[0]]
 
+    # Godot / custom: steam_api next to game.exe (+ optional .pck).
+    api_dirs: list[Path] = []
+    seen: set[str] = set()
+    for pattern in ("steam_api64.dll", "steam_api.dll"):
+        for api in root.rglob(pattern):
+            if _skip_overlay_path(api):
+                continue
+            parent = api.parent
+            key = str(parent.resolve())
+            if key in seen:
+                continue
+            has_game = False
+            for exe in parent.glob("*.exe"):
+                lower = exe.name.lower()
+                if lower in ("cmd.exe",) or "unins" in lower or "crash" in lower or "redist" in lower:
+                    continue
+                has_game = True
+                break
+            if not has_game and list(parent.glob("*.pck")):
+                has_game = True
+            if has_game:
+                seen.add(key)
+                api_dirs.append(parent)
+    if api_dirs:
+        api_dirs.sort(
+            key=lambda p: (1 if list(p.glob("*.pck")) else 0, str(p)),
+            reverse=True,
+        )
+        return [api_dirs[0]]
+
     return [root]
 
 

@@ -1,4 +1,5 @@
-# Copy OS-specific third_party tree into the plugin bundle (flat: DDMod, SLSsteam/LumaCore, dotnet).
+# Copy OS-specific third_party tree into the plugin bundle (flat: SLSsteam on Linux).
+# Skip legacy DepotDownloaderMod / portable .NET / LumaCore.
 if(NOT EXISTS "${SOURCE_DIR}")
   message(WARNING "third_party OS dir missing: ${SOURCE_DIR} — run tools/fetch_third_party.sh")
   return()
@@ -6,6 +7,9 @@ endif()
 
 file(GLOB _CHILDREN RELATIVE "${SOURCE_DIR}" "${SOURCE_DIR}/*")
 foreach(_child ${_CHILDREN})
+  if(_child STREQUAL "DDMod" OR _child STREQUAL "dotnet" OR _child STREQUAL "LumaCore")
+    continue()
+  endif()
   if(IS_DIRECTORY "${SOURCE_DIR}/${_child}")
     file(COPY "${SOURCE_DIR}/${_child}" DESTINATION "${DEST_DIR}")
   else()

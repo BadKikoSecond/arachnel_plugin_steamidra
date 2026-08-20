@@ -2,6 +2,7 @@
 #include "http_client.h"
 #include "online_fix_embed.h"
 #include "plugin_settings.h"
+#include "steam_launch.h"
 
 #include <QCoreApplication>
 #include <QDebug>

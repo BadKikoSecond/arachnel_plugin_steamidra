@@ -1,6 +1,8 @@
 #include "http_client.h"
 
 #include <QEventLoop>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -49,7 +51,26 @@ QByteArray httpGet(const QString& url, int timeoutMs, const QMap<QString, QStrin
         return {};
     }
     const QByteArray body = reply->readAll();
+    const QVariant statusVar = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+    const int status = statusVar.isValid() ? statusVar.toInt() : 0;
     reply->deleteLater();
+    if (status >= 400) {
+        if (errorOut) {
+            QString detail = QString::fromUtf8(body).trimmed();
+            // Prefer JSON {"detail":"…"} from the relay.
+            if (detail.startsWith(QLatin1Char('{'))) {
+                const QJsonObject obj = QJsonDocument::fromJson(body).object();
+                const QString d = obj.value(QStringLiteral("detail")).toString().trimmed();
+                if (!d.isEmpty())
+                    detail = d;
+            }
+            if (detail.size() > 280)
+                detail = detail.left(277) + QStringLiteral("...");
+            *errorOut = detail.isEmpty() ? QStringLiteral("HTTP %1").arg(status)
+                                         : QStringLiteral("HTTP %1: %2").arg(status).arg(detail);
+        }
+        return {};
+    }
     return body;
 }
 

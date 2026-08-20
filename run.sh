@@ -2,9 +2,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 export ARACHNEL_SDK_DIR="${ARACHNEL_SDK_DIR:-$ROOT/../Arachnel}"
-if [[ ! -f "$ROOT/third_party/linux/DDMod/DepotDownloaderMod.dll" ]] \
-  || [[ ! -x "$ROOT/third_party/linux/dotnet/dotnet" ]]; then
-  echo "Fetching third_party (linux)…"
+export DEPOTKIT_DIR="${DEPOTKIT_DIR:-$ROOT/../depotkit}"
+if [[ ! -d "$ROOT/third_party/linux" ]]; then
+  echo "Preparing third_party (linux)…"
   "$ROOT/tools/fetch_third_party.sh" linux
 fi
 BUILD="$ROOT/build"
