@@ -333,9 +333,24 @@ void writeOnlineFixIni(const QString& path, const QString& realAppId, const QStr
     }
     body += "FakeAppId=";
     body += fakeAppId.toUtf8();
-    body += "\r\n";
+    body += "\r\n\r\n[Misc]\r\nExtraProtection=false\r\n";
     f.write(body);
     f.commit();
+}
+
+/** Steam's wine steamclient LoadLibrary("GameOverlayRenderer.dll") - Proton prefixes
+ *  often only ship the x64 renderer. Point the PE32 name at OF.me SteamOverlay32. */
+void plantValveOverlayAlias(const QString& target, bool want32)
+{
+    if (want32) {
+        const QString src = target + QStringLiteral("/SteamOverlay32.dll");
+        if (QFileInfo::exists(src))
+            copyFileBestEffort(src, target + QStringLiteral("/GameOverlayRenderer.dll"));
+    } else {
+        const QString src = target + QStringLiteral("/SteamOverlay64.dll");
+        if (QFileInfo::exists(src))
+            copyFileBestEffort(src, target + QStringLiteral("/GameOverlayRenderer64.dll"));
+    }
 }
 
 void writeDllListTxt(const QString& path, const QStringList& dllNames)
@@ -1132,6 +1147,7 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
                 if (!x86OnlineKit.stub32.isEmpty())
                     copyFileBestEffort(x86OnlineKit.stub32,
                                        target + QStringLiteral("/StubDRM32.dll"));
+                plantValveOverlayAlias(target, true);
                 for (const QString& n : {QStringLiteral("SteamOverlay32.dll"), fixName,
                                          QStringLiteral("StubDRM32.dll")}) {
                     if (QFileInfo::exists(target + QLatin1Char('/') + n))
@@ -1148,6 +1164,7 @@ OnlineFixResult embedOnlineFix(const QString& installPath, const QString& appid,
                 }
                 copyKitFileIfExists(kit, QStringLiteral("SteamOverlay64.dll"), target);
                 copyKitFileIfExists(kit, QStringLiteral("StubDRM64.dll"), target);
+                plantValveOverlayAlias(target, false);
                 for (const QString& n : {QStringLiteral("OnlineFix64.dll"),
                                          QStringLiteral("OnlineFix.dll"),
                                          QStringLiteral("SteamOverlay64.dll"),
@@ -1275,6 +1292,12 @@ void repairOnlineFixBeforeLaunch(const QString& installPath, const QString& appi
         ensureFreetpAckFolder(target, kit);
         if (!QFileInfo::exists(target + QStringLiteral("/steam_appid.txt")))
             writeSteamAppIdFile(target);
+        if (QFileInfo::exists(target + QStringLiteral("/SteamOverlay32.dll"))
+            || QFileInfo::exists(target + QStringLiteral("/OnlineFix.dll")))
+            plantValveOverlayAlias(target, true);
+        else if (QFileInfo::exists(target + QStringLiteral("/SteamOverlay64.dll"))
+                 || QFileInfo::exists(target + QStringLiteral("/OnlineFix64.dll")))
+            plantValveOverlayAlias(target, false);
     }
 }
 
