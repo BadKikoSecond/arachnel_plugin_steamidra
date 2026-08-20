@@ -838,51 +838,16 @@ bool rewriteSteamworksJsInitAppId(const QString& installPath, const QString& rea
 void stripSteamFixOverlay(const QString& target)
 {
     for (const QString& name :
-         {QStringLiteral("winmm.dll"), QStringLiteral("winmm.txt"), QStringLiteral("SteamFix64.dll"),
-          QStringLiteral("SteamFix32.dll"), QStringLiteral("SteamFix.ini"),
+         {QStringLiteral("winmm.dll"), QStringLiteral("winmm.txt"), QStringLiteral("dlllist.txt"),
+          QStringLiteral("SteamFix64.dll"), QStringLiteral("SteamFix32.dll"),
+          QStringLiteral("SteamFix.ini"), QStringLiteral("OnlineFix64.dll"),
+          QStringLiteral("OnlineFix.dll"), QStringLiteral("OnlineFix.ini"),
+          QStringLiteral("SteamOverlay64.dll"), QStringLiteral("SteamOverlay32.dll"),
+          QStringLiteral("StubDRM64.dll"), QStringLiteral("StubDRM32.dll"),
           QStringLiteral("EpicFix64.dll"), QStringLiteral("EpicFix.ini"),
           QStringLiteral("cmd.exe")}) {
         QFile::remove(target + QLatin1Char('/') + name);
     }
-}
-
-
-bool skipOverlayPath(const QString& path)
-{
-    const QString l = path.toLower();
-    static const char* skip[] = {".depotdownloader", "staging", "intermediate", "saved",
-                                 "deriveddatacache", "thirdparty", "downloads", "proton", ".git"};
-    for (const char* s : skip) {
-        if (l.contains(QLatin1String(s)))
-            return true;
-    }
-    return false;
-}
-
-bool gameNeedsEpicFix(const QString& root)
-{
-    // FreeTP policy: EpicFix only for RedpointEOS (Meccha etc.).
-    // Plain EOSSDK*.dll alone (Pratfall) gets SteamFix/OnlineFix without EpicFix —
-    // forcing EpicFix opens freetp.org and can black-screen.
-    // EpicFix64 is x64-only; Win32 Redpoint/EOSSDK must not receive it.
-    QDirIterator it(root, QDirIterator::Subdirectories);
-    while (it.hasNext()) {
-        it.next();
-        if (skipOverlayPath(it.filePath()))
-            continue;
-        const QString name = it.fileName();
-        if (it.fileInfo().isDir() && name.compare(QStringLiteral("RedpointEOS"), Qt::CaseInsensitive) == 0)
-            return true;
-        if (!it.fileInfo().isFile())
-            continue;
-        if (name.startsWith(QStringLiteral("RedpointEOS"), Qt::CaseInsensitive)
-            && name.endsWith(QStringLiteral(".dll"), Qt::CaseInsensitive)) {
-            const quint16 m = peMachine(it.filePath());
-            if (m == kPeAmd64 || m == 0)
-                return true;
-        }
-    }
-    return false;
 }
 
 /** EpicFix lives in FreeTP windows kit; OF.me linux kit keeps it as sibling windows/. */
