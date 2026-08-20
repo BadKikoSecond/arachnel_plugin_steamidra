@@ -8,7 +8,7 @@ OUT_ARCH="${3:-${ROOT}/dist/universal/steam.arach}"
 STAGING="${ROOT}/dist/universal/.staging"
 
 rm -rf "${STAGING}"
-mkdir -p "${STAGING}/win" "${STAGING}/linux" "${STAGING}/merged/steamidra"
+mkdir -p "${STAGING}/win" "${STAGING}/linux" "${STAGING}/merged/steamidra" "${STAGING}/linux_kit"
 unzip -q "${WIN_ARCH}" -d "${STAGING}/win"
 unzip -q "${LIN_ARCH}" -d "${STAGING}/linux"
 
@@ -39,18 +39,66 @@ cp -a "${LIN}/third_party/." "${MERGED}/third_party/linux/"
 [[ ! -f "${MERGED}/third_party/README.md" ]] || \
   cp -a "${WIN}/third_party/README.md" "${MERGED}/third_party/README.md"
 
-# Prefer Windows-harvested SteamFix kit (Linux CI usually has none).
-if [[ -f "${WIN}/online_fix_kit/SteamFix64.dll" && -f "${WIN}/online_fix_kit/winmm.dll" ]]; then
-  rm -rf "${MERGED}/online_fix_kit"
-  mkdir -p "${MERGED}/online_fix_kit"
-  cp -a "${WIN}/online_fix_kit/." "${MERGED}/online_fix_kit/"
-elif [[ -f "${LIN}/online_fix_kit/SteamFix64.dll" && -f "${LIN}/online_fix_kit/winmm.dll" ]]; then
-  rm -rf "${MERGED}/online_fix_kit"
-  mkdir -p "${MERGED}/online_fix_kit"
-  cp -a "${LIN}/online_fix_kit/." "${MERGED}/online_fix_kit/"
+# Per-OS Online-Fix kits:
+# - windows/ stays flat (needed immediately on Windows hosts)
+# - linux kit is shipped as linux.zip only — no loose OnlineFix*/SteamFix PE for Defender
+#   to scan when the universal .arach is installed under %AppData% on Windows.
+rm -rf "${MERGED}/online_fix_kit"
+mkdir -p "${MERGED}/online_fix_kit/windows"
+if [[ -d "${WIN}/online_fix_kit" ]]; then
+  if [[ -d "${WIN}/online_fix_kit/windows" ]]; then
+    cp -a "${WIN}/online_fix_kit/windows/." "${MERGED}/online_fix_kit/windows/"
+  else
+    cp -a "${WIN}/online_fix_kit/." "${MERGED}/online_fix_kit/windows/"
+  fi
 fi
-if [[ ! -f "${MERGED}/online_fix_kit/SteamFix64.dll" ]]; then
-  echo "WARNING: universal bundle missing online_fix_kit/SteamFix64.dll" >&2
+# Drop any accidental loose linux PE / nested dirs from the Windows tree copy.
+rm -rf "${MERGED}/online_fix_kit/linux"
+rm -f "${MERGED}/online_fix_kit/linux.zip"
+# Never leave OF.me names at the kit root (Windows flat packages shouldn't have them).
+rm -f "${MERGED}/online_fix_kit/"OnlineFix*.dll \
+  "${MERGED}/online_fix_kit/"SteamOverlay*.dll \
+  "${MERGED}/online_fix_kit/"StubDRM*.dll \
+  "${MERGED}/online_fix_kit/OnlineFix.ini" \
+  "${MERGED}/online_fix_kit/dlllist.txt" 2>/dev/null || true
+
+if [[ -d "${LIN}/online_fix_kit" ]]; then
+  rm -rf "${STAGING}/linux_kit"
+  mkdir -p "${STAGING}/linux_kit"
+  if [[ -d "${LIN}/online_fix_kit/linux" ]]; then
+    cp -a "${LIN}/online_fix_kit/linux/." "${STAGING}/linux_kit/"
+  else
+    cp -a "${LIN}/online_fix_kit/." "${STAGING}/linux_kit/"
+  fi
+  # Strip READMEs / nested windows copies if a mis-packaged linux tree included them.
+  rm -rf "${STAGING}/linux_kit/windows" "${STAGING}/linux_kit/linux" \
+    "${STAGING}/linux_kit/x86_optional"
+  (cd "${STAGING}/linux_kit" && zip -qr "${MERGED}/online_fix_kit/linux.zip" .)
+fi
+
+kit_ok_windows=0
+kit_ok_linux=0
+if [[ -f "${MERGED}/online_fix_kit/windows/SteamFix64.dll" \
+   && -f "${MERGED}/online_fix_kit/windows/winmm.dll" ]]; then
+  kit_ok_windows=1
+fi
+if [[ -f "${MERGED}/online_fix_kit/linux.zip" ]]; then
+  kit_ok_linux=1
+fi
+if [[ "${kit_ok_windows}" -ne 1 ]]; then
+  echo "WARNING: universal bundle missing online_fix_kit/windows SteamFix64+winmm" >&2
+fi
+if [[ "${kit_ok_linux}" -ne 1 ]]; then
+  echo "WARNING: universal bundle missing online_fix_kit/linux.zip" >&2
+fi
+# Sanity: no loose OF.me PE in the universal tree (Windows Defender bait).
+if find "${MERGED}/online_fix_kit" -type f \
+  \( -iname 'OnlineFix*.dll' -o -iname 'SteamOverlay*.dll' -o -iname 'StubDRM*.dll' \) \
+  2>/dev/null | grep -q .; then
+  echo "ERROR: universal online_fix_kit still has loose OF.me PE files" >&2
+  find "${MERGED}/online_fix_kit" -type f \
+    \( -iname 'OnlineFix*.dll' -o -iname 'SteamOverlay*.dll' -o -iname 'StubDRM*.dll' \) >&2
+  exit 1
 fi
 
 shopt -s nullglob

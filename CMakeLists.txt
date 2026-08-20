@@ -127,6 +127,7 @@ add_custom_command(TARGET steamidra_plugin POST_BUILD
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/online_fix_kit
         -DDEST_DIR=${_PLUGIN_BUNDLE_DIR}/online_fix_kit
+        -DKIT_OS=${_TP_OS}
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CopyOnlineFixKit.cmake"
     COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/_staging_steamidra_arach"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_ARACH_STAGING}"
@@ -149,3 +150,15 @@ add_executable(steamidra_smoke
 )
 target_include_directories(steamidra_smoke PRIVATE src)
 target_link_libraries(steamidra_smoke PRIVATE arachnel_plugin_sdk Qt6::Core Qt6::Network)
+
+# Offline fixture smoke for Online-Fix embed layouts (no network).
+add_executable(steamidra_embed_smoke
+    src/online_fix_embed.cpp
+    tools/smoke_embed_fixtures.cpp
+)
+target_include_directories(steamidra_embed_smoke PRIVATE src)
+target_link_libraries(steamidra_embed_smoke PRIVATE arachnel_plugin_sdk Qt6::Core)
+# Default plugin root = staged bundle with online_fix_kit.
+target_compile_definitions(steamidra_embed_smoke PRIVATE
+    STEAMIDRA_DEFAULT_PLUGIN_ROOT="${_PLUGIN_BUNDLE_DIR}")
+add_dependencies(steamidra_embed_smoke steamidra_plugin)

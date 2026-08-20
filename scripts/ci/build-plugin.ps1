@@ -77,6 +77,8 @@ if (-not (Test-Path (Join-Path $QtPrefix "lib\cmake\Qt6\Qt6Config.cmake"))) {
 
 & (Join-Path $Root "tools\fetch_third_party.ps1") windows
 & (Join-Path $Root "tools\harvest_online_fix_kit.ps1")
+# Best-effort OF.me harvest for linux kit (used by universal merge); ignore failures.
+try { & (Join-Path $Root "tools\harvest_onlinefix_me_kit.ps1") } catch { Write-Warning $_ }
 
 $configureArgs = @(
     "-S", $Root,

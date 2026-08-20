@@ -18,12 +18,19 @@ rm -rf "$BUNDLE/worker"
 if [[ -d "$ROOT/config" ]]; then
   cp -a "$ROOT/config/." "$BUNDLE/config/"
 fi
-DEST="${XDG_DATA_HOME:-$HOME/.local/share}/Arachnel/plugins/steamidra"
-rm -rf "$DEST"
-mkdir -p "$DEST"
-cp -a "$BUNDLE/." "$DEST/"
-VER="$(python3 -c "import json; print(json.load(open('$DEST/plugin.json'))['version'])" 2>/dev/null || echo "?")"
-echo "Reinstalled steamidra v$VER -> $DEST"
+# Qt AppDataLocation is Org/App → ~/.local/share/Arachnel/Arachnel/plugins
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+DESTS=(
+  "$DATA_HOME/Arachnel/Arachnel/plugins/steamidra"
+  "$DATA_HOME/Arachnel/plugins/steamidra"
+)
+VER="$(python3 -c "import json; print(json.load(open('$BUNDLE/plugin.json'))['version'])" 2>/dev/null || echo "?")"
+for DEST in "${DESTS[@]}"; do
+  rm -rf "$DEST"
+  mkdir -p "$DEST"
+  cp -a "$BUNDLE/." "$DEST/"
+  echo "Reinstalled steamidra v$VER -> $DEST"
+done
 if [[ -f "$BUILD/dist/steamidra.arach" ]]; then
   echo "Package: $BUILD/dist/steamidra.arach ($(du -h "$BUILD/dist/steamidra.arach" | awk '{print $1}'))"
 fi
