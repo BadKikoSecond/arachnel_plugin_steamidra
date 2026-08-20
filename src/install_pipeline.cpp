@@ -427,6 +427,7 @@ struct DepotkitProgressBridge {
     std::function<void(const arachnel::core::OwnedDownloadProgress&)> onProgress;
     std::function<bool()> shouldCancel;
     depotkit_control* ctrl = nullptr;
+    QString lastDetail;
 };
 
 void depotkitProgressThunk(const depotkit_progress* p, void* user)
@@ -454,6 +455,8 @@ void depotkitProgressThunk(const depotkit_progress* p, void* user)
     const QString detail = p->detail ? QString::fromUtf8(p->detail)
                                      : (status == QStringLiteral("paused") ? QStringLiteral("Paused")
                                                                            : QStringLiteral("Downloading..."));
+    if (!detail.isEmpty())
+        bridge->lastDetail = detail;
     const int bps = (p->phase == DEPOTKIT_PHASE_PAUSED) ? 0 : static_cast<int>(p->rate_bps);
     emitProgress(bridge->onProgress, pct, detail, status, static_cast<qint64>(p->bytes_done),
                  static_cast<qint64>(p->bytes_total), bps);
@@ -563,7 +566,8 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
     req.depots = depots.data();
     req.depot_count = depots.size();
     req.install_dir = installDir.constData();
-    req.max_downloads = 48;
+    // 48 parallel HTTP/2 workers flake hard on some CDNs; keep it spicy but saner.
+    req.max_downloads = 24;
     // Always SHA1-check existing files. Size-only skip treats SetEndOfFile stubs as done.
     req.validate = 1;
     req.cell_id = 0;
@@ -594,10 +598,12 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
     if (rc == DEPOTKIT_ERR_CANCELLED || (shouldCancel && shouldCancel()))
         throw std::runtime_error("Cancelled");
     if (rc != DEPOTKIT_OK) {
+        const QString why = bridge.lastDetail.isEmpty()
+                                ? QString::fromUtf8(depotkit_strerror(rc))
+                                : bridge.lastDetail;
+        qWarning().noquote() << "[steamidra] depotkit failed" << why;
         throw std::runtime_error(
-            QStringLiteral("depotkit failed: %1")
-                .arg(QString::fromUtf8(depotkit_strerror(rc)))
-                .toStdString());
+            QStringLiteral("depotkit failed: %1").arg(why).toStdString());
     }
 }
 

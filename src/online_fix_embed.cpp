@@ -320,17 +320,14 @@ X86OnlineFixResolved resolveX86OnlineFixKit(const QString& kit)
     return out;
 }
 
-void writeOnlineFixIni(const QString& path, const QString& realAppId, const QString& fakeAppId)
+void writeOnlineFixIni(const QString& path, const QString& /*realAppId*/, const QString& fakeAppId)
 {
     QSaveFile f(path);
     if (!f.open(QIODevice::WriteOnly))
         return;
+    // Minimal ini: RealAppId has tripped OF.me Self-protection (error 4) on some
+    // Proton + GameMaker titles. FakeAppId + ExtraProtection=false is enough.
     QByteArray body = "[Main]\r\n";
-    if (!realAppId.isEmpty() && realAppId != QStringLiteral("0")) {
-        body += "RealAppId=";
-        body += realAppId.toUtf8();
-        body += "\r\n";
-    }
     body += "FakeAppId=";
     body += fakeAppId.toUtf8();
     body += "\r\n\r\n[Misc]\r\nExtraProtection=false\r\n";
@@ -338,10 +335,17 @@ void writeOnlineFixIni(const QString& path, const QString& realAppId, const QStr
     f.commit();
 }
 
-/** Steam's wine steamclient LoadLibrary("GameOverlayRenderer.dll") - Proton prefixes
- *  often only ship the x64 renderer. Point the PE32 name at OF.me SteamOverlay32. */
+/** FreeTP SteamFix: Proton steamclient looks for GameOverlayRenderer.dll.
+ *  OF.me: never plant that alias - the extra file trips Self-protection (error 4). */
 void plantValveOverlayAlias(const QString& target, bool want32)
 {
+    if (QFileInfo::exists(target + QStringLiteral("/OnlineFix.ini"))
+        || QFileInfo::exists(target + QStringLiteral("/OnlineFix.dll"))
+        || QFileInfo::exists(target + QStringLiteral("/OnlineFix64.dll"))) {
+        QFile::remove(target + QStringLiteral("/GameOverlayRenderer.dll"));
+        QFile::remove(target + QStringLiteral("/GameOverlayRenderer64.dll"));
+        return;
+    }
     if (want32) {
         const QString src = target + QStringLiteral("/SteamOverlay32.dll");
         if (QFileInfo::exists(src))
