@@ -764,6 +764,7 @@ InstallPipelineResult runInstallPipeline(
         }
 
         const ResolvedLaunchExe resolved = resolveInstallLaunch(installPath, appid);
+        const QVector<SteamLaunchOption> allOptions = collectLaunchOptions(installPath, appid);
         QJsonObject launch;
         if (!resolved.path.isEmpty()) {
             launch.insert(QStringLiteral("type"), QStringLiteral("exe"));
@@ -782,6 +783,21 @@ InstallPipelineResult runInstallPipeline(
         QJsonObject payload{{QStringLiteral("appid"), appid},
                             {QStringLiteral("mode"), QStringLiteral("depotkit")},
                             {QStringLiteral("launch"), launch}};
+        if (!allOptions.isEmpty()) {
+            QJsonArray optionsArr;
+            for (const auto& opt : allOptions) {
+                QJsonObject o;
+                o.insert(QStringLiteral("id"), opt.id);
+                o.insert(QStringLiteral("title"), opt.title);
+                o.insert(QStringLiteral("path"), opt.path);
+                o.insert(QStringLiteral("workingDirectory"), opt.workingDirectory);
+                o.insert(QStringLiteral("arguments"), QJsonArray::fromStringList(opt.arguments));
+                o.insert(QStringLiteral("type"), opt.type);
+                o.insert(QStringLiteral("isDefault"), opt.isDefault);
+                optionsArr.append(o);
+            }
+            payload.insert(QStringLiteral("launchOptions"), optionsArr);
+        }
         QJsonArray selectedDlcArr;
         for (const QString& id : selectedDlc)
             selectedDlcArr.append(id);

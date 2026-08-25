@@ -17,10 +17,24 @@ namespace {
 bool isBannedLaunchFileName(const QString& fileName)
 {
     const QString lower = fileName.toLower();
-    return lower == QStringLiteral("cmd.exe") || lower.contains(QStringLiteral("crash"))
-           || lower.contains(QStringLiteral("unins")) || lower.contains(QStringLiteral("redist"))
-           || lower.contains(QStringLiteral("prereq")) || lower.contains(QStringLiteral("vcredist"))
-           || lower.contains(QStringLiteral("dxsetup"));
+    if (lower == QStringLiteral("cmd.exe") || lower == QStringLiteral("cmd_stub.exe")
+        || lower == QStringLiteral("powershell.exe") || lower == QStringLiteral("conhost.exe"))
+        return true;
+    if (lower.contains(QStringLiteral("crash")) || lower.contains(QStringLiteral("unins"))
+        || lower.contains(QStringLiteral("setup")) || lower.contains(QStringLiteral("redist"))
+        || lower.contains(QStringLiteral("prereq")) || lower.contains(QStringLiteral("vcredist"))
+        || lower.contains(QStringLiteral("dxsetup")) || lower.contains(QStringLiteral("oalinst")))
+        return true;
+    if (lower == QStringLiteral("ffmpeg.exe") || lower == QStringLiteral("ffprobe.exe")
+        || lower == QStringLiteral("ffplay.exe") || lower == QStringLiteral("yt-dlp.exe")
+        || lower == QStringLiteral("youtube-dl.exe") || lower == QStringLiteral("texconv.exe")
+        || lower.startsWith(QStringLiteral("easyhook")) || lower.contains(QStringLiteral("easyhook"))
+        || lower == QStringLiteral("7z.exe") || lower == QStringLiteral("7za.exe")
+        || lower == QStringLiteral("curl.exe") || lower == QStringLiteral("wget.exe")
+        || lower == QStringLiteral("quickhash.exe") || lower == QStringLiteral("openvr_api.exe")
+        || lower == QStringLiteral("steam.exe") || lower.startsWith(QStringLiteral("steamless")))
+        return true;
+    return false;
 }
 
 QString normalizeRelPath(QString rel)
@@ -210,6 +224,134 @@ ResolvedLaunchExe resolveInstallLaunch(const QString& installPath, const QString
     out.workingDirectory = QFileInfo(path).absolutePath();
     out.source = QStringLiteral("heuristic");
     return out;
+}
+
+QVector<SteamLaunchOption> collectLaunchOptions(const QString& installPath, const QString& appid)
+{
+    if (installPath.isEmpty() || !QDir(installPath).exists())
+        return {};
+
+    if (!appid.trimmed().isEmpty()) {
+        const QJsonObject app = fetchSteamcmdApp(appid);
+        const QJsonObject launchMap =
+            app.value(QStringLiteral("config")).toObject().value(QStringLiteral("launch")).toObject();
+        if (!launchMap.isEmpty()) {
+            QVector<SteamLaunchOption> options;
+            int bestScore = -1;
+            int bestIndex = -1;
+
+            for (auto it = launchMap.begin(); it != launchMap.end(); ++it) {
+                if (!it.value().isObject())
+                    continue;
+                const QString optId = it.key();
+                const QJsonObject entry = it.value().toObject();
+                const int score = scoreSteamLaunchEntry(entry);
+                if (score < 0)
+                    continue;
+
+                const QString relExe = entry.value(QStringLiteral("executable")).toString();
+                const QString relWork = entry.value(QStringLiteral("workingdir")).toString();
+
+                QString absExe;
+                if (!relWork.trimmed().isEmpty()) {
+                    absExe = resolveUnderInstall(installPath,
+                                                 normalizeRelPath(relWork) + QLatin1Char('/')
+                                                     + normalizeRelPath(relExe));
+                }
+                if (absExe.isEmpty())
+                    absExe = resolveUnderInstall(installPath, relExe);
+                if (absExe.isEmpty() || !QFileInfo::exists(absExe))
+                    continue;
+
+                SteamLaunchOption opt;
+                opt.id = optId;
+                opt.path = absExe;
+                opt.type = entry.value(QStringLiteral("type")).toString();
+
+                if (!relWork.trimmed().isEmpty()) {
+                    const QString workAbs =
+                        QFileInfo(QDir(installPath).filePath(normalizeRelPath(relWork))).absoluteFilePath();
+                    if (QDir(workAbs).exists())
+                        opt.workingDirectory = workAbs;
+                }
+                if (opt.workingDirectory.isEmpty())
+                    opt.workingDirectory = QFileInfo(absExe).absolutePath();
+
+                const QJsonValue argsVal = entry.value(QStringLiteral("arguments"));
+                if (argsVal.isArray()) {
+                    for (const QJsonValue& v : argsVal.toArray()) {
+                        const QString a = v.toString().trimmed();
+                        if (!a.isEmpty())
+                            opt.arguments.append(a);
+                    }
+                } else {
+                    const QString args = argsVal.toString().trimmed();
+                    if (!args.isEmpty()) {
+                        opt.arguments =
+                            args.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+                    }
+                }
+
+                // Title / Description
+                QString title;
+                const QJsonObject loc = entry.value(QStringLiteral("description_loc")).toObject();
+                if (loc.contains(QStringLiteral("russian")))
+                    title = loc.value(QStringLiteral("russian")).toString().trimmed();
+                if (title.isEmpty() && loc.contains(QStringLiteral("english")))
+                    title = loc.value(QStringLiteral("english")).toString().trimmed();
+                if (title.isEmpty())
+                    title = entry.value(QStringLiteral("description")).toString().trimmed();
+                if (title.isEmpty() || title.compare(QStringLiteral("launch"), Qt::CaseInsensitive) == 0
+                    || title.compare(QStringLiteral("play"), Qt::CaseInsensitive) == 0) {
+                    const QString stem = QFileInfo(absExe).completeBaseName();
+                    if (!opt.arguments.isEmpty())
+                        title = QStringLiteral("%1 (%2)").arg(stem, opt.arguments.join(QLatin1Char(' ')));
+                    else if (!opt.type.isEmpty() && opt.type != QStringLiteral("default") && opt.type != QStringLiteral("none"))
+                        title = QStringLiteral("%1 (%2)").arg(stem, opt.type.toUpper());
+                    else
+                        title = stem;
+                }
+                opt.title = title;
+
+                bool duplicate = false;
+                for (const auto& existing : options) {
+                    if (existing.path.compare(opt.path, Qt::CaseInsensitive) == 0
+                        && existing.arguments == opt.arguments) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate)
+                    continue;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestIndex = options.size();
+                }
+                options.append(opt);
+            }
+
+            if (bestIndex >= 0 && bestIndex < options.size())
+                options[bestIndex].isDefault = true;
+            else if (!options.isEmpty())
+                options[0].isDefault = true;
+
+            if (!options.isEmpty())
+                return options;
+        }
+    }
+
+    const QString path = findLaunchExeHeuristic(installPath);
+    if (!path.isEmpty() && !isBannedLaunchFileName(QFileInfo(path).fileName())) {
+        SteamLaunchOption opt;
+        opt.id = QStringLiteral("default");
+        opt.title = QFileInfo(path).completeBaseName();
+        opt.path = path;
+        opt.workingDirectory = QFileInfo(path).absolutePath();
+        opt.isDefault = true;
+        return {opt};
+    }
+    return {};
 }
 
 QString findLaunchExeForInstall(const QString& installPath, const QString& appid)

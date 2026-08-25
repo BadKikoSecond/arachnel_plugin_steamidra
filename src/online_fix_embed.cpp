@@ -25,6 +25,29 @@
 namespace steamidra {
 namespace {
 
+bool isBannedLaunchExeName(const QString& fileName)
+{
+    const QString lower = fileName.toLower();
+    if (lower == QStringLiteral("cmd.exe") || lower == QStringLiteral("cmd_stub.exe")
+        || lower == QStringLiteral("powershell.exe") || lower == QStringLiteral("conhost.exe"))
+        return true;
+    if (lower.contains(QStringLiteral("crash")) || lower.contains(QStringLiteral("unins"))
+        || lower.contains(QStringLiteral("setup")) || lower.contains(QStringLiteral("redist"))
+        || lower.contains(QStringLiteral("prereq")) || lower.contains(QStringLiteral("vcredist"))
+        || lower.contains(QStringLiteral("dxsetup")) || lower.contains(QStringLiteral("oalinst")))
+        return true;
+    if (lower == QStringLiteral("ffmpeg.exe") || lower == QStringLiteral("ffprobe.exe")
+        || lower == QStringLiteral("ffplay.exe") || lower == QStringLiteral("yt-dlp.exe")
+        || lower == QStringLiteral("youtube-dl.exe") || lower == QStringLiteral("texconv.exe")
+        || lower.startsWith(QStringLiteral("easyhook")) || lower.contains(QStringLiteral("easyhook"))
+        || lower == QStringLiteral("7z.exe") || lower == QStringLiteral("7za.exe")
+        || lower == QStringLiteral("curl.exe") || lower == QStringLiteral("wget.exe")
+        || lower == QStringLiteral("quickhash.exe") || lower == QStringLiteral("openvr_api.exe")
+        || lower == QStringLiteral("steam.exe") || lower.startsWith(QStringLiteral("steamless")))
+        return true;
+    return false;
+}
+
 QString pickOverlayExe(const QString& target);
 
 enum class KitFlavor { None, SteamFix, OnlineFix };
@@ -1001,10 +1024,9 @@ QString pickOverlayExe(const QString& target)
     QString best;
     qint64 bestScore = -1;
     for (const QFileInfo& fi : dir.entryInfoList({QStringLiteral("*.exe")}, QDir::Files)) {
-        const QString lower = fi.fileName().toLower();
-        if (lower == QStringLiteral("cmd.exe") || lower.contains(QStringLiteral("crash"))
-            || lower.contains(QStringLiteral("unins")) || lower.contains(QStringLiteral("redist")))
+        if (isBannedLaunchExeName(fi.fileName()))
             continue;
+        const QString lower = fi.fileName().toLower();
         qint64 score = fi.size();
         if (lower.contains(QStringLiteral("launcher")) || lower.contains(QStringLiteral("bootstrap")))
             score -= 50LL * 1024 * 1024;
@@ -1035,12 +1057,9 @@ QString findLaunchExeForInstall(const QString& installPath)
     QDirIterator it(installPath, {QStringLiteral("*.exe")}, QDir::Files, QDirIterator::Subdirectories);
     while (it.hasNext()) {
         it.next();
-        if (skipOverlayPath(it.filePath()))
+        if (skipOverlayPath(it.filePath()) || isBannedLaunchExeName(it.fileName()))
             continue;
         const QString lower = it.fileName().toLower();
-        if (lower.contains(QStringLiteral("crash")) || lower.contains(QStringLiteral("unins"))
-            || lower.contains(QStringLiteral("redist")) || lower.contains(QStringLiteral("prereq")))
-            continue;
         qint64 score = it.fileInfo().size();
         const bool hasOverlay = QFileInfo::exists(it.fileInfo().absolutePath() + QStringLiteral("/SteamFix64.dll"))
                                 || QFileInfo::exists(it.fileInfo().absolutePath() + QStringLiteral("/winmm.dll"))

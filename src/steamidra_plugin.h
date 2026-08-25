@@ -58,6 +58,9 @@ public:
     bool applySelectedDlc(const arachnel::core::LibraryGame& local,
                           const QStringList& enabledAddonIds) const override;
 
+    QVector<arachnel::core::GameLaunchOption> launchOptions(
+        const arachnel::core::LibraryGame& local) const override;
+
     /** Sync on-disk catalog and return raw UTF-8 JSON (no in-memory row mirror). */
     QByteArray catalogJsonUtf8() const;
 

@@ -415,6 +415,36 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(const arachnel::core::Lib
         return true;
     };
 
+    auto parseOptionObj = [](const QJsonObject& obj) -> arachnel::core::GameLaunchOption {
+        arachnel::core::GameLaunchOption opt;
+        opt.id = obj.value(QStringLiteral("id")).toString();
+        opt.title = obj.value(QStringLiteral("title")).toString();
+        opt.executable = obj.value(QStringLiteral("path")).toString();
+        if (opt.executable.isEmpty())
+            opt.executable = obj.value(QStringLiteral("executable")).toString();
+        opt.workingDirectory = obj.value(QStringLiteral("workingDirectory")).toString();
+        for (const auto& a : obj.value(QStringLiteral("arguments")).toArray())
+            opt.arguments.append(a.toString());
+        opt.type = obj.value(QStringLiteral("type")).toString();
+        opt.isDefault = obj.value(QStringLiteral("isDefault")).toBool(false);
+        return opt;
+    };
+
+    if (!local.selectedLaunchOptionId.isEmpty()) {
+        const auto opts = launchOptions(local);
+        for (const auto& opt : opts) {
+            if (opt.id == local.selectedLaunchOptionId && !opt.executable.isEmpty()
+                && QFileInfo::exists(opt.executable)) {
+                info.executable = opt.executable;
+                info.workingDirectory = opt.workingDirectory.isEmpty()
+                                            ? QFileInfo(opt.executable).absolutePath()
+                                            : opt.workingDirectory;
+                info.arguments = opt.arguments;
+                return info;
+            }
+        }
+    }
+
     auto tryMarker = [&](bool steamSourceOnly) {
         const QString markerPath = local.installPath + QStringLiteral("/.arachnel-steamidra");
         if (!QFileInfo::exists(markerPath))
@@ -422,8 +452,8 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(const arachnel::core::Lib
         QFile f(markerPath);
         if (!f.open(QIODevice::ReadOnly))
             return false;
-        const QJsonObject launch =
-            QJsonDocument::fromJson(f.readAll()).object().value(QStringLiteral("launch")).toObject();
+        const QJsonObject rootObj = QJsonDocument::fromJson(f.readAll()).object();
+        const QJsonObject launch = rootObj.value(QStringLiteral("launch")).toObject();
         if (launch.value(QStringLiteral("type")).toString() != QStringLiteral("exe"))
             return false;
         if (steamSourceOnly
@@ -493,6 +523,91 @@ arachnel::core::LaunchInfo SteamidraPlugin::launchInfo(const arachnel::core::Lib
         info.arguments = {QStringLiteral("steam://rungameid/%1").arg(appId)};
     }
     return info;
+}
+
+QVector<arachnel::core::GameLaunchOption> SteamidraPlugin::launchOptions(
+    const arachnel::core::LibraryGame& local) const
+{
+    QVector<arachnel::core::GameLaunchOption> out;
+    if (local.installPath.isEmpty() || !QDir(local.installPath).exists())
+        return out;
+
+    const QString markerPath = local.installPath + QStringLiteral("/.arachnel-steamidra");
+    if (QFileInfo::exists(markerPath)) {
+        QFile f(markerPath);
+        if (f.open(QIODevice::ReadOnly)) {
+            const QJsonObject rootObj = QJsonDocument::fromJson(f.readAll()).object();
+            const QJsonArray arr = rootObj.value(QStringLiteral("launchOptions")).toArray();
+            for (const auto& v : arr) {
+                if (!v.isObject())
+                    continue;
+                const QJsonObject o = v.toObject();
+                arachnel::core::GameLaunchOption opt;
+                opt.id = o.value(QStringLiteral("id")).toString();
+                opt.title = o.value(QStringLiteral("title")).toString();
+                opt.executable = o.value(QStringLiteral("path")).toString();
+                if (opt.executable.isEmpty())
+                    opt.executable = o.value(QStringLiteral("executable")).toString();
+                opt.workingDirectory = o.value(QStringLiteral("workingDirectory")).toString();
+                for (const auto& a : o.value(QStringLiteral("arguments")).toArray())
+                    opt.arguments.append(a.toString());
+                opt.type = o.value(QStringLiteral("type")).toString();
+                opt.isDefault = o.value(QStringLiteral("isDefault")).toBool(false);
+                if (!opt.executable.isEmpty() && QFileInfo::exists(opt.executable))
+                    out.append(opt);
+            }
+            if (!out.isEmpty())
+                return out;
+        }
+    }
+
+    QString appId = local.steamAppId;
+    if (appId.isEmpty() && local.id.startsWith(QStringLiteral("steam-")))
+        appId = local.id.mid(6);
+    if (appId.isEmpty())
+        appId = local.magnetUri;
+    if (appId.startsWith(QStringLiteral("steam://app/")))
+        appId = appId.mid(QStringLiteral("steam://app/").size());
+
+    const QVector<SteamLaunchOption> steamOpts = collectLaunchOptions(local.installPath, appId);
+    if (!steamOpts.isEmpty()) {
+        for (const auto& s : steamOpts) {
+            arachnel::core::GameLaunchOption opt;
+            opt.id = s.id;
+            opt.title = s.title;
+            opt.executable = s.path;
+            opt.workingDirectory = s.workingDirectory;
+            opt.arguments = s.arguments;
+            opt.type = s.type;
+            opt.isDefault = s.isDefault;
+            out.append(opt);
+        }
+
+        // Persist discovered options into marker for instant future lookups
+        QJsonObject payload;
+        QFile marker(markerPath);
+        if (marker.exists() && marker.open(QIODevice::ReadOnly)) {
+            payload = QJsonDocument::fromJson(marker.readAll()).object();
+            marker.close();
+        }
+        QJsonArray optionsArr;
+        for (const auto& opt : steamOpts) {
+            QJsonObject o;
+            o.insert(QStringLiteral("id"), opt.id);
+            o.insert(QStringLiteral("title"), opt.title);
+            o.insert(QStringLiteral("path"), opt.path);
+            o.insert(QStringLiteral("workingDirectory"), opt.workingDirectory);
+            o.insert(QStringLiteral("arguments"), QJsonArray::fromStringList(opt.arguments));
+            o.insert(QStringLiteral("type"), opt.type);
+            o.insert(QStringLiteral("isDefault"), opt.isDefault);
+            optionsArr.append(o);
+        }
+        payload.insert(QStringLiteral("launchOptions"), optionsArr);
+        if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            marker.write(QJsonDocument(payload).toJson(QJsonDocument::Indented));
+    }
+
+    return out;
 }
 
 arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
