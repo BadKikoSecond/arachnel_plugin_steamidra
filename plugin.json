@@ -11,6 +11,6 @@
   "recommended": true,
   "minArachnel": "0.1.34",
   "maxArachnel": "",
-  "sdkRef": "feature/dlc",
+  "sdkRef": "develop",
   "abiToken": "api=4"
 }
