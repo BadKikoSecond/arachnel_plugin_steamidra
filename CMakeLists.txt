@@ -39,7 +39,22 @@ endif()
 cmake_path(ABSOLUTE_PATH DEPOTKIT_DIR NORMALIZE)
 set(DEPOTKIT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(DEPOTKIT_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-add_subdirectory("${DEPOTKIT_DIR}" "${CMAKE_BINARY_DIR}/_deps/depotkit" EXCLUDE_FROM_ALL)
+# Copy then patch. BCryptSetProperty and manifest lengths are fixed in the
+# copy so a sibling depotkit checkout is left untouched.
+set(_DEPOTKIT_SRC "${CMAKE_BINARY_DIR}/_deps/depotkit-src")
+file(COPY "${DEPOTKIT_DIR}/" DESTINATION "${_DEPOTKIT_SRC}")
+find_program(PYTHON_FOR_HARDEN NAMES python3 python REQUIRED)
+execute_process(
+    COMMAND "${PYTHON_FOR_HARDEN}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/harden_depotkit.py"
+            "${_DEPOTKIT_SRC}"
+    RESULT_VARIABLE _harden_rc
+    ERROR_VARIABLE _harden_err
+    OUTPUT_VARIABLE _harden_out
+)
+if(NOT _harden_rc EQUAL 0)
+    message(FATAL_ERROR "depotkit harden failed (${_harden_rc}): ${_harden_err} ${_harden_out}")
+endif()
+add_subdirectory("${_DEPOTKIT_SRC}" "${CMAKE_BINARY_DIR}/_deps/depotkit" EXCLUDE_FROM_ALL)
 
 add_library(steamidra_plugin SHARED
     src/plugin_entry.cpp
