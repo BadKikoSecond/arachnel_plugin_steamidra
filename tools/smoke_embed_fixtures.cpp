@@ -105,6 +105,13 @@ int main(int argc, char** argv)
             failures += fail("unity64 expected OF.me layout");
         if (exists(root + QStringLiteral("/SteamFix64.dll")))
             failures += fail("unity64 must not get FreeTP SteamFix on Linux kit");
+        {
+            QFile ini(root + QStringLiteral("/OnlineFix.ini"));
+            const QByteArray body = ini.open(QIODevice::ReadOnly) ? ini.readAll() : QByteArray();
+            if (!body.contains("RealAppId=123") || !body.contains("FakeAppId=480")
+                || !body.contains("UnlockAllDLC=true"))
+                failures += fail("unity64 OnlineFix.ini missing RealAppId/FakeAppId/DLC");
+        }
 #endif
         if (exists(root + QStringLiteral("/EpicFix64.dll")))
             failures += fail("unity64 must not get EpicFix without Redpoint");
