@@ -343,16 +343,26 @@ X86OnlineFixResolved resolveX86OnlineFixKit(const QString& kit)
     return out;
 }
 
-void writeOnlineFixIni(const QString& path, const QString& /*realAppId*/, const QString& fakeAppId)
+void writeOnlineFixIni(const QString& path, const QString& realAppId, const QString& fakeAppId,
+                      bool unlockAllDlc = true)
 {
     QSaveFile f(path);
     if (!f.open(QIODevice::WriteOnly))
         return;
-    // Minimal ini: RealAppId has tripped OF.me Self-protection (error 4) on some
-    // Proton + GameMaker titles. FakeAppId + ExtraProtection=false is enough.
+    // RealAppId is required: without it OF.me reports FakeAppId (480/Spacewar) to the
+    // game via SteamAPI_GetAppID. Unity/Steamworks.NET then quits ("AppId Reported = 480").
+    // ExtraProtection=false + no GameOverlayRenderer alias still avoid OF.me error 4.
     QByteArray body = "[Main]\r\n";
+    if (!realAppId.isEmpty() && realAppId != QStringLiteral("0")
+        && realAppId != QStringLiteral("480")) {
+        body += "RealAppId=";
+        body += realAppId.toUtf8();
+        body += "\r\n";
+    }
     body += "FakeAppId=";
     body += fakeAppId.toUtf8();
+    body += "\r\nUnlockAllDLC=";
+    body += unlockAllDlc ? "true" : "false";
     body += "\r\n\r\n[Misc]\r\nExtraProtection=false\r\n";
     f.write(body);
     f.commit();
@@ -1315,6 +1325,13 @@ void repairOnlineFixBeforeLaunch(const QString& installPath, const QString& appi
         ensureFreetpAckFolder(target, kit);
         if (!QFileInfo::exists(target + QStringLiteral("/steam_appid.txt")))
             writeSteamAppIdFile(target);
+        // Heal OF.me installs embedded before RealAppId was restored.
+        if (QFileInfo::exists(target + QStringLiteral("/OnlineFix.ini"))
+            || QFileInfo::exists(target + QStringLiteral("/OnlineFix64.dll"))
+            || QFileInfo::exists(target + QStringLiteral("/OnlineFix.dll"))) {
+            writeOnlineFixIni(target + QStringLiteral("/OnlineFix.ini"), appid,
+                              QStringLiteral("480"));
+        }
         if (QFileInfo::exists(target + QStringLiteral("/SteamOverlay32.dll"))
             || QFileInfo::exists(target + QStringLiteral("/OnlineFix.dll")))
             plantValveOverlayAlias(target, true);
@@ -1340,6 +1357,9 @@ bool applyDlcUnlocks(const QString& installPath, const QString& appid,
             && !QFileInfo::exists(target + QStringLiteral("/SteamFix64.dll"))
             && !QFileInfo::exists(target + QStringLiteral("/SteamFix32.dll"))) {
             QFile::remove(target + QStringLiteral("/SteamFix.ini"));
+            writeOnlineFixIni(target + QStringLiteral("/OnlineFix.ini"), appid,
+                              QStringLiteral("480"), unlockAll);
+            wrote = true;
             continue;
         }
         const QString ini = target + QStringLiteral("/SteamFix.ini");
