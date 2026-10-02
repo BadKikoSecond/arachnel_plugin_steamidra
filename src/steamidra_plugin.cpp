@@ -103,7 +103,7 @@ QString SteamidraPlugin::version() const
         if (!ver.isEmpty())
             return ver;
     }
-    return QStringLiteral("0.6.18");
+    return QStringLiteral("0.6.21");
 }
 
 QStringList SteamidraPlugin::capabilities() const
@@ -615,22 +615,52 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
     const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress) const
 {
     arachnel::core::InstallResult result;
-    {
-        QMutexLocker lock(&m_cancelMutex);
-        m_cancelledJobs.remove(ctx.jobId);
+
+    // Copy host fields up front. selectedAddonIds is only non-empty when the
+    // user picked a Steam DLC (Valheim steam-1620250). A bad QString in that
+    // list used to be walked later, inside depotkit, as a C string.
+    const QString jobId = ctx.jobId;
+    const QString entryId = ctx.entryId;
+    const QString title = ctx.title;
+    const QString installMode = ctx.installMode;
+    QString targetPath = ctx.targetPath.trimmed();
+    targetPath.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    QString appId = ctx.magnetUri.trimmed();
+    if (appId.startsWith(QStringLiteral("steam://app/")))
+        appId = appId.mid(QStringLiteral("steam://app/").size()).trimmed();
+    if (appId.startsWith(QStringLiteral("steam-")))
+        appId = appId.mid(6).trimmed();
+    if (appId.isEmpty() && entryId.startsWith(QStringLiteral("steam-")))
+        appId = entryId.mid(6).trimmed();
+    QStringList selectedAddonIds;
+    selectedAddonIds.reserve(ctx.selectedAddonIds.size());
+    for (const QString& rawId : ctx.selectedAddonIds) {
+        const QString id = rawId.trimmed();
+        if (!id.isEmpty())
+            selectedAddonIds.append(id);
     }
 
-    QString appId = ctx.magnetUri;
-    if (appId.startsWith(QStringLiteral("steam://app/")))
-        appId = appId.mid(QStringLiteral("steam://app/").size());
-    if (appId.isEmpty() && ctx.entryId.startsWith(QStringLiteral("steam-")))
-        appId = ctx.entryId.mid(6);
+    qInfo().noquote() << "[steamidra] owns-download start" << entryId << "app" << appId
+                      << "addons" << selectedAddonIds.join(QLatin1Char(','))
+                      << "target" << targetPath;
+
     if (appId.isEmpty()) {
         result.error = QStringLiteral("Missing Steam App ID");
         return result;
     }
+    bool appOk = false;
+    const qulonglong appNum = appId.toULongLong(&appOk);
+    if (!appOk || appNum == 0 || appNum > 0xffffffffu) {
+        result.error = QStringLiteral("Steam App ID is not a valid number");
+        return result;
+    }
 
-    auto cancelled = [this, jobId = ctx.jobId]() {
+    {
+        QMutexLocker lock(&m_cancelMutex);
+        m_cancelledJobs.remove(jobId);
+    }
+
+    auto cancelled = [this, jobId]() {
         QMutexLocker lock(&m_cancelMutex);
         return m_cancelledJobs.contains(jobId);
     };
@@ -639,7 +669,7 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         arachnel::core::OwnedDownloadProgress p;
         p.percent = 0;
         p.status = QStringLiteral("downloading");
-        p.detail = QStringLiteral("Downloading from Steam CDN…");
+        p.detail = QStringLiteral("Downloading from Steam CDN...");
         onProgress(p);
     }
 
@@ -650,20 +680,20 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
     }
     {
         QMutexLocker lock(&m_downloadCtrlMutex);
-        m_downloadControls.insert(ctx.jobId, ctrl);
+        m_downloadControls.insert(jobId, ctrl);
     }
 
     const PluginSettings settings = loadPluginSettings(settingsPath());
     const bool forceUpdate =
-        ctx.installMode.compare(QStringLiteral("update"), Qt::CaseInsensitive) == 0
-        || ctx.installMode.compare(QStringLiteral("force"), Qt::CaseInsensitive) == 0;
+        installMode.compare(QStringLiteral("update"), Qt::CaseInsensitive) == 0
+        || installMode.compare(QStringLiteral("force"), Qt::CaseInsensitive) == 0;
     const InstallPipelineResult pipe =
-        runInstallPipeline(m_rootPath, appId, ctx.title, ctx.targetPath, settings, forceUpdate,
-                           ctx.selectedAddonIds, onProgress, cancelled, ctrl);
+        runInstallPipeline(m_rootPath, appId, title, targetPath, settings, forceUpdate,
+                           selectedAddonIds, onProgress, cancelled, ctrl);
 
     {
         QMutexLocker lock(&m_downloadCtrlMutex);
-        m_downloadControls.remove(ctx.jobId);
+        m_downloadControls.remove(jobId);
     }
     depotkit_control_destroy(ctrl);
 
@@ -672,11 +702,16 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         return result;
     }
     if (!pipe.ok) {
-        result.error = pipe.error;
+        result.error = pipe.error.isEmpty() ? QStringLiteral("Install failed") : pipe.error;
         return result;
     }
     result.success = true;
-    result.installPath = pipe.installPath.isEmpty() ? ctx.targetPath : pipe.installPath;
+    result.installPath = pipe.installPath.isEmpty() ? targetPath : pipe.installPath;
+    if (result.installPath.isEmpty()) {
+        result.success = false;
+        result.error = QStringLiteral("Install path is empty");
+        return result;
+    }
     return result;
 }
 

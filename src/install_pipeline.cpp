@@ -3,6 +3,7 @@
 #include "http_client.h"
 #include "online_fix_embed.h"
 #include "steam_launch.h"
+#include "zip_local.h"
 
 #include <depotkit.h>
 
@@ -22,6 +23,7 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
+#include <climits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -133,53 +135,51 @@ LuaParsed parseLua(const QString& text)
     return out;
 }
 
-/** Extract .lua / .manifest from a ZIP in memory (no zip on disk — Defender MalUri).
+/** Extract .lua / .manifest from a ZIP in memory (no zip on disk, Defender MalUri).
  *  Handles store (method 0); deflated entries are skipped (Ryuu packs store). */
 bool extractRelayZipMemory(const QByteArray& raw, const QString& staging, QString* luaOut)
 {
-    if (raw.size() < 30 || raw[0] != 'P' || raw[1] != 'K')
+    if (raw.size() < 30 || raw.isEmpty())
         return false;
     QDir().mkpath(staging);
     bool wrote = false;
-    int pos = 0;
-    while (pos + 30 <= raw.size()) {
-        const auto u16 = [&](int off) -> quint16 {
-            return quint16(quint8(raw[pos + off])) | (quint16(quint8(raw[pos + off + 1])) << 8);
-        };
-        const auto u32 = [&](int off) -> quint32 {
-            return quint32(u16(off)) | (quint32(u16(off + 2)) << 16);
-        };
-        if (u32(0) != 0x04034b50u)
+    size_t pos = 0;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(raw.constData());
+    const size_t n = static_cast<size_t>(raw.size());
+    while (pos < n) {
+        ZipLocalView entry;
+        if (!readZipLocal(bytes, n, pos, &entry))
             break;
-        const quint16 method = u16(8);
-        const quint32 compSize = u32(18);
-        const quint32 uncompSize = u32(22);
-        const quint16 nameLen = u16(26);
-        const quint16 extraLen = u16(28);
-        const int dataOff = pos + 30 + nameLen + extraLen;
-        if (dataOff < 0 || dataOff + int(compSize) > raw.size())
+        if (entry.nextPos <= pos)
             break;
-        const QString name = QString::fromUtf8(raw.constData() + pos + 30, nameLen);
+        const int nameLen = entry.nameLen > static_cast<size_t>(INT_MAX)
+                                ? 0
+                                : static_cast<int>(entry.nameLen);
+        const QString name = nameLen > 0
+                                 ? QString::fromUtf8(raw.constData() + static_cast<qsizetype>(entry.nameOff),
+                                                     nameLen)
+                                 : QString();
         const QString base = QFileInfo(name).fileName().toLower();
-        pos = dataOff + int(compSize);
-        if (method != 0 || compSize != uncompSize)
+        pos = entry.nextPos;
+        if (entry.method != 0 || entry.compSize != entry.uncompSize)
             continue; // only stored entries
         if (!base.endsWith(QStringLiteral(".lua")) && !base.endsWith(QStringLiteral(".manifest")))
             continue;
-        const QByteArray data = raw.mid(dataOff, int(compSize));
+        if (entry.compSize > static_cast<uint32_t>(INT_MAX))
+            continue;
+        const QByteArray data = raw.mid(static_cast<qsizetype>(entry.dataOff),
+                                        static_cast<qsizetype>(entry.compSize));
         if (base.endsWith(QStringLiteral(".lua")) && luaOut && luaOut->isEmpty())
             *luaOut = QString::fromUtf8(data);
-        if (base.endsWith(QStringLiteral(".manifest"))) {
-            QFile out(staging + QLatin1Char('/') + QFileInfo(name).fileName());
+        const QString outName = QFileInfo(name).fileName();
+        if (outName.isEmpty() || outName == QLatin1String(".") || outName == QLatin1String(".."))
+            continue;
+        if (base.endsWith(QStringLiteral(".manifest")) || base.endsWith(QStringLiteral(".lua"))) {
+            QFile out(staging + QLatin1Char('/') + outName);
             if (out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
                 out.write(data);
                 wrote = true;
             }
-        } else if (base.endsWith(QStringLiteral(".lua"))) {
-            QFile out(staging + QLatin1Char('/') + QFileInfo(name).fileName());
-            if (out.open(QIODevice::WriteOnly | QIODevice::Truncate))
-                out.write(data);
-            wrote = true;
         }
     }
     return wrote || (luaOut && !luaOut->isEmpty());
@@ -513,6 +513,8 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
         c.manifestPath = mf;
         const QByteArray mfUtf8 = QDir::toNativeSeparators(mf).toUtf8();
         const QByteArray keyUtf8 = c.key.toUtf8();
+        if (mfUtf8.isEmpty() || !mfUtf8.constData() || keyUtf8.size() != 64 || !keyUtf8.constData())
+            continue;
         uint32_t flags = 0;
         if (depotkit_manifest_platform_hint(mfUtf8.constData(), keyUtf8.constData(), &flags)
             == DEPOTKIT_OK)
@@ -542,25 +544,53 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
     qInfo().noquote() << "[steamidra] depotkit matched" << matchedIds.join(QLatin1Char(','))
                       << "wantOs" << depotOs << "cands" << int(cands.size());
 
-    // Keep QString storage alive for C string pointers passed into depotkit.
-    std::vector<QByteArray> pathBytes;
-    std::vector<QByteArray> keyBytes;
-    pathBytes.reserve(matched.size());
-    keyBytes.reserve(matched.size());
-    std::vector<depotkit_depot> depots;
-    depots.reserve(matched.size());
-
+    // Take C string pointers only after every QByteArray sits in its final
+    // element. constData() dies if the vector grows. A selected DLC keeps
+    // every lua depot, so this list is much larger than a base-game install.
+    // depotkit writes through manifest_path, key_hex, and install_dir.
+    struct DepotBytes {
+        uint32_t depotId = 0;
+        QByteArray path;
+        QByteArray key;
+    };
+    std::vector<DepotBytes> held;
+    held.reserve(matched.size());
     for (const Cand& c : matched) {
-        pathBytes.push_back(QDir::toNativeSeparators(c.manifestPath).toUtf8());
-        keyBytes.push_back(c.key.toUtf8());
+        if (c.manifestPath.isEmpty() || c.key.size() != 64 || c.depotId.isEmpty())
+            continue;
+        bool idOk = false;
+        const qulonglong depotNum = c.depotId.toULongLong(&idOk);
+        if (!idOk || depotNum == 0 || depotNum > 0xffffffffu)
+            continue;
+        DepotBytes row;
+        row.depotId = static_cast<uint32_t>(depotNum);
+        row.path = QDir::toNativeSeparators(c.manifestPath).toUtf8();
+        row.key = c.key.toUtf8();
+        if (row.path.isEmpty() || row.key.size() != 64)
+            continue;
+        held.push_back(std::move(row));
+    }
+    if (held.empty())
+        throw std::runtime_error(
+            "No downloadable depots with local manifests (anonymous CDN needs them)");
+
+    std::vector<depotkit_depot> depots(held.size());
+    for (size_t i = 0; i < held.size(); ++i) {
         depotkit_depot d{};
-        d.depot_id = c.depotId.toUInt();
-        d.manifest_path = pathBytes.back().constData();
-        d.key_hex = keyBytes.back().constData();
-        depots.push_back(d);
+        d.depot_id = held[i].depotId;
+        d.manifest_path = held[i].path.constData();
+        d.key_hex = held[i].key.constData();
+        if (!d.manifest_path || !d.key_hex || !d.manifest_path[0] || !d.key_hex[0])
+            throw std::runtime_error("depotkit handoff missing path or key");
+        depots[i] = d;
     }
 
-    const QByteArray installDir = QDir::toNativeSeparators(dest).toUtf8();
+    const QString nativeDest = QDir::toNativeSeparators(dest.trimmed());
+    if (nativeDest.isEmpty())
+        throw std::runtime_error("Install path is empty");
+    const QByteArray installDir = nativeDest.toUtf8();
+    if (installDir.isEmpty() || !installDir.constData())
+        throw std::runtime_error("Install path is empty");
     depotkit_request req{};
     req.app_id = appid.toUInt();
     req.depots = depots.data();
@@ -700,9 +730,21 @@ InstallPipelineResult runInstallPipeline(
 {
     InstallPipelineResult result;
     try {
+        const QString app = appid.trimmed();
+        if (app.isEmpty())
+            throw std::runtime_error("Missing Steam App ID");
+        QStringList addons;
+        addons.reserve(selectedAddonIds.size());
+        for (const QString& rawId : selectedAddonIds) {
+            const QString id = rawId.trimmed();
+            if (!id.isEmpty())
+                addons.append(id);
+        }
+
         const QString steam = findSteamPath(settings);
-        const QString installdir = sanitizeInstallDir(title, appid);
-        QString installPath = targetPath;
+        const QString installdir = sanitizeInstallDir(title, app);
+        QString installPath = targetPath.trimmed();
+        installPath.replace(QLatin1Char('\\'), QLatin1Char('/'));
         if (installPath.isEmpty()) {
             if (!settings.libraryFolder.isEmpty())
                 installPath = settings.libraryFolder + QLatin1Char('/') + installdir;
@@ -710,7 +752,7 @@ InstallPipelineResult runInstallPipeline(
                 const QString base =
                     QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)
                     + QStringLiteral("/ArachnelGames");
-                installPath = base + QStringLiteral("/%1-%2").arg(appid, installdir);
+                installPath = base + QStringLiteral("/%1-%2").arg(app, installdir);
             }
         }
 
@@ -721,19 +763,21 @@ InstallPipelineResult runInstallPipeline(
             throw std::runtime_error("Cannot create staging directory");
 
         emitProgress(onProgress, 0, QStringLiteral("Getting game info…"));
-        const QString lua = fetchLua(appid, settings, staging.path(), onProgress);
+        const QString lua = fetchLua(app, settings, staging.path(), onProgress);
         LuaParsed parsed = parseLua(lua);
         // Local *.manifest from Ryuu are required: anonymous Steam returns 401 without
         // -manifestfile. Staging filenames override any lua setManifestid pins.
         adoptStagingManifests(staging.path(), parsed);
-        const QSet<QString> selectedDlc = selectedDlcAppIds(selectedAddonIds);
+        const QSet<QString> selectedDlc = selectedDlcAppIds(addons);
         // Any selected DLC → keep all lua depots. steamcmd dlcappid maps are incomplete
-        // (Isaac kept only 250902-250911 and skipped Afterbirth/etc.).
+        // (Isaac kept only 250902-250911 and skipped Afterbirth/etc.). Valheim's public
+        // steamcmd payload has no dlcappid rows, so steam-1620250 cannot be mapped and
+        // this branch is what actually starts the DLC download.
         const bool downloadAllDlc = settings.includeDlc || !selectedDlc.isEmpty();
-        filterPrimaryDepots(appid, parsed, downloadAllDlc, selectedDlc);
+        filterPrimaryDepots(app, parsed, downloadAllDlc, selectedDlc);
         if (!steam.isEmpty()) {
             QDir().mkpath(steam + QStringLiteral("/config/stplug-in"));
-            QFile luaOut(steam + QStringLiteral("/config/stplug-in/%1.lua").arg(appid));
+            QFile luaOut(steam + QStringLiteral("/config/stplug-in/%1.lua").arg(app));
             if (luaOut.open(QIODevice::WriteOnly | QIODevice::Truncate))
                 luaOut.write(lua.toUtf8());
         }
@@ -747,7 +791,7 @@ InstallPipelineResult runInstallPipeline(
         QString depotOs = settings.depotOs.trimmed();
         if (depotOs.isEmpty() || depotOs.compare(QStringLiteral("auto"), Qt::CaseInsensitive) == 0)
             depotOs = QStringLiteral("windows");
-        runDepotkit(appid, parsed, installPath, staging.path(), depotOs, force, onProgress,
+        runDepotkit(app, parsed, installPath, staging.path(), depotOs, force, onProgress,
                     shouldCancel, downloadCtrl);
 
         QJsonObject settingsJson;
@@ -756,15 +800,15 @@ InstallPipelineResult runInstallPipeline(
         settingsJson.insert(QStringLiteral("hasWorkshop"), true);
         settingsJson.insert(QStringLiteral("unlockAllDlc"), downloadAllDlc);
         const OnlineFixResult fix =
-            embedOnlineFix(installPath, appid, pluginRoot, settingsJson, false);
+            embedOnlineFix(installPath, app, pluginRoot, settingsJson, false);
         if (!fix.ok && !fix.error.isEmpty()) {
             emitProgress(onProgress, 95,
                          QStringLiteral("Online-Fix: %1").arg(fix.error),
                          QStringLiteral("warning"));
         }
 
-        const ResolvedLaunchExe resolved = resolveInstallLaunch(installPath, appid);
-        const QVector<SteamLaunchOption> allOptions = collectLaunchOptions(installPath, appid);
+        const ResolvedLaunchExe resolved = resolveInstallLaunch(installPath, app);
+        const QVector<SteamLaunchOption> allOptions = collectLaunchOptions(installPath, app);
         QJsonObject launch;
         if (!resolved.path.isEmpty()) {
             launch.insert(QStringLiteral("type"), QStringLiteral("exe"));
@@ -777,10 +821,10 @@ InstallPipelineResult runInstallPipeline(
             launch.insert(QStringLiteral("source"), resolved.source);
         } else {
             launch.insert(QStringLiteral("type"), QStringLiteral("steam"));
-            launch.insert(QStringLiteral("uri"), QStringLiteral("steam://rungameid/%1").arg(appid));
+            launch.insert(QStringLiteral("uri"), QStringLiteral("steam://rungameid/%1").arg(app));
         }
         QFile marker(installPath + QStringLiteral("/.arachnel-steamidra"));
-        QJsonObject payload{{QStringLiteral("appid"), appid},
+        QJsonObject payload{{QStringLiteral("appid"), app},
                             {QStringLiteral("mode"), QStringLiteral("depotkit")},
                             {QStringLiteral("launch"), launch}};
         if (!allOptions.isEmpty()) {
@@ -818,7 +862,7 @@ InstallPipelineResult runInstallPipeline(
         if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate))
             marker.write(QJsonDocument(payload).toJson(QJsonDocument::Indented));
 
-        qInfo().noquote() << "[steamidra] installed" << appid << "force" << force
+        qInfo().noquote() << "[steamidra] installed" << app << "force" << force
                           << "manifests" << parsed.manifests.keys().join(QLatin1Char(','));
         emitProgress(onProgress, 100, QStringLiteral("Installed"), QStringLiteral("completed"));
         result.ok = true;
