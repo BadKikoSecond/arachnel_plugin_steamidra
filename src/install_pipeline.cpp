@@ -94,6 +94,9 @@ bool extractZipToDir(const QString& zipPath, const QString& destDir)
 struct LuaParsed {
     QMap<QString, QString> depots;
     QMap<QString, QString> manifests;
+    /** Steam's per-depot `config.oslist` (lowercase, e.g. "windows", "linux"), from
+     *  steamcmd. Absent or empty = shared depot. Filled by filterPrimaryDepots(). */
+    QHash<QString, QString> depotOsList;
 };
 
 LuaParsed parseLua(const QString& text)
@@ -309,6 +312,16 @@ void filterPrimaryDepots(const QString& appid, LuaParsed& parsed, bool includeAl
         for (auto it = depotsObj.begin(); it != depotsObj.end(); ++it) {
             if (it.key().isEmpty() || !it.key().at(0).isDigit() || !it.value().isObject())
                 continue;
+            const QString oslist = it.value()
+                                       .toObject()
+                                       .value(QStringLiteral("config"))
+                                       .toObject()
+                                       .value(QStringLiteral("oslist"))
+                                       .toString()
+                                       .trimmed()
+                                       .toLower();
+            if (!oslist.isEmpty())
+                parsed.depotOsList.insert(it.key(), oslist);
             const QJsonValue dlcVal = it.value().toObject().value(QStringLiteral("dlcappid"));
             const QString dlcId = dlcVal.toVariant().toString().trimmed();
             if (dlcId.isEmpty() || dlcId == QStringLiteral("0"))
@@ -526,8 +539,36 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
         throw std::runtime_error(
             "No downloadable depots with local manifests (anonymous CDN needs them)");
 
+    // Steam says which OS each depot is for; trust that over the manifest hint.
+    // The hint is guessed from file contents and comes back 0 ("unknown") for a
+    // plain Linux depot, which the check below then lets through. Core Keeper
+    // (1621690) got its Linux depot 1621692 installed over Windows depot 1621691
+    // that way: the Linux managed libraries overwrote the Windows ones, Mono took
+    // the Unix code path under Proton, System.Random could not initialise, and the
+    // game sat on its loading screen forever - on Windows hosts as well as Linux.
+    // Depots with no oslist are shared content and are kept, as the worker does.
+    const QString wantOsName = wantFlags == 2u   ? QStringLiteral("linux")
+                               : wantFlags == 4u ? QStringLiteral("macos")
+                                                 : QStringLiteral("windows");
+    auto steamSaysOtherOs = [&](const QString& depotId) {
+        const QString oslist = parsed.depotOsList.value(depotId);
+        if (oslist.isEmpty())
+            return false;
+        const QStringList oses = oslist.split(QLatin1Char(','), Qt::SkipEmptyParts);
+        for (const QString& os : oses) {
+            if (os.trimmed() == wantOsName)
+                return false;
+        }
+        return true;
+    };
+
     std::vector<Cand> matched;
     for (const Cand& c : cands) {
+        if (steamSaysOtherOs(c.depotId)) {
+            qInfo().noquote() << "[steamidra] skip depot" << c.depotId << "oslist"
+                              << parsed.depotOsList.value(c.depotId) << "wantOs" << wantOsName;
+            continue;
+        }
         if (c.plat == 0 || (c.plat & wantFlags))
             matched.push_back(c);
     }
