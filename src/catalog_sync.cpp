@@ -11,6 +11,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMap>
+#include <QRegularExpression>
+#include <QSaveFile>
 #include <QSet>
 #include <QUrl>
 
@@ -251,29 +253,307 @@ QJsonArray parseCatalogPayload(const QJsonDocument& doc)
         if (rows.isEmpty())
             rows = root.value(QStringLiteral("downloads")).toArray();
     }
-    QJsonArray games;
+    // Pass 1: DLC appids referenced by any row. Pass 2: normalize and keep only rows that are
+    // not such a DLC. (This used to build the full normalized array first and then copy it
+    // into a filtered one, holding two ~115 MB arrays at once.)
     QSet<QString> referencedDlc;
+    for (const QJsonValue& v : rows) {
+        if (v.isObject())
+            collectReferencedDlcAppIds(v.toObject(), &referencedDlc);
+    }
+    QJsonArray games;
     for (const QJsonValue& v : rows) {
         if (!v.isObject())
             continue;
-        const QJsonObject raw = v.toObject();
-        collectReferencedDlcAppIds(raw, &referencedDlc);
-        const QJsonObject n = normalizeCatalogGame(raw);
-        if (!n.isEmpty())
-            games.append(n);
-    }
-    if (referencedDlc.isEmpty())
-        return games;
-
-    QJsonArray filtered;
-    for (const QJsonValue& v : games) {
-        const QJsonObject o = v.toObject();
-        const QString appid = o.value(QStringLiteral("steamAppId")).toString();
-        if (!appid.isEmpty() && referencedDlc.contains(appid))
+        const QJsonObject n = normalizeCatalogGame(v.toObject());
+        if (n.isEmpty())
             continue;
-        filtered.append(o);
+        if (!referencedDlc.isEmpty()) {
+            const QString appid = n.value(QStringLiteral("steamAppId")).toString();
+            if (!appid.isEmpty() && referencedDlc.contains(appid))
+                continue;
+        }
+        games.append(n);
     }
-    return filtered;
+    return games;
+}
+
+// ---- streaming catalog normalization --------------------------------------------------------
+// QJsonDocument keeps a ~4x larger tree than the JSON text (about 300 MB for the 72 MB feed).
+// The feed is a flat array of small objects, so instead of building one tree the rows are
+// located in the raw bytes and parsed one at a time.
+
+// Index just past the JSON value that starts at p[i]; -1 on malformed input.
+qsizetype skipJsonValue(const char* p, qsizetype n, qsizetype i)
+{
+    if (i >= n)
+        return -1;
+    const char c = p[i];
+    if (c == '"') {
+        for (++i; i < n;) {
+            if (p[i] == '\\')
+                i += 2;
+            else if (p[i] == '"')
+                return i + 1;
+            else
+                ++i;
+        }
+        return -1;
+    }
+    if (c == '{' || c == '[') {
+        int depth = 0;
+        bool inString = false;
+        for (; i < n; ++i) {
+            const char ch = p[i];
+            if (inString) {
+                if (ch == '\\')
+                    ++i;
+                else if (ch == '"')
+                    inString = false;
+            } else if (ch == '"') {
+                inString = true;
+            } else if (ch == '{' || ch == '[') {
+                ++depth;
+            } else if (ch == '}' || ch == ']') {
+                if (--depth == 0)
+                    return i + 1;
+            }
+        }
+        return -1;
+    }
+    while (i < n && p[i] != ',' && p[i] != ']' && p[i] != '}' && p[i] != ' ' && p[i] != '\n'
+           && p[i] != '\r' && p[i] != '\t') {
+        ++i;
+    }
+    return i;
+}
+
+qsizetype skipJsonSpace(const char* p, qsizetype n, qsizetype i)
+{
+    while (i < n && (p[i] == ' ' || p[i] == '\n' || p[i] == '\r' || p[i] == '\t'))
+        ++i;
+    return i;
+}
+
+struct RowsRange
+{
+    qsizetype begin = -1; // just after '['
+    qsizetype end = -1;   // at the matching ']'
+    bool valid() const { return begin >= 0 && end >= begin; }
+};
+
+// Locates the rows array the same way parseCatalogPayload does: a top-level array, or the first
+// non-empty of "entries", "games", "downloads" in a top-level object.
+bool locateRows(const QByteArray& payload, RowsRange* out)
+{
+    const char* p = payload.constData();
+    const qsizetype n = payload.size();
+    qsizetype i = skipJsonSpace(p, n, 0);
+    if (i >= n)
+        return false;
+    const auto rangeOfArray = [&](qsizetype at) {
+        RowsRange r;
+        const qsizetype stop = skipJsonValue(p, n, at);
+        if (stop > at) {
+            r.begin = at + 1;
+            r.end = stop - 1;
+        }
+        return r;
+    };
+    const auto nonEmpty = [&](const RowsRange& r) {
+        return r.valid() && skipJsonSpace(p, n, r.begin) < r.end;
+    };
+    if (p[i] == '[') {
+        *out = rangeOfArray(i);
+        return out->valid();
+    }
+    if (p[i] != '{')
+        return false;
+    RowsRange entries, games, downloads;
+    ++i;
+    for (;;) {
+        i = skipJsonSpace(p, n, i);
+        if (i >= n)
+            return false;
+        if (p[i] == '}')
+            break;
+        if (p[i] == ',') {
+            ++i;
+            continue;
+        }
+        if (p[i] != '"')
+            return false;
+        const qsizetype keyEnd = skipJsonValue(p, n, i);
+        if (keyEnd < 0)
+            return false;
+        const QByteArrayView key(p + i + 1, keyEnd - i - 2);
+        i = skipJsonSpace(p, n, keyEnd);
+        if (i >= n || p[i] != ':')
+            return false;
+        i = skipJsonSpace(p, n, i + 1);
+        if (i >= n)
+            return false;
+        const qsizetype valueEnd = skipJsonValue(p, n, i);
+        if (valueEnd < 0)
+            return false;
+        if (p[i] == '[') {
+            if (key == "entries")
+                entries = rangeOfArray(i);
+            else if (key == "games")
+                games = rangeOfArray(i);
+            else if (key == "downloads")
+                downloads = rangeOfArray(i);
+        }
+        i = valueEnd;
+    }
+    if (nonEmpty(entries))
+        *out = entries;
+    else if (nonEmpty(games))
+        *out = games;
+    else if (nonEmpty(downloads))
+        *out = downloads;
+    else
+        return false; // nothing usable: let the caller take the whole-document path
+    return true;
+}
+
+// Normalizes every row of `payload` without building a document tree. Each kept row is stored
+// already serialized (compact JSON, the exact bytes the cache file wants) together with its
+// steamAppId; `referenced` collects DLC appids that must be dropped afterwards.
+bool normalizeRowsStreaming(const QByteArray& payload, QVector<QByteArray>* rows,
+                            QVector<QString>* appIds, QSet<QString>* referenced)
+{
+    RowsRange range;
+    if (!locateRows(payload, &range))
+        return false;
+    const char* p = payload.constData();
+    const qsizetype n = payload.size();
+    qsizetype i = range.begin;
+    rows->reserve(130000);
+    appIds->reserve(130000);
+    for (;;) {
+        i = skipJsonSpace(p, n, i);
+        if (i >= range.end)
+            break;
+        if (p[i] == ',') {
+            ++i;
+            continue;
+        }
+        const qsizetype stop = skipJsonValue(p, n, i);
+        if (stop < 0 || stop > range.end)
+            return false;
+        if (p[i] == '{') {
+            const QJsonDocument one =
+                QJsonDocument::fromJson(QByteArray::fromRawData(p + i, stop - i));
+            if (one.isObject()) {
+                const QJsonObject raw = one.object();
+                collectReferencedDlcAppIds(raw, referenced);
+                const QJsonObject norm = normalizeCatalogGame(raw);
+                if (!norm.isEmpty()) {
+                    appIds->append(norm.value(QStringLiteral("steamAppId")).toString());
+                    rows->append(QJsonDocument(norm).toJson(QJsonDocument::Compact));
+                }
+            }
+        }
+        i = stop;
+    }
+    return true;
+}
+
+// The cache is written with sorted compact keys: {"catalogKind":"..","count":N,"entries":[...
+// so its kind and size are in the first bytes. Reading them avoids parsing the whole file
+// (~150 MB of QJson data for a 70 MB feed) on every sync call.
+bool peekCacheHeader(const QString& path, QString* kind, int* count)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return false;
+    const QByteArray head = f.read(512);
+    static const QRegularExpression re(
+        QStringLiteral(R"re("catalogKind":"([^"]*)","count":(\d+),"entries":\[)re"));
+    const QRegularExpressionMatch m = re.match(QString::fromLatin1(head));
+    if (!m.hasMatch())
+        return false;
+    *kind = m.captured(1);
+    *count = m.captured(2).toInt();
+    return true;
+}
+
+QByteArray quoteAscii(const QString& s)
+{
+    return '"' + s.toLatin1() + '"';
+}
+
+// Streams the cache file entry by entry. Same bytes QJsonDocument(doc).toJson(Compact) used to
+// produce, without a second 70 MB copy of the array and the serialized text.
+bool writeCatalogCache(const QString& cachePath, const QString& kind, const QJsonArray& games)
+{
+    QSaveFile out(cachePath);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    QByteArray chunk;
+    chunk.reserve(1 << 20);
+    chunk += "{\"catalogKind\":" + quoteAscii(kind) + ",\"count\":"
+        + QByteArray::number(games.size()) + ",\"entries\":[";
+    bool first = true;
+    for (const QJsonValue& v : games) {
+        if (!first)
+            chunk += ',';
+        first = false;
+        chunk += QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact);
+        if (chunk.size() >= (1 << 20)) {
+            if (out.write(chunk) != chunk.size()) {
+                out.cancelWriting();
+                return false;
+            }
+            chunk.clear();
+        }
+    }
+    chunk += "],\"schemaVersion\":1,\"updatedAt\":"
+        + quoteAscii(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)) + "}";
+    if (out.write(chunk) != chunk.size()) {
+        out.cancelWriting();
+        return false;
+    }
+    return out.commit();
+}
+
+// Same file as writeCatalogCache, from rows that are already serialized; `skipped` entries
+// (referenced DLC ids) are left out.
+bool writeCatalogCacheRows(const QString& cachePath, const QString& kind,
+                           const QVector<QByteArray>& rows, const QVector<QString>& appIds,
+                           const QSet<QString>& referenced, int keptCount)
+{
+    QSaveFile out(cachePath);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    QByteArray chunk;
+    chunk.reserve(1 << 20);
+    chunk += "{\"catalogKind\":" + quoteAscii(kind) + ",\"count\":" + QByteArray::number(keptCount)
+        + ",\"entries\":[";
+    bool first = true;
+    for (qsizetype i = 0; i < rows.size(); ++i) {
+        if (!referenced.isEmpty() && !appIds.at(i).isEmpty() && referenced.contains(appIds.at(i)))
+            continue;
+        if (!first)
+            chunk += ',';
+        first = false;
+        chunk += rows.at(i);
+        if (chunk.size() >= (1 << 20)) {
+            if (out.write(chunk) != chunk.size()) {
+                out.cancelWriting();
+                return false;
+            }
+            chunk.clear();
+        }
+    }
+    chunk += "],\"schemaVersion\":1,\"updatedAt\":"
+        + quoteAscii(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)) + "}";
+    if (out.write(chunk) != chunk.size()) {
+        out.cancelWriting();
+        return false;
+    }
+    return out.commit();
 }
 
 } // namespace
@@ -371,15 +651,21 @@ QString syncManifestCatalog(const PluginSettings& settings, const QString& cache
         return QFileInfo::exists(cachePath) ? cachePath : QString();
 
     if (QFileInfo::exists(cachePath)) {
-        QFile peek(cachePath);
-        if (peek.open(QIODevice::ReadOnly)) {
-            const QJsonObject root = QJsonDocument::fromJson(peek.readAll()).object();
-            const QString kind = root.value(QStringLiteral("catalogKind")).toString();
-            const int count = root.value(QStringLiteral("entries")).toArray().size();
-            if (kind == QStringLiteral("installable-manifest") && count < 10000) {
-                QFile::remove(cachePath);
-                force = true;
+        QString kind;
+        int count = 0;
+        bool known = peekCacheHeader(cachePath, &kind, &count);
+        if (!known) {
+            // Older layout: fall back to reading the whole file.
+            QFile peek(cachePath);
+            if (peek.open(QIODevice::ReadOnly)) {
+                const QJsonObject root = QJsonDocument::fromJson(peek.readAll()).object();
+                kind = root.value(QStringLiteral("catalogKind")).toString();
+                count = root.value(QStringLiteral("entries")).toArray().size();
             }
+        }
+        if (kind == QStringLiteral("installable-manifest") && count < 10000) {
+            QFile::remove(cachePath);
+            force = true;
         }
     }
 
@@ -390,28 +676,48 @@ QString syncManifestCatalog(const PluginSettings& settings, const QString& cache
             return cachePath;
     }
 
-    QString err;
-    const QByteArray payload = httpGet(url, 90000, {}, &err);
+    const QString kind = url.contains(QStringLiteral("ryuu")) ? QStringLiteral("ryuu-relay")
+                                                              : QStringLiteral("installable-manifest");
+    QByteArray payload;
+    {
+        QString err;
+        payload = httpGet(url, 90000, {}, &err);
+    }
     if (payload.isEmpty())
         return QFileInfo::exists(cachePath) ? cachePath : QString();
 
-    const QJsonArray games = parseCatalogPayload(QJsonDocument::fromJson(payload));
+    // Preferred path: row-by-row, no document tree (peak ~ payload + serialized rows).
+    {
+        QVector<QByteArray> rows;
+        QVector<QString> appIds;
+        QSet<QString> referenced;
+        if (normalizeRowsStreaming(payload, &rows, &appIds, &referenced)) {
+            payload = QByteArray();
+            int kept = 0;
+            for (qsizetype i = 0; i < rows.size(); ++i) {
+                if (referenced.isEmpty() || appIds.at(i).isEmpty()
+                    || !referenced.contains(appIds.at(i)))
+                    ++kept;
+            }
+            if (kept < 10)
+                return QFileInfo::exists(cachePath) ? cachePath : QString();
+            if (!writeCatalogCacheRows(cachePath, kind, rows, appIds, referenced, kept))
+                return {};
+            return cachePath;
+        }
+    }
+
+    // Fallback (unexpected layout): the whole-document path.
+    QJsonArray games;
+    {
+        const QJsonDocument doc = QJsonDocument::fromJson(payload);
+        payload = QByteArray();
+        games = parseCatalogPayload(doc);
+    }
     if (games.size() < 10)
         return QFileInfo::exists(cachePath) ? cachePath : QString();
-
-    QJsonObject doc;
-    doc.insert(QStringLiteral("schemaVersion"), 1);
-    doc.insert(QStringLiteral("catalogKind"),
-               url.contains(QStringLiteral("ryuu")) ? QStringLiteral("ryuu-relay")
-                                                    : QStringLiteral("installable-manifest"));
-    doc.insert(QStringLiteral("updatedAt"),
-               QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
-    doc.insert(QStringLiteral("count"), games.size());
-    doc.insert(QStringLiteral("entries"), games);
-    QFile out(cachePath);
-    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    if (!writeCatalogCache(cachePath, kind, games))
         return {};
-    out.write(QJsonDocument(doc).toJson(QJsonDocument::Compact));
     return cachePath;
 }
 

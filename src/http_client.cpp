@@ -26,6 +26,17 @@ QByteArray httpGet(const QString& url, int timeoutMs, const QMap<QString, QStrin
         req.setRawHeader(it.key().toUtf8(), it.value().toUtf8());
 
     QNetworkReply* reply = nam.get(req);
+    // Drain the reply as it arrives instead of readAll() at the end: the reply buffers every
+    // byte it has not handed out, so a 70 MB catalog used to sit in memory twice (reply
+    // buffer + the copy) with geometric growth slack on top.
+    QByteArray body;
+    QObject::connect(reply, &QNetworkReply::downloadProgress, reply,
+                     [&body](qint64, qint64 total) {
+                         if (total > 0 && body.capacity() < total)
+                             body.reserve(total + 4096);
+                     });
+    QObject::connect(reply, &QNetworkReply::readyRead, reply,
+                     [&body, reply]() { body.append(reply->readAll()); });
     QEventLoop loop;
     QTimer timer;
     timer.setSingleShot(true);
@@ -50,7 +61,7 @@ QByteArray httpGet(const QString& url, int timeoutMs, const QMap<QString, QStrin
         reply->deleteLater();
         return {};
     }
-    const QByteArray body = reply->readAll();
+    body.append(reply->readAll());
     const QVariant statusVar = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
     const int status = statusVar.isValid() ? statusVar.toInt() : 0;
     reply->deleteLater();
