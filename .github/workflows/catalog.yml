@@ -1,3 +1,4 @@
+# Runs on the schedule below and from Actions -> Catalog -> Run workflow.
 # Daily refresh of catalog/games-manifest-catalog.json (installable manifests only).
 # Optional repository secret: HUBCAP_API_KEY.
 
