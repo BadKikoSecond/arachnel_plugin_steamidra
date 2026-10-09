@@ -51,6 +51,17 @@ cmake -S "${ROOT}" -B "${BUILD}" -G Ninja \
 cmake --build "${BUILD}" --target steamidra_arach -j"$(nproc)"
 bash "${ROOT}/scripts/ci/check-linux-runtime.sh" "${BUILD}/plugin-bundle/libsteamidra_plugin.so"
 
+# The host looks these up by name; a missing export silently drops back to the slow catalog_json
+# path (extension) or refuses to load the plugin (API 4), so fail the build instead.
+EXPORTS="$(nm -D --defined-only "${BUILD}/plugin-bundle/libsteamidra_plugin.so" | awk '{print $3}')"
+for sym in arachnel_plugin_api_version arachnel_plugin_create arachnel_plugin_destroy \
+           arachnel_plugin_catalog_json arachnel_plugin_catalog_json_free \
+           arachnel_plugin_source_ext_version arachnel_plugin_catalog_source \
+           arachnel_plugin_normalize_rows arachnel_plugin_source_free; do
+  grep -qx "${sym}" <<<"${EXPORTS}" || { echo "missing plugin export: ${sym}" >&2; exit 1; }
+done
+echo "plugin exports OK"
+
 mkdir -p "${DIST}"
 cp -f "${BUILD}/dist/steamidra.arach" "${DIST}/steam.arach"
 echo "Done: ${DIST}/steam.arach"
