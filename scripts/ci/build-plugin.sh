@@ -11,7 +11,8 @@ QT_PATH="${QT_INSTALL_DIR:-${ROOT}/.ci/qt/${QT_VERSION}/gcc_64}"
 DIST="${ROOT}/dist/linux"
 
 cd "${ROOT}"
-[[ -z "${CI_COMMIT_TAG:-}" ]] || python3 scripts/ci/set_plugin_version.py "${CI_COMMIT_TAG}"
+RELEASE_TAG="${RELEASE_TAG:-${CI_COMMIT_TAG:-}}"
+[[ -z "${RELEASE_TAG}" ]] || python3 scripts/ci/set_plugin_version.py "${RELEASE_TAG}"
 
 if [[ ! -f "${SDK_DIR}/cmake/ArachnelPluginSdk.cmake" ]]; then
   rm -rf "${SDK_DIR}"

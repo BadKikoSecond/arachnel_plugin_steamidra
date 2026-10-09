@@ -13,7 +13,7 @@ Daily CI rebuilds [`catalog/games-manifest-catalog.json`](catalog/games-manifest
 Raw URL (used by the plugin):
 
 ```
-https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json
+https://raw.githubusercontent.com/BadKikoSecond/arachnel_plugin_steamidra/master/catalog/games-manifest-catalog.json
 ```
 
 `uploadDate` / `version` drive **sort by newest** and **library update detection**.
@@ -27,7 +27,7 @@ python tools/build_manifest_catalog.py --incremental --steam-dates --verbose
 python tools/build_manifest_catalog.py --steam-dates --verbose
 ```
 
-GitLab: **CI/CD → Schedules** → cron `0 4 * * *` on branch `master`, set `CATALOG_PUSH_TOKEN` (project access token, `write_repository`). Optional: `HUBCAP_API_KEY`.
+GitHub Actions: [`catalog.yml`](.github/workflows/catalog.yml) runs daily at 04:00 UTC (or **Actions → Catalog → Run workflow**) and commits the refreshed catalog to `master`. Optional repository secret: `HUBCAP_API_KEY`.
 
 ## Release
 
@@ -38,9 +38,16 @@ git tag v0.6.0
 git push origin v0.6.0
 ```
 
-GitLab builds Windows and Linux bundles, merges their platform runtimes, uploads the
-package, and creates a Release. The toolchain is pinned in
+[GitHub Actions](.github/workflows/release.yml) builds the Windows and Linux bundles, merges
+them into one `steam.arach`, checks it on Ubuntu / Fedora / Arch and creates a GitHub Release.
+You can also run **Actions → Release → Run workflow** and enter the version (untick *Create the
+GitHub Release* for a build-and-verify dry run). The toolchain is pinned in
 `scripts/ci/launcher-toolchain.env`.
+
+The sourcelist ([`arachnel_plugins_sourcelist`](https://github.com/BadKikoSecond/arachnel_plugins_sourcelist))
+polls this repo's releases every 30 minutes. Add the repository secret
+`SOURCELIST_DISPATCH_TOKEN` (fine-grained token with *Contents: write* on the sourcelist) to make
+the update instant.
 
 ## What is bundled
 

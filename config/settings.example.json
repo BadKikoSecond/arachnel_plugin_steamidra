@@ -6,7 +6,7 @@
   "depotOs": "windows",
   "libraryFolder": "",
   "includeDlc": false,
-  "manifestCatalogUrl": "https://gitlab.com/BadKiko/arachnel-plugin-steamidra/-/raw/master/catalog/games-manifest-catalog.json",
+  "manifestCatalogUrl": "https://raw.githubusercontent.com/BadKikoSecond/arachnel_plugin_steamidra/master/catalog/games-manifest-catalog.json",
   "manifestCatalogTtlHours": 24,
   "autoEmbedOnlineFix": true,
   "onlineFixOnWeakMultiplayer": false,

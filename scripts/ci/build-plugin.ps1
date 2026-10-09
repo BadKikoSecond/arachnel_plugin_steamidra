@@ -21,8 +21,9 @@ $useMingw = $QtKit -match 'mingw'
 
 Write-Host "Toolchain: Qt $QtVersion $QtArch ($QtKit), SDK $($env:ARACHNEL_SDK_REF)"
 
-if ($env:CI_COMMIT_TAG) {
-    python (Join-Path $Root "scripts\ci\set_plugin_version.py") $env:CI_COMMIT_TAG
+$ReleaseTag = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } else { $env:CI_COMMIT_TAG }
+if ($ReleaseTag) {
+    python (Join-Path $Root "scripts\ci\set_plugin_version.py") $ReleaseTag
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
