@@ -14,6 +14,9 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
+    # ci/** branches get the same dry run as PRs (build + verify, never publish).
+    branches:
+      - 'ci/**'
   # Dry run on PRs that touch the build: builds, merges and verifies, never publishes.
   pull_request:
     branches: [master]
@@ -65,7 +68,7 @@ jobs:
         run: |
           if [[ -n "${INPUT_VERSION}" ]]; then
             TAG="v${INPUT_VERSION#v}"
-          elif [[ "${EVENT}" == "pull_request" ]]; then
+          elif [[ "${EVENT}" == "pull_request" || "${REF_TYPE}" == "branch" ]]; then
             TAG="v$(python3 -c 'import json; print(json.load(open("plugin.json"))["version"])')"
           elif [[ "${REF_TYPE}" == "tag" ]]; then
             TAG="${REF_NAME}"
@@ -251,7 +254,7 @@ jobs:
 
   release:
     needs: [prepare, verify]
-    if: github.event_name == 'push' || github.event.inputs.publish_release == 'true'
+    if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.publish_release == 'true'
     runs-on: ubuntu-24.04
     outputs:
       download_url: ${{ steps.publish.outputs.download_url }}
@@ -293,7 +296,7 @@ jobs:
 
   notify-sourcelist:
     needs: [prepare, release]
-    if: github.event_name == 'push' || github.event.inputs.notify_sourcelist == 'true'
+    if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.notify_sourcelist == 'true'
     runs-on: ubuntu-24.04
     steps:
       - name: Dispatch sourcelist ingest
