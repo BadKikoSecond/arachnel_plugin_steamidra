@@ -721,6 +721,49 @@ QString syncManifestCatalog(const PluginSettings& settings, const QString& cache
     return cachePath;
 }
 
+QByteArray catalogSourceDescriptorJson(const PluginSettings& settings)
+{
+    const QString url = settings.manifestCatalogUrl.trimmed();
+    if (url.isEmpty())
+        return {};
+    QJsonObject o;
+    o.insert(QStringLiteral("url"), url);
+    o.insert(QStringLiteral("rowsKeys"),
+             QJsonArray{QStringLiteral("entries"), QStringLiteral("games"),
+                        QStringLiteral("downloads")});
+    o.insert(QStringLiteral("ttlSeconds"), static_cast<double>(catalogTtlSeconds(settings)));
+    o.insert(QStringLiteral("minRows"), 10);
+    o.insert(QStringLiteral("parallel"), true);
+    o.insert(QStringLiteral("userAgent"), QStringLiteral("Arachnel-SteaMidra/0.4"));
+    return QJsonDocument(o).toJson(QJsonDocument::Compact);
+}
+
+QByteArray normalizeRowsJson(const QByteArray& rowsJsonArray)
+{
+    const QJsonDocument doc = QJsonDocument::fromJson(rowsJsonArray);
+    if (!doc.isArray())
+        return {};
+    QJsonArray entries;
+    QSet<QString> referenced;
+    for (const QJsonValue& v : doc.array()) {
+        if (!v.isObject())
+            continue;
+        const QJsonObject raw = v.toObject();
+        collectReferencedDlcAppIds(raw, &referenced);
+        const QJsonObject norm = normalizeCatalogGame(raw);
+        if (!norm.isEmpty())
+            entries.append(norm);
+    }
+    QJsonArray supersedes;
+    for (const QString& appid : referenced)
+        supersedes.append(QStringLiteral("steam-%1").arg(appid));
+    QJsonObject root;
+    root.insert(QStringLiteral("schema"), QStringLiteral("arachnel.plugin.catalog.v1"));
+    root.insert(QStringLiteral("entries"), entries);
+    root.insert(QStringLiteral("supersedes"), supersedes);
+    return QJsonDocument(root).toJson(QJsonDocument::Compact);
+}
+
 QJsonObject steamAppDetailsJson(const QString& appid)
 {
     const QString url =

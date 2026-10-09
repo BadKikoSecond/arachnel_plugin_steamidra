@@ -63,6 +63,8 @@ public:
 
     /** Sync on-disk catalog and return raw UTF-8 JSON (no in-memory row mirror). */
     QByteArray catalogJsonUtf8() const;
+    /** Catalog-source extension: descriptor for the host-driven sync (empty if no URL). */
+    QByteArray catalogSourceJson() const;
 
     void releaseCatalogMemory() const;
 

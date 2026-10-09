@@ -181,6 +181,11 @@ QByteArray SteamidraPlugin::catalogJsonUtf8() const
     return file.readAll();
 }
 
+QByteArray SteamidraPlugin::catalogSourceJson() const
+{
+    return catalogSourceDescriptorJson(loadPluginSettings(settingsPath()));
+}
+
 void SteamidraPlugin::ensureCatalogSeeded() const
 {
     constexpr qint64 kMemoryTtlMs = 60 * 1000;
